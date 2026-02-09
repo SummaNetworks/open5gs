@@ -73,6 +73,26 @@ mme_timer_cfg_t *mme_timer_cfg(mme_timer_e id)
     return &g_mme_timer_cfg[id];
 }
 
+void mme_timer_cfg_init(void)
+{
+    mme_context_t *self = mme_self();
+
+    /* Override T3413 timer configuration from YAML */
+    if (self->time.t3413.value > 0) {
+        g_mme_timer_cfg[MME_TIMER_T3413].duration =
+            ogs_time_from_sec(self->time.t3413.value);
+    }
+
+    if (self->time.t3413.max_count >= 0) {
+        g_mme_timer_cfg[MME_TIMER_T3413].max_count =
+            self->time.t3413.max_count;
+    }
+
+    ogs_debug("T3413 timer configured: duration=%ds, max_count=%d",
+        (int)self->time.t3413.value,
+        self->time.t3413.max_count);
+}
+
 const char *mme_timer_get_name(mme_timer_e id)
 {
     switch (id) {

@@ -106,6 +106,14 @@ void smf_context_init(void)
     self.n1n2message_hash = ogs_hash_make();
     ogs_assert(self.n1n2message_hash);
 
+    /* Initialize GTP node cleanup (disabled by default) */
+    self.gtp_node_cleanup_enabled = false;
+    self.t_gtp_node_cleanup = ogs_timer_add(ogs_app()->timer_mgr, 
+            smf_timer_gtp_node_cleanup, NULL);
+    ogs_assert(self.t_gtp_node_cleanup);
+    
+    /* Timer will be started only if explicitly enabled in configuration */
+
     context_initialized = 1;
 }
 
@@ -128,6 +136,11 @@ void smf_context_final(void)
     ogs_hash_destroy(self.ipv6_hash);
     ogs_assert(self.n1n2message_hash);
     ogs_hash_destroy(self.n1n2message_hash);
+
+    if (self.t_gtp_node_cleanup) {
+        ogs_timer_delete(self.t_gtp_node_cleanup);
+        self.t_gtp_node_cleanup = NULL;
+    }
 
     ogs_pool_final(&smf_ue_pool);
     ogs_pool_final(&smf_bearer_pool);
@@ -296,7 +309,6 @@ int smf_context_parse_config(void)
     int rv;
     yaml_document_t *document = NULL;
     ogs_yaml_iter_t root_iter;
-    int idx = 0;
 
     document = ogs_app()->document;
     ogs_assert(document);
@@ -308,8 +320,7 @@ int smf_context_parse_config(void)
     while (ogs_yaml_iter_next(&root_iter)) {
         const char *root_key = ogs_yaml_iter_key(&root_iter);
         ogs_assert(root_key);
-        if ((!strcmp(root_key, "smf")) &&
-            (idx++ == ogs_app()->config_section_id)) {
+        if (!strcmp(root_key, "smf")) {
             ogs_yaml_iter_t smf_iter;
             ogs_yaml_iter_recurse(&root_iter, &smf_iter);
             while (ogs_yaml_iter_next(&smf_iter)) {
@@ -405,7 +416,7 @@ int smf_context_parse_config(void)
                                     int tc_timer = 0;
 
                                     if (ogs_yaml_iter_type(&conn_array) ==
-                                        YAML_MAPPING_NODE) {
+                                            YAML_MAPPING_NODE) {
                                         memcpy(&conn_iter, &conn_array,
                                                 sizeof(ogs_yaml_iter_t));
                                     } else if (ogs_yaml_iter_type(
@@ -414,8 +425,8 @@ int smf_context_parse_config(void)
                                             break;
                                         ogs_yaml_iter_recurse(&conn_array,
                                                 &conn_iter);
-                                    } else if (ogs_yaml_iter_type(
-                                            &conn_array) == YAML_SCALAR_NODE) {
+                                    } else if (ogs_yaml_iter_type(&conn_array) ==
+                                            YAML_SCALAR_NODE) {
                                         break;
                                     } else
                                         ogs_assert_if_reached();
@@ -581,6 +592,27 @@ int smf_context_parse_config(void)
 
                     } while (ogs_yaml_iter_type(&p_cscf_iter) ==
                                 YAML_SEQUENCE_NODE);
+                } else if (!strcmp(smf_key, "gtp_node_cleanup")) {
+                    const char *v = ogs_yaml_iter_value(&smf_iter);
+                    if (v) {
+                        if (!strcmp(v, "true") || !strcmp(v, "yes") || !strcmp(v, "enabled")) {
+                            self.gtp_node_cleanup_enabled = true;
+                            /* Start the cleanup timer when explicitly enabled */
+                            if (self.t_gtp_node_cleanup) {
+                                ogs_timer_start(self.t_gtp_node_cleanup, ogs_time_from_sec(30));
+                            }
+                        } else if (!strcmp(v, "false") || !strcmp(v, "no") || !strcmp(v, "disabled")) {
+                            self.gtp_node_cleanup_enabled = false;
+                            /* Stop the cleanup timer when explicitly disabled */
+                            if (self.t_gtp_node_cleanup) {
+                                ogs_timer_stop(self.t_gtp_node_cleanup);
+                            }
+                        } else {
+                            ogs_warn("Invalid gtp_node_cleanup value: %s (use true/false)", v);
+                        }
+                        ogs_info("GTP node cleanup timer: %s", 
+                                self.gtp_node_cleanup_enabled ? "enabled" : "disabled");
+                    }
                 } else if (!strcmp(smf_key, "info")) {
                     ogs_sbi_nf_instance_t *nf_instance = NULL;
 
@@ -989,7 +1021,9 @@ smf_gtp_node_t *smf_gtp_node_new(ogs_gtp_node_t *gnode)
 
     ogs_pool_alloc(&smf_gtp_node_pool, &smf_gnode);
     if (!smf_gnode) {
-        ogs_error("ogs_pool_alloc() failed");
+        ogs_error("SMF GTP node pool exhausted! Pool size: %d, Available: %d", 
+                 ogs_pool_size(&smf_gtp_node_pool), ogs_pool_avail(&smf_gtp_node_pool));
+        ogs_error("Total GTP nodes in sgw_s5c_list: %d", ogs_list_count(&smf_self()->sgw_s5c_list));
         return NULL;
     }
     memset(smf_gnode, 0, sizeof(smf_gtp_node_t));
@@ -1184,6 +1218,8 @@ static ogs_pfcp_node_t *selected_upf_node(
 
 void smf_sess_select_upf(smf_sess_t *sess)
 {
+    char buf[OGS_ADDRSTRLEN];
+
     ogs_assert(sess);
 
     /*
@@ -1199,9 +1235,8 @@ void smf_sess_select_upf(smf_sess_t *sess)
         selected_upf_node(ogs_pfcp_self()->pfcp_node, sess);
     ogs_assert(ogs_pfcp_self()->pfcp_node);
     OGS_SETUP_PFCP_NODE(sess, ogs_pfcp_self()->pfcp_node);
-    ogs_debug("UE using UPF on IP %s",
-            ogs_sockaddr_to_string_static(
-                ogs_pfcp_self()->pfcp_node->addr_list));
+    ogs_debug("UE using UPF on IP[%s]",
+            OGS_ADDR(&ogs_pfcp_self()->pfcp_node->addr, buf));
 }
 
 smf_sess_t *smf_sess_add_by_apn(smf_ue_t *smf_ue, char *apn, uint8_t rat_type)
@@ -1250,6 +1285,9 @@ smf_sess_t *smf_sess_add_by_apn(smf_ue_t *smf_ue, char *apn, uint8_t rat_type)
     /* Set RAT-Type */
     sess->gtp_rat_type = rat_type;
     ogs_assert(sess->gtp_rat_type);
+    
+    /* Initialize UE capabilities flags */
+    sess->gtp.ue_local_addr_in_tft = false;  /* Default: UE doesn't support local address in TFT */
 
     /* Set EPC */
     sess->epc = true;
@@ -1479,7 +1517,6 @@ smf_sess_t *smf_sess_add_by_psi(smf_ue_t *smf_ue, uint8_t psi)
 
     ogs_list_add(&smf_ue->sess_list, sess);
 
-    smf_metrics_inst_global_inc(SMF_METR_GLOB_GAUGE_PFCP_SESSIONS_ACTIVE);
     stats_add_smf_session();
 
     return sess;
@@ -1610,7 +1647,7 @@ uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
         subnet6 = sess->ipv6->subnet;
         ogs_assert(subnet6);
 
-        sess->paa.len = OGS_IPV6_DEFAULT_PREFIX_LEN;
+        sess->paa.len = OGS_IPV6_DEFAULT_PREFIX_LEN >> 3;
         memcpy(sess->paa.addr6, sess->ipv6->addr, OGS_IPV6_LEN);
         ogs_hash_set(smf_self()->ipv6_hash,
                 sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
@@ -1639,7 +1676,7 @@ uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
         ogs_assert(subnet6);
 
         sess->paa.both.addr = sess->ipv4->addr[0];
-        sess->paa.both.len = OGS_IPV6_DEFAULT_PREFIX_LEN;
+        sess->paa.both.len = OGS_IPV6_DEFAULT_PREFIX_LEN >> 3;
         memcpy(sess->paa.both.addr6, sess->ipv6->addr, OGS_IPV6_LEN);
         ogs_hash_set(smf_self()->ipv4_hash,
                 sess->ipv4->addr, OGS_IPV4_LEN, sess);
@@ -1696,6 +1733,9 @@ void smf_sess_remove(smf_sess_t *sess)
             sess->ipv4 ? OGS_INET_NTOP(&sess->ipv4->addr, buf1) : "",
             sess->ipv6 ? OGS_INET6_NTOP(&sess->ipv6->addr, buf2) : "");
 
+    /* Let the session state machine handle PFCP session deletion properly */
+    ogs_debug("Session removal - letting FSM handle PFCP cleanup [SEID:0x%lx]", sess->smf_n4_seid);
+
     ogs_list_remove(&smf_ue->sess_list, sess);
 
     memset(&e, 0, sizeof(e));
@@ -1749,10 +1789,6 @@ void smf_sess_remove(smf_sess_t *sess)
     if (sess->policy_association.client)
         ogs_sbi_client_remove(sess->policy_association.client);
 
-    UDM_SDM_CLEAR(sess);
-    if (sess->data_change_subscription.client)
-        ogs_sbi_client_remove(sess->data_change_subscription.client);
-
     if (sess->session.name)
         ogs_free(sess->session.name);
     if (sess->full_dnn)
@@ -1793,10 +1829,20 @@ void smf_sess_remove(smf_sess_t *sess)
     /* Free SBI object memory */
     ogs_sbi_object_free(&sess->sbi);
 
-    if (sess->aaa_server_identifier.name)
-        ogs_free(sess->aaa_server_identifier.name);
-    if (sess->aaa_server_identifier.realm)
-        ogs_free(sess->aaa_server_identifier.realm);
+    /* Clean up Diameter session state to prevent "No Session Data" errors */
+    if (sess->gx_sid) {
+        ogs_info("Cleaning up Diameter Gx session state: %s", sess->gx_sid);
+        /* Note: sess->gx_sid points to Diameter session state memory, don't free directly */
+        sess->gx_sid = NULL;
+    }
+    if (sess->gy_sid) {
+        ogs_debug("Cleaning up Diameter Gy session state: %s", sess->gy_sid);
+        sess->gy_sid = NULL;
+    }
+    if (sess->s6b_sid) {
+        ogs_debug("Cleaning up Diameter S6b session state: %s", sess->s6b_sid);
+        sess->s6b_sid = NULL;
+    }
 
     smf_bearer_remove_all(sess);
 
@@ -1817,7 +1863,6 @@ void smf_sess_remove(smf_sess_t *sess)
         smf_metrics_inst_global_dec(SMF_METR_GLOB_GAUGE_GTP2_SESSIONS_ACTIVE);
         break;
     }
-    smf_metrics_inst_global_dec(SMF_METR_GLOB_GAUGE_PFCP_SESSIONS_ACTIVE);
     stats_remove_smf_session(sess);
 
     ogs_pool_free(&smf_n4_seid_pool, sess->smf_n4_seid_node);
@@ -1915,6 +1960,25 @@ smf_sess_t *smf_sess_find_by_paging_n1n2message_location(
             n1n2message_location, strlen(n1n2message_location));
 }
 
+smf_sess_t *smf_sess_find_by_gx_sid(char *gx_sid)
+{
+    smf_ue_t *smf_ue = NULL;
+    smf_sess_t *sess = NULL;
+
+    ogs_assert(gx_sid);
+
+    /* Iterate through all UEs and sessions to find matching gx_sid */
+    ogs_list_for_each(&self.smf_ue_list, smf_ue) {
+        ogs_list_for_each(&smf_ue->sess_list, sess) {
+            if (sess->gx_sid && strcmp(sess->gx_sid, gx_sid) == 0) {
+                return sess;
+            }
+        }
+    }
+
+    return NULL;
+}
+
 ogs_pcc_rule_t *smf_pcc_rule_find_by_id(smf_sess_t *sess, char *pcc_rule_id)
 {
     int i;
@@ -1963,9 +2027,6 @@ smf_bearer_t *smf_qos_flow_add(smf_sess_t *sess)
 
     dl_pdr->src_if = OGS_PFCP_INTERFACE_CORE;
 
-    dl_pdr->src_if_type_presence = true;
-    dl_pdr->src_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_N6;
-
     ul_pdr = ogs_pfcp_pdr_add(&sess->pfcp);
     ogs_assert(ul_pdr);
     qos_flow->ul_pdr = ul_pdr;
@@ -1976,10 +2037,7 @@ smf_bearer_t *smf_qos_flow_add(smf_sess_t *sess)
 
     ul_pdr->src_if = OGS_PFCP_INTERFACE_ACCESS;
 
-    ul_pdr->src_if_type_presence = true;
-    ul_pdr->src_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_N3_3GPP_ACCESS;
-
-    ul_pdr->outer_header_removal_len = 1;
+    ul_pdr->outer_header_removal_len = 2;
     if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4) {
         ul_pdr->outer_header_removal.description =
             OGS_PFCP_OUTER_HEADER_REMOVAL_GTPU_UDP_IPV4;
@@ -1989,10 +2047,10 @@ smf_bearer_t *smf_qos_flow_add(smf_sess_t *sess)
     } else if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4V6) {
         ul_pdr->outer_header_removal.description =
             OGS_PFCP_OUTER_HEADER_REMOVAL_GTPU_UDP_IP;
-    } else {
-        ogs_error("Invalid session_type [%d]", sess->session.session_type);
+    } else
         ogs_assert_if_reached();
-    }
+    ul_pdr->outer_header_removal.gtpu_extheader_deletion =
+        OGS_PFCP_PDU_SESSION_CONTAINER_TO_BE_DELETED;
 
     /* FAR */
     dl_far = ogs_pfcp_far_add(&sess->pfcp);
@@ -2004,10 +2062,6 @@ smf_bearer_t *smf_qos_flow_add(smf_sess_t *sess)
     ogs_assert(dl_far->apn);
 
     dl_far->dst_if = OGS_PFCP_INTERFACE_ACCESS;
-
-    dl_far->dst_if_type_presence = true;
-    dl_far->dst_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_N3_3GPP_ACCESS;
-
     ogs_pfcp_pdr_associate_far(dl_pdr, dl_far);
 
     dl_far->apply_action =
@@ -2023,10 +2077,6 @@ smf_bearer_t *smf_qos_flow_add(smf_sess_t *sess)
     ogs_assert(ul_far->apn);
 
     ul_far->dst_if = OGS_PFCP_INTERFACE_CORE;
-
-    ul_far->dst_if_type_presence = true;
-    ul_far->dst_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_N6;
-
     ogs_pfcp_pdr_associate_far(ul_pdr, ul_far);
 
     ul_far->apply_action = OGS_PFCP_APPLY_ACTION_FORW;
@@ -2089,10 +2139,6 @@ void smf_sess_create_indirect_data_forwarding(smf_sess_t *sess)
 
         pdr->src_if = OGS_PFCP_INTERFACE_ACCESS;
 
-        pdr->src_if_type_presence = true;
-        pdr->src_if_type =
-            OGS_PFCP_3GPP_INTERFACE_TYPE_SGW_UPF_GTP_U_FOR_UL_DATA_FORWARDING;
-
         pdr->outer_header_removal_len = 1;
         if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4) {
             pdr->outer_header_removal.description =
@@ -2103,10 +2149,8 @@ void smf_sess_create_indirect_data_forwarding(smf_sess_t *sess)
         } else if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4V6) {
             pdr->outer_header_removal.description =
                 OGS_PFCP_OUTER_HEADER_REMOVAL_GTPU_UDP_IP;
-        } else {
-            ogs_error("Invalid session_type [%d]", sess->session.session_type);
+        } else
             ogs_assert_if_reached();
-        }
 
         far = ogs_pfcp_far_add(&sess->pfcp);
         ogs_assert(far);
@@ -2116,11 +2160,6 @@ void smf_sess_create_indirect_data_forwarding(smf_sess_t *sess)
         ogs_assert(far->apn);
 
         far->dst_if = OGS_PFCP_INTERFACE_ACCESS;
-
-        far->dst_if_type_presence = true;
-        far->dst_if_type =
-            OGS_PFCP_3GPP_INTERFACE_TYPE_SGW_UPF_GTP_U_FOR_DL_DATA_FORWARDING;
-
         ogs_pfcp_pdr_associate_far(pdr, far);
 
         far->apply_action = OGS_PFCP_APPLY_ACTION_FORW;
@@ -2187,16 +2226,14 @@ void smf_sess_create_indirect_data_forwarding(smf_sess_t *sess)
                     else
                         sess->handover.upf_dl_teid = pdr->teid;
                 } else {
-                    ogs_assert(sess->pfcp_node->addr_list);
-                    if (sess->pfcp_node->addr_list->ogs_sa_family == AF_INET)
+                    if (sess->pfcp_node->addr.ogs_sa_family == AF_INET)
                         ogs_assert(OGS_OK == ogs_copyaddrinfo(
                             &sess->handover.upf_dl_addr,
-                            sess->pfcp_node->addr_list));
-                    else if (sess->pfcp_node->addr_list->ogs_sa_family ==
-                            AF_INET6)
+                            &sess->pfcp_node->addr));
+                    else if (sess->pfcp_node->addr.ogs_sa_family == AF_INET6)
                         ogs_assert(OGS_OK == ogs_copyaddrinfo(
                             &sess->handover.upf_dl_addr6,
-                            sess->pfcp_node->addr_list));
+                            &sess->pfcp_node->addr));
                     else
                         ogs_assert_if_reached();
 
@@ -2273,7 +2310,6 @@ void smf_sess_create_cp_up_data_forwarding(smf_sess_t *sess)
     ogs_pfcp_far_t *up2cp_far = NULL;
 
     ogs_assert(sess);
-    ogs_assert(sess->session.name);
 
     smf_sess_delete_cp_up_data_forwarding(sess);
 
@@ -2281,10 +2317,9 @@ void smf_sess_create_cp_up_data_forwarding(smf_sess_t *sess)
     ogs_assert(cp2up_pdr);
     sess->cp2up_pdr = cp2up_pdr;
 
-    if (ogs_global_conf()->parameter.use_upg_vpp == true) {
-        cp2up_pdr->apn = ogs_strdup(sess->session.name);
-        ogs_assert(cp2up_pdr->apn);
-    }
+    ogs_assert(sess->session.name);
+    cp2up_pdr->apn = ogs_strdup(sess->session.name);
+    ogs_assert(cp2up_pdr->apn);
 
     cp2up_pdr->src_if = OGS_PFCP_INTERFACE_CP_FUNCTION;
 
@@ -2298,22 +2333,18 @@ void smf_sess_create_cp_up_data_forwarding(smf_sess_t *sess)
     } else if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4V6) {
         cp2up_pdr->outer_header_removal.description =
             OGS_PFCP_OUTER_HEADER_REMOVAL_GTPU_UDP_IP;
-    } else {
-        ogs_error("Invalid session_type [%d]", sess->session.session_type);
+    } else
         ogs_assert_if_reached();
-    }
 
     up2cp_pdr = ogs_pfcp_pdr_add(&sess->pfcp);
     ogs_assert(up2cp_pdr);
     sess->up2cp_pdr = up2cp_pdr;
 
+    ogs_assert(sess->session.name);
     up2cp_pdr->apn = ogs_strdup(sess->session.name);
     ogs_assert(up2cp_pdr->apn);
 
     up2cp_pdr->src_if = OGS_PFCP_INTERFACE_ACCESS;
-
-    up2cp_pdr->src_if_type_presence = true;
-    up2cp_pdr->src_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_N3_3GPP_ACCESS;
 
     up2cp_pdr->outer_header_removal_len = 1;
     if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4) {
@@ -2325,10 +2356,8 @@ void smf_sess_create_cp_up_data_forwarding(smf_sess_t *sess)
     } else if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4V6) {
         up2cp_pdr->outer_header_removal.description =
             OGS_PFCP_OUTER_HEADER_REMOVAL_GTPU_UDP_IP;
-    } else {
-        ogs_error("Invalid session_type [%d]", sess->session.session_type);
+    } else
         ogs_assert_if_reached();
-    }
 
     qos_flow = smf_default_bearer_in_sess(sess);
     ogs_assert(qos_flow);
@@ -2344,23 +2373,15 @@ void smf_sess_create_cp_up_data_forwarding(smf_sess_t *sess)
     ogs_assert(up2cp_far);
     sess->up2cp_far = up2cp_far;
 
-    if (ogs_global_conf()->parameter.use_upg_vpp == true) {
-        up2cp_far->apn = ogs_strdup(sess->session.name);
-        ogs_assert(up2cp_far->apn);
-    }
+    ogs_assert(sess->session.name);
+    up2cp_far->apn = ogs_strdup(sess->session.name);
+    ogs_assert(up2cp_far->apn);
 
     up2cp_far->dst_if = OGS_PFCP_INTERFACE_CP_FUNCTION;
     ogs_pfcp_pdr_associate_far(up2cp_pdr, up2cp_far);
 
     up2cp_far->apply_action = OGS_PFCP_APPLY_ACTION_FORW;
 
-#if 0
-    /*
-     * MODIFIED the PDI matching for UP2CP
-     * to not distinguish the QoS Flow Identifier.
-     *
-     * When omitted, the UPF was also adjusted to not compare the QFI.
-     */
     if (qos_flow->qer && qos_flow->qfi) {
         /* To match the PDI of UP2CP_PDR(from ff02::2/128 to assigned)
          * Router-Solicitation has QFI in the Extended Header */
@@ -2370,7 +2391,6 @@ void smf_sess_create_cp_up_data_forwarding(smf_sess_t *sess)
          * it includes QFI in extension header */
         ogs_pfcp_pdr_associate_qer(cp2up_pdr, qos_flow->qer);
     }
-#endif
 }
 
 void smf_sess_delete_cp_up_data_forwarding(smf_sess_t *sess)
@@ -2432,6 +2452,12 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     ogs_pool_id_calloc(&smf_bearer_pool, &bearer);
     ogs_assert(bearer);
 
+    /* Initialize race condition handling flags */
+    bearer->create_pending = false;
+    bearer->delete_pending = false;
+    bearer->delete_cause_value = OGS_GTP2_CAUSE_UNDEFINED_VALUE;
+    bearer->delete_pti = OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED;
+
     smf_pf_identifier_pool_init(bearer);
 
     ogs_list_init(&bearer->pf_list);
@@ -2447,9 +2473,6 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
 
     dl_pdr->src_if = OGS_PFCP_INTERFACE_CORE;
 
-    dl_pdr->src_if_type_presence = true;
-    dl_pdr->src_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_N6;
-
     ul_pdr = ogs_pfcp_pdr_add(&sess->pfcp);
     ogs_assert(ul_pdr);
     bearer->ul_pdr = ul_pdr;
@@ -2459,9 +2482,6 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     ogs_assert(ul_pdr->apn);
 
     ul_pdr->src_if = OGS_PFCP_INTERFACE_ACCESS;
-
-    ul_pdr->src_if_type_presence = true;
-    ul_pdr->src_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_N3_3GPP_ACCESS;
 
     ul_pdr->outer_header_removal_len = 1;
     if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4) {
@@ -2473,10 +2493,31 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     } else if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4V6) {
         ul_pdr->outer_header_removal.description =
             OGS_PFCP_OUTER_HEADER_REMOVAL_GTPU_UDP_IP;
-    } else {
-        ogs_error("Invalid session_type [%d]", sess->session.session_type);
+    } else
         ogs_assert_if_reached();
-    }
+
+    // Eureka - ktsubouc: start
+    if (!bearer->urr)
+        bearer->urr = ogs_pfcp_urr_add(&sess->pfcp);
+    ogs_assert(bearer->urr);
+
+    bearer->urr->meas_method = OGS_PFCP_MEASUREMENT_METHOD_VOLUME;
+    bearer->urr->rep_triggers.volume_threshold = 1;
+    bearer->urr->vol_threshold.tovol = 1;
+    bearer->urr->vol_threshold.flags = 1;
+    bearer->urr->vol_threshold.total_volume = 1024*1024*10; // 10MB
+
+    //bearer->urr->meas_method |= OGS_PFCP_MEASUREMENT_METHOD_DURATION;
+    //bearer->urr->rep_triggers.time_threshold = 1;
+    //bearer->urr->time_threshold = 10;
+
+    //bearer->urr->rep_triggers.periodic_reporting = 1;
+    //bearer->urr->meas_period = 10;
+
+    /* Associate acconting URR each direction PDR: */
+    ogs_pfcp_pdr_associate_urr(bearer->ul_pdr, bearer->urr);
+    ogs_pfcp_pdr_associate_urr(bearer->dl_pdr, bearer->urr);
+    // Eureka - ktsubouc: end
 
     /* FAR */
     dl_far = ogs_pfcp_far_add(&sess->pfcp);
@@ -2488,10 +2529,6 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     ogs_assert(dl_far->apn);
 
     dl_far->dst_if = OGS_PFCP_INTERFACE_ACCESS;
-
-    dl_far->dst_if_type_presence = true;
-    dl_far->dst_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_N3_3GPP_ACCESS;
-
     ogs_pfcp_pdr_associate_far(dl_pdr, dl_far);
 
     dl_far->apply_action =
@@ -2507,10 +2544,6 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     ogs_assert(ul_far->apn);
 
     ul_far->dst_if = OGS_PFCP_INTERFACE_CORE;
-
-    ul_far->dst_if_type_presence = true;
-    ul_far->dst_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_N6;
-
     ogs_pfcp_pdr_associate_far(ul_pdr, ul_far);
 
     ul_far->apply_action = OGS_PFCP_APPLY_ACTION_FORW;
@@ -3121,10 +3154,9 @@ int smf_pco_build(uint8_t *pco_buf, uint8_t *buffer, int length)
             /* TODO */
             break;
         case OGS_PCO_ID_MS_SUPPORT_LOCAL_ADDR_TFT_INDICATOR:
-            smf.ids[smf.num_of_id].id = ue.ids[i].id;
-            smf.ids[smf.num_of_id].len = 0;
-            smf.ids[smf.num_of_id].data = 0;
-            smf.num_of_id++;
+            /* This PCO ID indicates the UE supports local address in TFT
+             * We'll store this information when processing the PCO in the session handler */
+            ogs_debug("UE indicates support for local address in TFT");
             break;
         case OGS_PCO_ID_P_CSCF_RE_SELECTION_SUPPORT:
             /* TODO */

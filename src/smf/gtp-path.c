@@ -73,8 +73,18 @@ static void _gtpv1v2_c_recv_cb(short when, ogs_socket_t fd, void *data)
 
     ogs_pkbuf_trim(pkbuf, size);
 
+    /* Debug: Log received message details */
+    if (size >= 2) {
+        uint8_t msg_type = pkbuf->data[1];
+        ogs_info("SMF received GTP message type %d from %s:%d (size: %d bytes)", 
+                 msg_type, OGS_ADDR(&from, frombuf), OGS_PORT(&from), (int)size);
+    }
+
     gnode = ogs_gtp_node_find_by_addr(&smf_self()->sgw_s5c_list, &from);
     if (!gnode) {
+        ogs_info("Creating new GTP node for SGW %s:%u (total nodes: %d)", 
+                 OGS_ADDR(&from, frombuf), OGS_PORT(&from), 
+                 ogs_list_count(&smf_self()->sgw_s5c_list));
         gnode = ogs_gtp_node_add_by_addr(&smf_self()->sgw_s5c_list, &from);
         if (!gnode) {
             ogs_error("Failed to create new gnode(%s:%u), mempool full, ignoring msg!",
@@ -85,7 +95,24 @@ static void _gtpv1v2_c_recv_cb(short when, ogs_socket_t fd, void *data)
         gnode->sock = data;
         smf_gtp_node_new(gnode);
         smf_metrics_inst_global_inc(SMF_METR_GLOB_GAUGE_GTP_PEERS_ACTIVE);
+    } else {
+        /* Update port if it has changed (SGW uses ephemeral ports) */
+        uint16_t old_port = OGS_PORT(&gnode->addr);
+        uint16_t new_port = OGS_PORT(&from);
+        if (old_port != new_port) {
+            ogs_info("Updating SGW port: %s:%u -> %s:%u", 
+                     OGS_ADDR(&gnode->addr, frombuf), old_port,
+                     OGS_ADDR(&from, frombuf), new_port);
+            /* Update the port in the stored address */
+            memcpy(&gnode->addr, &from, sizeof(ogs_sockaddr_t));
+        } else {
+            ogs_debug("Reusing existing GTP node for SGW %s:%u (same port)", 
+                      OGS_ADDR(&from, frombuf), OGS_PORT(&from));
+        }
     }
+    
+    /* Update activity timestamp for cleanup tracking */
+    gnode->last_activity = ogs_get_monotonic_time();
 
     gtp_ver = ((ogs_gtp2_header_t *)pkbuf->data)->version;
     switch (gtp_ver) {
@@ -141,6 +168,7 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
 
     ogs_assert(pkbuf);
     ogs_assert(pkbuf->len);
+    ogs_assert(pkbuf->data);
 
     gtp_h = (ogs_gtp2_header_t *)pkbuf->data;
     if (gtp_h->version != OGS_GTP2_VERSION_1) {
@@ -236,6 +264,8 @@ int smf_gtp_open(void)
     ogs_list_for_each(&ogs_gtp_self()->gtpc_list, node) {
         sock = ogs_gtp_server(node);
         if (!sock) return OGS_ERROR;
+
+        ogs_info("SMF GTP-C server listening (address logging temporarily disabled)");
 
         node->poll = ogs_pollset_add(ogs_app()->pollset,
                 OGS_POLLIN, sock->fd, _gtpv1v2_c_recv_cb, sock);
@@ -549,6 +579,17 @@ int smf_gtp2_send_delete_bearer_request(
     ogs_assert(bearer);
     sess = smf_sess_find_by_id(bearer->sess_id);
     ogs_assert(sess);
+
+    /* Check if Create Bearer Response is pending */
+    if (bearer->create_pending) {
+        /* Mark for deletion after Create Bearer Response is received */
+        ogs_warn("Bearer[EBI:%d] Create Bearer Response pending, "
+                 "deferring Delete Bearer Request", bearer->ebi);
+        bearer->delete_pending = true;
+        bearer->delete_cause_value = cause_value;
+        bearer->delete_pti = pti;
+        return OGS_OK;
+    }
 
     memset(&h, 0, sizeof(ogs_gtp2_header_t));
     h.type = OGS_GTP2_DELETE_BEARER_REQUEST_TYPE;

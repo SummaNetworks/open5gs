@@ -431,30 +431,40 @@ ogs_pkbuf_t *smf_s5c_build_create_bearer_request(
     req->bearer_contexts.eps_bearer_id.presence = 1;
     req->bearer_contexts.eps_bearer_id.u8 = bearer->ebi;
 
+    /* Bearer Charging ID */
+    req->bearer_contexts.charging_id.presence = 1;
+    req->bearer_contexts.charging_id.u32 = sess->charging.id;
+
     /* Data Plane(UL) : PGW-S5U */
     memset(&pgw_s5u_teid, 0, sizeof(ogs_gtp2_f_teid_t));
+    ogs_assert(bearer->pgw_s5u_addr || bearer->pgw_s5u_addr6);
+    rv = ogs_gtp2_sockaddr_to_f_teid(
+        bearer->pgw_s5u_addr, bearer->pgw_s5u_addr6,
+        &pgw_s5u_teid, &len);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_gtp2_sockaddr_to_f_teid() failed");
+        return NULL;
+    }
+    pgw_s5u_teid.teid = htobe32(bearer->pgw_s5u_teid);
     switch (sess->gtp_rat_type) {
     case OGS_GTP2_RAT_TYPE_EUTRAN:
         pgw_s5u_teid.interface_type = OGS_GTP2_F_TEID_S5_S8_PGW_GTP_U;
+        ogs_debug("[SMF] setting OGS_GTP2_F_TEID_S5_S8_PGW_GTP_U as interface type");
+        req->bearer_contexts.s4_u_sgsn_f_teid.presence = 1;
+        req->bearer_contexts.s4_u_sgsn_f_teid.data = &pgw_s5u_teid;
+        req->bearer_contexts.s4_u_sgsn_f_teid.len = len;
         break;
     case OGS_GTP2_RAT_TYPE_WLAN:
         pgw_s5u_teid.interface_type = OGS_GTP2_F_TEID_S2B_U_PGW_GTP_U;
+        ogs_debug("[SMF] setting OGS_GTP2_F_TEID_S2B_U_PGW_GTP_U as interface type");
+        req->bearer_contexts.s12_rnc_f_teid.presence = 1;
+        req->bearer_contexts.s12_rnc_f_teid.data = &pgw_s5u_teid;
+        req->bearer_contexts.s12_rnc_f_teid.len = len;
         break;
     default:
         ogs_error("Unknown RAT Type [%d]", sess->gtp_rat_type);
         ogs_assert_if_reached();
     }
-    pgw_s5u_teid.teid = htobe32(bearer->pgw_s5u_teid);
-    ogs_assert(bearer->pgw_s5u_addr || bearer->pgw_s5u_addr6);
-    rv = ogs_gtp2_sockaddr_to_f_teid(
-        bearer->pgw_s5u_addr, bearer->pgw_s5u_addr6, &pgw_s5u_teid, &len);
-    if (rv != OGS_OK) {
-        ogs_error("ogs_gtp2_sockaddr_to_f_teid() failed");
-        return NULL;
-    }
-    req->bearer_contexts.s4_u_sgsn_f_teid.presence = 1;
-    req->bearer_contexts.s4_u_sgsn_f_teid.data = &pgw_s5u_teid;
-    req->bearer_contexts.s4_u_sgsn_f_teid.len = len;
 
     /* Bearer QoS */
     memset(&bearer_qos, 0, sizeof(bearer_qos));
@@ -512,6 +522,10 @@ ogs_pkbuf_t *smf_s5c_build_update_bearer_request(
     req->bearer_contexts.presence = 1;
     req->bearer_contexts.eps_bearer_id.presence = 1;
     req->bearer_contexts.eps_bearer_id.u8 = bearer->ebi;
+
+    /* Bearer Charging ID */
+    req->bearer_contexts.charging_id.presence = 1;
+    req->bearer_contexts.charging_id.u32 = sess->charging.id;
 
     if (sess->session.ambr.uplink || sess->session.ambr.downlink) {
         /*

@@ -176,28 +176,11 @@ void smf_s6b_send_aar(smf_sess_t *sess, ogs_gtp_xact_t *xact)
     ret = fd_msg_add_origin(req, 0);
     ogs_assert(ret == 0);
 
-    /* Set the Destination-Host AVP */
-    if (sess->aaa_server_identifier.name) {
-        ret = fd_msg_avp_new(ogs_diam_destination_host, 0, &avp);
-        ogs_assert(ret == 0);
-        val.os.data = (unsigned char *)sess->aaa_server_identifier.name;
-        val.os.len  = strlen(sess->aaa_server_identifier.name);
-        ret = fd_msg_avp_setvalue(avp, &val);
-        ogs_assert(ret == 0);
-        ret = fd_msg_avp_add(req, MSG_BRW_LAST_CHILD, avp);
-        ogs_assert(ret == 0);
-    }
-
     /* Set the Destination-Realm AVP */
     ret = fd_msg_avp_new(ogs_diam_destination_realm, 0, &avp);
     ogs_assert(ret == 0);
-    if (sess->aaa_server_identifier.realm) {
-        val.os.data = (unsigned char *)(sess->aaa_server_identifier.realm);
-        val.os.len  = strlen(sess->aaa_server_identifier.realm);
-    } else {
-        val.os.data = (unsigned char *)(fd_g_config->cnf_diamrlm);
-        val.os.len  = strlen(fd_g_config->cnf_diamrlm);
-    }
+    val.os.data = (unsigned char *)(fd_g_config->cnf_diamrlm);
+    val.os.len  = strlen(fd_g_config->cnf_diamrlm);
     ret = fd_msg_avp_setvalue(avp, &val);
     ogs_assert(ret == 0);
     ret = fd_msg_avp_add(req, MSG_BRW_LAST_CHILD, avp);
@@ -243,7 +226,7 @@ void smf_s6b_send_aar(smf_sess_t *sess, ogs_gtp_xact_t *xact)
     ogs_assert(ret == 0);
 
     /* Set the User-Name AVP */
-    user_name = ogs_msprintf("%s@nai.epc.mnc%03d.mcc%03d.3gppnetwork.org",
+    user_name = ogs_msprintf("0%s@nai.epc.mnc%03d.mcc%03d.3gppnetwork.org",
                     smf_ue->imsi_bcd,
                     ogs_plmn_id_mnc(&sess->serving_plmn_id),
                     ogs_plmn_id_mcc(&sess->serving_plmn_id));
@@ -616,7 +599,7 @@ void smf_s6b_send_str(smf_sess_t *sess, ogs_gtp_xact_t *xact, uint32_t cause)
     ogs_assert(ret == 0);
 
     /* Set the User-Name AVP */
-    user_name = ogs_msprintf("%s@nai.epc.mnc%03d.mcc%03d.3gppnetwork.org",
+    user_name = ogs_msprintf("0%s@nai.epc.mnc%03d.mcc%03d.3gppnetwork.org",
                     smf_ue->imsi_bcd,
                     ogs_plmn_id_mnc(&sess->serving_plmn_id),
                     ogs_plmn_id_mcc(&sess->serving_plmn_id));
@@ -699,6 +682,7 @@ static void smf_s6b_sta_cb(void *data, struct msg **msg)
     ogs_assert(s6b_message);
     /* Set Session Termination Command */
     s6b_message->cmd_code = OGS_DIAM_S6B_CMD_SESSION_TERMINATION;
+
 
     /* Value of Result Code */
     ret = fd_msg_search_avp(*msg, ogs_diam_result_code, &avp);

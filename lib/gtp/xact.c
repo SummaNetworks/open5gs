@@ -598,7 +598,10 @@ static int ogs_gtp_xact_update_rx(ogs_gtp_xact_t *xact, uint8_t type)
 
         case GTP_XACT_FINAL_STAGE:
             if (xact->step != 2) {
-                ogs_error("invalid step[%d]", xact->step);
+                char buf[OGS_ADDRSTRLEN];
+                ogs_error("invalid step[%d] for xact[%d] from [%s]:%d (expected step 2 for FINAL_STAGE)", 
+                        xact->step, xact->xid,
+                        OGS_ADDR(&xact->gnode->addr, buf), OGS_PORT(&xact->gnode->addr));
                 return OGS_ERROR;
             }
 

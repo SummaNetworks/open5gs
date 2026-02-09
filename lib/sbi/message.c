@@ -412,7 +412,8 @@ ogs_sbi_request_t *ogs_sbi_build_request(ogs_sbi_message_t *message)
                                 &discovery_option->guami.amf_id));
             }
         }
-        if (discovery_option->num_of_service_names) {
+        if (ogs_sbi_self()->discovery_config.no_service_names == false &&
+            discovery_option->num_of_service_names) {
 
     /*
      * Issues #1730
@@ -612,6 +613,11 @@ ogs_sbi_request_t *ogs_sbi_build_request(ogs_sbi_message_t *message)
         char *v = NULL;
         cJSON *item = NULL;
 
+        if (!message->param.s_nssai.sst) {
+            ogs_error("No S-NSSAI SST");
+            ogs_sbi_request_free(request);
+            return NULL;
+        }
         if (!message->param.roaming_indication) {
             ogs_error("No Roaming Indication");
             ogs_sbi_request_free(request);

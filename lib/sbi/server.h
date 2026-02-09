@@ -41,7 +41,7 @@ typedef struct ogs_sbi_server_s {
 
     char *interface;
     OpenAPI_uri_scheme_e scheme;
-    char *private_key, *cert, *sslkeylog;
+    char *private_key, *cert;
     bool verify_client;
     char *verify_client_cacert;
 

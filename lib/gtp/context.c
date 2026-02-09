@@ -200,7 +200,6 @@ int ogs_gtp_context_parse_config(const char *local, const char *remote)
                                                 server_key);
                                 }
 
-                                /* Add address information */
                                 addr = NULL;
                                 for (i = 0; i < num; i++) {
                                     rv = ogs_addaddrinfo(&addr,
@@ -208,30 +207,17 @@ int ogs_gtp_context_parse_config(const char *local, const char *remote)
                                     ogs_assert(rv == OGS_OK);
                                 }
 
-                                /* Add each address as a separate socknode */
                                 if (addr) {
-                                    ogs_sockaddr_t *current = addr;
-                                    while (current) {
-                                        if (current->ogs_sa_family ==
-                                                AF_INET &&
-                                            ogs_global_conf()->
-                                                parameter.no_ipv4 == 0) {
-                                            ogs_socknode_add(&self.gtpc_list,
-                                                             AF_INET, current,
-                                                             is_option ?
-                                                             &option : NULL);
-                                        }
-                                        if (current->ogs_sa_family ==
-                                                AF_INET6 &&
-                                            ogs_global_conf()->
-                                                parameter.no_ipv6 == 0) {
-                                            ogs_socknode_add(&self.gtpc_list6,
-                                                             AF_INET6, current,
-                                                             is_option ?
-                                                             &option : NULL);
-                                        }
-                                        current = current->next;
-                                    }
+                                    if (ogs_global_conf()->parameter.
+                                            no_ipv4 == 0)
+                                        ogs_socknode_add(
+                                            &self.gtpc_list, AF_INET, addr,
+                                            is_option ? &option : NULL);
+                                    if (ogs_global_conf()->parameter.
+                                            no_ipv6 == 0)
+                                        ogs_socknode_add(
+                                            &self.gtpc_list6, AF_INET6, addr,
+                                            is_option ? &option : NULL);
                                     ogs_freeaddrinfo(addr);
                                 }
 
@@ -431,28 +417,16 @@ int ogs_gtp_context_parse_config(const char *local, const char *remote)
                                 ogs_list_init(&list6);
 
                                 if (addr) {
-                                    ogs_sockaddr_t *current = addr;
-                                    while (current) {
-                                        if (current->ogs_sa_family ==
-                                                AF_INET &&
-                                            ogs_global_conf()->
-                                                parameter.no_ipv4 == 0) {
-                                            ogs_socknode_add(&list,
-                                                             AF_INET, current,
-                                                             is_option ?
-                                                             &option : NULL);
-                                        }
-                                        if (current->ogs_sa_family ==
-                                                AF_INET6 &&
-                                            ogs_global_conf()->
-                                                parameter.no_ipv6 == 0) {
-                                            ogs_socknode_add(&list6,
-                                                             AF_INET6, current,
-                                                             is_option ?
-                                                             &option : NULL);
-                                        }
-                                        current = current->next;
-                                    }
+                                    if (ogs_global_conf()->parameter.
+                                            no_ipv4 == 0)
+                                        ogs_socknode_add(
+                                            &list, AF_INET, addr,
+                                            is_option ? &option : NULL);
+                                    if (ogs_global_conf()->parameter.
+                                            no_ipv6 == 0)
+                                        ogs_socknode_add(
+                                            &list6, AF_INET6, addr,
+                                            is_option ? &option : NULL);
                                     ogs_freeaddrinfo(addr);
                                 }
 
@@ -585,6 +559,9 @@ ogs_gtp_node_t *ogs_gtp_node_new(ogs_sockaddr_t *sa_list)
 
     ogs_list_init(&node->local_list);
     ogs_list_init(&node->remote_list);
+    
+    /* Initialize activity timestamp */
+    node->last_activity = ogs_get_monotonic_time();
 
     return node;
 }
@@ -690,6 +667,40 @@ void ogs_gtp_node_remove_all(ogs_list_t *list)
         ogs_gtp_node_remove(list, node);
 }
 
+void ogs_gtp_node_remove_idle(ogs_list_t *list)
+{
+    ogs_gtp_node_t *node = NULL, *next_node = NULL;
+    char buf[OGS_ADDRSTRLEN];
+    int removed_count = 0;
+    int total_count = 0;
+
+    ogs_list_for_each_safe(list, next_node, node) {
+        total_count++;
+        /* Remove nodes with no active transactions */
+        if (ogs_list_empty(&node->local_list) && 
+            ogs_list_empty(&node->remote_list)) {
+            ogs_info("Removing idle GTP node [%s]:%d (no active transactions)", 
+                    OGS_ADDR(&node->addr, buf), OGS_PORT(&node->addr));
+            
+            /* Free application-specific wrapper if present */
+            if (node->data_ptr) {
+                /* This should be freed by the application layer before calling remove */
+                ogs_warn("GTP node has data_ptr - application should free wrapper first");
+            }
+            
+            ogs_gtp_node_remove(list, node);
+            removed_count++;
+        }
+    }
+
+    if (removed_count > 0) {
+        ogs_info("GTP node cleanup: removed %d idle nodes, %d nodes remaining", 
+                removed_count, total_count - removed_count);
+    } else if (total_count > 0) {
+        ogs_debug("GTP node cleanup: no idle nodes found, %d nodes active", total_count);
+    }
+}
+
 ogs_gtp_node_t *ogs_gtp_node_find_by_addr(
         ogs_list_t *list, ogs_sockaddr_t *addr)
 {
@@ -699,7 +710,24 @@ ogs_gtp_node_t *ogs_gtp_node_find_by_addr(
     ogs_assert(addr);
 
     ogs_list_for_each(list, node) {
-        if (ogs_sockaddr_is_equal(&node->addr, addr) == true)
+        /* Compare only IP address, ignore port to handle SGW ephemeral ports */
+        /* COMPILE VERIFICATION: This fix should prevent pool exhaustion */
+        if (node->addr.ogs_sa_family != addr->ogs_sa_family)
+            continue;
+            
+        bool addr_match = false;
+        switch (addr->ogs_sa_family) {
+        case AF_INET:
+            addr_match = (memcmp(&node->addr.sin.sin_addr, &addr->sin.sin_addr, 
+                                sizeof(struct in_addr)) == 0);
+            break;
+        case AF_INET6:
+            addr_match = (memcmp(&node->addr.sin6.sin6_addr, &addr->sin6.sin6_addr, 
+                                sizeof(struct in6_addr)) == 0);
+            break;
+        }
+        
+        if (addr_match)
             break;
     }
 

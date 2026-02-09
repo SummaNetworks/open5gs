@@ -53,6 +53,8 @@ libcore_headers = ('''
     sys/types.h
     sys/wait.h
     sys/uio.h
+    ulfius.h
+    jansson.h
 '''.split())
 
 foreach h : libcore_headers
@@ -133,6 +135,13 @@ if libcore_conf.has('HAVE_EXECINFO_H')
         libcore_conf.set('HAVE_BACKTRACE', 1)
     endif
 endif    
+
+# ktsubouc
+libulfius = []
+libulfius = cc.find_library('ulfius')
+libjansson = []
+libjansson = cc.find_library('jansson')
+# ---
 
 # Check for clock_gettime()
 clock_gettime_test_code = '''
@@ -318,10 +327,10 @@ libcore = library('ogscore',
     version : libogslib_version,
     c_args : '-DOGS_CORE_COMPILATION',
     include_directories : [libcore_inc, libinc],
-    dependencies : [threads, librt, libexecinfo, libsocket, libtalloc_dep],
+    dependencies : [threads, librt, libexecinfo, libsocket, libtalloc_dep, libulfius, libjansson],
     install : true)
 
 libcore_dep = declare_dependency(
     link_with : libcore,
     include_directories : [libcore_inc, libinc],
-    dependencies : [threads, librt, libexecinfo, libsocket, libtalloc_dep])
+    dependencies : [threads, librt, libexecinfo, libsocket, libtalloc_dep, libulfius, libjansson])

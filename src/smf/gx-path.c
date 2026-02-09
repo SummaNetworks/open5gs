@@ -802,7 +802,14 @@ static void smf_gx_cca_cb(void *data, struct msg **msg)
 
     sess = smf_sess_find_by_id(sess_data->sess_id);
     ogs_assert(sess_data->xact_data[req_slot].cc_req_no == cc_request_number);
-    ogs_assert(sess);
+    
+    if (!sess) {
+        ogs_warn("Session not found for ID [%d] - session might have been released", 
+                sess_data->sess_id);
+        ogs_debug("Cleaning up Gx Diameter session for already released SMF session");
+        state_cleanup(sess_data, NULL, NULL);
+        return;
+    }
 
     gx_message = ogs_calloc(1, sizeof(ogs_diam_gx_message_t));
     ogs_assert(gx_message);
@@ -1127,17 +1134,14 @@ out:
     ogs_debug("    CC-Request-Type[%d] Number[%d] in Session Data",
         sess_data->cc_request_type, sess_data->cc_request_number);
     ogs_debug("    Current CC-Request-Number[%d]", cc_request_number);
-    if (sess_data->cc_request_type ==
-            OGS_DIAM_GX_CC_REQUEST_TYPE_TERMINATION_REQUEST &&
-        sess_data->cc_request_number <= cc_request_number) {
-        ogs_debug("    [LAST] state_cleanup(): [%s]", sess_data->gx_sid);
-        state_cleanup(sess_data, NULL, NULL);
-    } else {
-        ogs_debug("    fd_sess_state_store(): [%s]", sess_data->gx_sid);
-        ret = fd_sess_state_store(smf_gx_reg, session, &sess_data);
-        ogs_assert(ret == 0);
-        ogs_assert(sess_data == NULL);
-    }
+    
+    /* Don't automatically cleanup Diameter session state for CCR-T responses.
+     * Let the proper session management flow handle cleanup to avoid race conditions
+     * where RAR arrives after premature Diameter state cleanup. */
+    ogs_debug("    fd_sess_state_store(): [%s]", sess_data->gx_sid);
+    ret = fd_sess_state_store(smf_gx_reg, session, &sess_data);
+    ogs_assert(ret == 0);
+    ogs_assert(sess_data == NULL);
 
     ret = fd_msg_free(*msg);
     ogs_assert(ret == 0);
@@ -1193,14 +1197,18 @@ static int smf_gx_rar_cb( struct msg **msg, struct avp *avp,
     ret = fd_sess_state_retrieve(smf_gx_reg, session, &sess_data);
     ogs_assert(ret == 0);
     if (!sess_data) {
-        ogs_error("No Session Data");
+        ogs_warn("No Session Data - session already released, sending UNKNOWN_SESSION_ID");
+        result_code = OGS_DIAM_UNKNOWN_SESSION_ID;
         goto out;
     }
 
     /* Get Session Information */
     sess = smf_sess_find_by_id(sess_data->sess_id);
     if (!sess) {
-        ogs_error("No Session ID [%d]", sess_data->sess_id);
+        ogs_warn("No Session ID [%d] - session already released, cleaning up Diameter state", 
+                sess_data->sess_id);
+        state_cleanup(sess_data, NULL, NULL);
+        result_code = OGS_DIAM_UNKNOWN_SESSION_ID;
         goto out;
     }
 
@@ -1270,7 +1278,7 @@ static int smf_gx_rar_cb( struct msg **msg, struct avp *avp,
                     }
                     break;
                 default:
-                    ogs_error("Not supported(%d)", hdr->avp_code);
+                    ogs_debug("Ignoring unsupported AVP(%d) in charging rule install", hdr->avp_code);
                     break;
                 }
                 fd_msg_browse(avpch1, MSG_BRW_NEXT, &avpch1, NULL);
@@ -1301,14 +1309,14 @@ static int smf_gx_rar_cb( struct msg **msg, struct avp *avp,
                     }
                     break;
                 default:
-                    ogs_error("Not supported(%d)", hdr->avp_code);
+                    ogs_debug("Ignoring unsupported AVP(%d) in charging rule remove", hdr->avp_code);
                     break;
                 }
                 fd_msg_browse(avpch1, MSG_BRW_NEXT, &avpch1, NULL);
             }
             break;
         default:
-            ogs_warn("Not supported(%d)", hdr->avp_code);
+            ogs_debug("Ignoring unsupported AVP(%d) in main context", hdr->avp_code);
             break;
         }
         fd_msg_browse(avp, MSG_BRW_NEXT, &avp, NULL);
@@ -1609,7 +1617,7 @@ static int decode_pcc_rule_definition(
             pcc_rule->rating_group = hdr->avp_value->i32;
             break;
         default:
-            ogs_error("Not implemented(%d)", hdr->avp_code);
+            ogs_debug("Ignoring unsupported AVP(%d) in PCC rule definition", hdr->avp_code);
             break;
         }
         fd_msg_browse(avpch2, MSG_BRW_NEXT, &avpch2, NULL);

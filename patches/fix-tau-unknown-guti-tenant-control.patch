@@ -1,0 +1,35 @@
+diff --git a/src/mme/emm-handler.c b/src/mme/emm-handler.c
+index 0f953c59e..b6a574ead 100644
+--- a/src/mme/emm-handler.c
++++ b/src/mme/emm-handler.c
+@@ -459,11 +459,11 @@ int emm_handle_identity_response(
+         }
+ 
+         ogs_info("    IMSI[%s]", mme_ue->imsi_bcd);
+-        
++
+         /* Check Tenant Control after IMSI is obtained from Identity Response */
+         if (mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST) {
+             if (!mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
+-                ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation", 
++                ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation",
+                          mme_ue->imsi_bcd, mme_ue->tai.tac);
+                 r = nas_eps_send_attach_reject(enb_ue, mme_ue,
+                         OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA,
+@@ -715,11 +715,11 @@ int emm_handle_tau_request(
+     }
+     ogs_debug("    SERVED_TAI_INDEX[%d]", served_tai_index);
+ 
+-    /* Check Tenant Control */
+-    if (!mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
+-        ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation", 
+-                 MME_UE_HAVE_IMSI(mme_ue) ? mme_ue->imsi_bcd : "Unknown", 
+-                 mme_ue->tai.tac);
++    /* Check Tenant Control only when IMSI is known */
++    if (MME_UE_HAVE_IMSI(mme_ue) &&
++        !mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
++        ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation",
++                 mme_ue->imsi_bcd, mme_ue->tai.tac);
+         r = nas_eps_send_tau_reject(enb_ue, mme_ue,
+                 OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA);
+         ogs_expect(r == OGS_OK);

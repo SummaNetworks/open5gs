@@ -168,8 +168,16 @@ static void _gtpv1_tun_recv_common_cb(
         goto cleanup;
 
     ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
+        if (!pdr->id) {
+            ogs_error("Invalid PDR with ID:0 found - skipping corrupted entry");
+            continue;
+        }
+        
         far = pdr->far;
-        ogs_assert(far);
+        if (!far) {
+            ogs_warn("PDR [ID:%d] has no associated FAR - skipping", pdr->id);
+            continue;
+        }
 
         /* Check if PDR is Downlink */
         if (pdr->src_if != OGS_PFCP_INTERFACE_CORE)
@@ -351,6 +359,18 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
     if (header_desc.type == OGS_GTPU_MSGTYPE_END_MARKER) {
         /* Nothing */
 
+    } else if (header_desc.type != OGS_GTPU_MSGTYPE_ECHO_REQ &&
+               header_desc.type != OGS_GTPU_MSGTYPE_ECHO_RSP &&
+               header_desc.type != OGS_GTPU_MSGTYPE_ERR_IND &&
+               header_desc.type != OGS_GTPU_MSGTYPE_SUPP_EXTHDR_NOTI &&
+               header_desc.type != OGS_GTPU_MSGTYPE_END_MARKER &&
+               header_desc.type != OGS_GTPU_MSGTYPE_GPDU) {
+        /* Handle unknown GTP-U message types */
+        ogs_warn("Received unknown GTP-U message type [%d] from [%s]", 
+                header_desc.type, OGS_ADDR(&from, buf1));
+        ogs_log_hexdump(OGS_LOG_WARN, pkbuf->data, pkbuf->len);
+        goto cleanup;
+
     } else if (header_desc.type == OGS_GTPU_MSGTYPE_ERR_IND) {
         ogs_pfcp_far_t *far = NULL;
 
@@ -450,7 +470,8 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
                     continue;
 
                 /* Check if QFI */
-                if (pdr->qfi && pdr->qfi != header_desc.qos_flow_identifier)
+                if (header_desc.qos_flow_identifier &&
+                    pdr->qfi != header_desc.qos_flow_identifier)
                     continue;
 
                 /* Check if Rule List in PDR */
@@ -489,8 +510,8 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
 
             break;
         default:
-            ogs_fatal("Unknown type [%d]", pfcp_object->type);
-            ogs_assert_if_reached();
+            ogs_warn("Unknown PFCP object type [%d], skipping packet", pfcp_object->type);
+            goto cleanup;
         }
 
         ogs_assert(pdr);
@@ -500,8 +521,16 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
         sess = UPF_SESS(pdr->sess);
         ogs_assert(sess);
 
+        if (!pdr->id) {
+            ogs_error("Invalid PDR with ID:0 found - skipping corrupted entry");
+            goto cleanup;
+        }
+
         far = pdr->far;
-        ogs_assert(far);
+        if (!far) {
+            ogs_warn("PDR [ID:%d] has no associated FAR - skipping", pdr->id);
+            goto cleanup;
+        }
 
         if (ip_h->ip_v == 4 && sess->ipv4) {
             src_addr = (void *)&ip_h->ip_src.s_addr;
@@ -516,7 +545,15 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
              */
             if (far->dst_if != OGS_PFCP_INTERFACE_ACCESS) {
 
-                if (src_addr[0] == sess->ipv4->addr[0]) {
+                /* Exempt IMS APN from strict IP spoofing detection
+                 * As IMS services like P-CSCF legitimately send traffic to UEs
+                 * with source IPs that don't match the UE's IP
+                 */
+                if (pdr->dnn && strcmp(pdr->dnn, "ims") == 0) {
+                    /* Skip source IP validation for IMS APN */
+                    ogs_debug("Exempting IMS APN from source IP validation: SRC:%08X, UE:%08X",
+                        be32toh(src_addr[0]), be32toh(sess->ipv4->addr[0]));
+                } else if (src_addr[0] == sess->ipv4->addr[0]) {
                     /* Source IP address should be matched in uplink */
                 } else if (check_framed_routes(sess, AF_INET, src_addr)) {
                     /* Or source IP address should match a framed route */

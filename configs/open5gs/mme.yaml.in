@@ -50,6 +50,16 @@ mme:
 #      value: 3240  # 54 minutes * 60 = 3240 seconds
 #    t3423:
 #      value: 720   # 12 minutes * 60 = 720 seconds
+#    t3413:
+#      value: 2      # Paging timer: 2 seconds (default)
+#      max_count: 1  # Paging retry count: 1 retry (default)
+#                    # Total paging duration = value * (max_count + 1)
+#                    # Default: 2 seconds * 2 = 4 seconds
+
+  # Paging failure policy (default: no_action)
+  # - no_action: Only send UNABLE_TO_PAGE_UE cause, keep sessions (legacy behavior)
+  # - delete_sessions: Delete all PDN sessions when paging fails (3GPP compliant aggressive policy)
+# paging_failure_policy: no_action
 
 ################################################################################
 # S1AP Server
@@ -164,9 +174,8 @@ mme:
 ################################################################################
 #  o MSC/VLR
 #  sgsap:
-#    client:
-#      - address: msc.open5gs.org # SCTP server address configured on the MSC/VLR
-#        local_address: 127.0.0.2 # SCTP local IP addresses to be bound in the MME
+#    server:
+#      - address: 127.0.0.2
 #        map:
 #          tai:
 #            plmn_id:
@@ -189,15 +198,7 @@ mme:
 #              mcc: 002
 #              mnc: 02
 #            lac: 43692
-#      - address:       # SCTP server address configured on the MSC/VLR
-#          - 127.0.0.88
-#          - 10.0.0.88
-#          - 172.16.0.88
-#          - 2001:db8:babe::88
-#        local_address: # SCTP local IP addresses to be bound in the MME
-#          - 127.0.0.2
-#          - 192.168.1.4
-#          - 2001:db8:cafe::2
+#      - address: msc.open5gs.org
 #        map:
 #          tai:
 #            plmn_id:

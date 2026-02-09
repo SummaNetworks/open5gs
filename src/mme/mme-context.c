@@ -19,13 +19,15 @@
 
 #include "ogs-sctp.h"
 
+#include <jansson.h>
+
 #include "mme-context.h"
 #include "mme-event.h"
 #include "mme-timer.h"
+#include "mme-sm.h"
 #include "nas-path.h"
 #include "s1ap-path.h"
 #include "s1ap-handler.h"
-#include "mme-sm.h"
 #include "mme-gtp-path.h"
 
 #define MAX_CELL_PER_ENB            8
@@ -43,7 +45,6 @@ static OGS_POOL(mme_sgw_pool, mme_sgw_t);
 static OGS_POOL(mme_pgw_pool, mme_pgw_t);
 static OGS_POOL(mme_vlr_pool, mme_vlr_t);
 static OGS_POOL(mme_csmap_pool, mme_csmap_t);
-static OGS_POOL(mme_hssmap_pool, mme_hssmap_t);
 
 static OGS_POOL(mme_enb_pool, mme_enb_t);
 static OGS_POOL(mme_ue_pool, mme_ue_t);
@@ -98,7 +99,6 @@ void mme_context_init(void)
     ogs_list_init(&self.enb_list);
     ogs_list_init(&self.vlr_list);
     ogs_list_init(&self.csmap_list);
-    ogs_list_init(&self.hssmap_list);
 
     ogs_pool_init(&mme_sgsn_route_pool, ogs_app()->pool.nf);
     ogs_pool_init(&mme_sgsn_pool, ogs_app()->pool.nf);
@@ -106,7 +106,6 @@ void mme_context_init(void)
     ogs_pool_init(&mme_pgw_pool, ogs_app()->pool.nf);
     ogs_pool_init(&mme_vlr_pool, ogs_app()->pool.nf);
     ogs_pool_init(&mme_csmap_pool, ogs_app()->pool.csmap);
-    ogs_pool_init(&mme_hssmap_pool, ogs_app()->pool.nf);
 
     /* Allocate TWICE the pool to check if maximum number of eNBs is reached */
     ogs_pool_init(&mme_enb_pool, ogs_global_conf()->max.peer*2);
@@ -127,6 +126,9 @@ void mme_context_init(void)
 #if 0 /* For debugging : Verify whether there are duplicates of M_TMSI. */
     ogs_pool_assert_if_has_duplicate(&m_tmsi_pool);
 #endif
+
+    /* Initialize tenant control mutex */
+    ogs_thread_mutex_init(&self.tenant_control_mutex);
 
     self.enb_addr_hash = ogs_hash_make();
     ogs_assert(self.enb_addr_hash);
@@ -158,7 +160,6 @@ void mme_context_final(void)
     mme_csmap_remove_all();
     mme_vlr_remove_all();
     mme_sgsn_remove_all();
-    mme_hssmap_remove_all();
 
     ogs_assert(self.enb_addr_hash);
     ogs_hash_destroy(self.enb_addr_hash);
@@ -191,7 +192,9 @@ void mme_context_final(void)
     ogs_pool_final(&mme_pgw_pool);
     ogs_pool_final(&mme_csmap_pool);
     ogs_pool_final(&mme_vlr_pool);
-    ogs_pool_final(&mme_hssmap_pool);
+
+    /* Destroy tenant control mutex */
+    ogs_thread_mutex_destroy(&self.tenant_control_mutex);
 
     context_initialized = 0;
 }
@@ -212,6 +215,13 @@ static int mme_context_prepare(void)
 
     /* Set the default T3412 to 9 minutes for backward compatibility. */
     self.time.t3412.value = 540;
+
+    /* Set default T3413 (Paging timer) values */
+    self.time.t3413.value = 2;      /* 2 seconds */
+    self.time.t3413.max_count = 1;  /* 1 retry (total 4 seconds) */
+
+    /* Set default paging failure policy */
+    self.paging_failure_policy = MME_PAGING_FAILURE_POLICY_NO_ACTION;
 
     return OGS_OK;
 }
@@ -1837,73 +1847,119 @@ int mme_context_parse_config(void)
 
                     } while (ogs_yaml_iter_type(&access_control_array) ==
                             YAML_SEQUENCE_NODE);
-                } else if (!strcmp(mme_key, "hss_map")) {
-                    ogs_yaml_iter_t hss_map_array, hss_map_iter;
-                    ogs_yaml_iter_recurse(&mme_iter, &hss_map_array);
+                } else if (!strcmp(mme_key, "tenant_control")) {
+                    ogs_yaml_iter_t tenant_control_array, tenant_control_iter;
+                    ogs_yaml_iter_recurse(&mme_iter, &tenant_control_array);
                     do {
-                        if (ogs_yaml_iter_type(&hss_map_array) ==
-                                YAML_MAPPING_NODE) {
-                            memcpy(&hss_map_iter, &hss_map_array,
-                                    sizeof(ogs_yaml_iter_t));
-                        } else if (ogs_yaml_iter_type(&hss_map_array) ==
-                            YAML_SEQUENCE_NODE) {
-                            if (!ogs_yaml_iter_next(&hss_map_array))
-                                break;
-                            ogs_yaml_iter_recurse(&hss_map_array,
-                                    &hss_map_iter);
-                        } else if (ogs_yaml_iter_type(&hss_map_array) ==
-                            YAML_SCALAR_NODE) {
+                        if (!ogs_yaml_iter_next(&tenant_control_array))
                             break;
-                        } else
-                            ogs_assert_if_reached();
+                        ogs_yaml_iter_recurse(&tenant_control_array,
+                                &tenant_control_iter);
 
-                        while (ogs_yaml_iter_next(&hss_map_iter)) {
-                            const char *mnc = NULL, *mcc = NULL, *realm = NULL, *host = NULL;
-                            const char *hss_map_key =
-                                ogs_yaml_iter_key(&hss_map_iter);
-                            ogs_assert(hss_map_key);
-                            if (!strcmp(hss_map_key, "plmn_id")) {
-                                ogs_yaml_iter_t plmn_id_iter;
+                        ogs_assert(self.num_of_tenant_control < 16);
 
-                                ogs_yaml_iter_recurse(&hss_map_iter,
-                                        &plmn_id_iter);
-                                while (ogs_yaml_iter_next(&plmn_id_iter)) {
-                                    const char *plmn_id_key =
-                                        ogs_yaml_iter_key(&plmn_id_iter);
-                                    ogs_assert(plmn_id_key);
-                                    if (!strcmp(plmn_id_key, "host")) {
-                                        const char *v = ogs_yaml_iter_value(
-                                                &plmn_id_iter);
-                                        if (v) host = ogs_strndup(v, OGS_MAX_FQDN_LEN);
-                                    } else if (!strcmp(plmn_id_key, "realm")) {
-                                        const char *v = ogs_yaml_iter_value(
-                                                &plmn_id_iter);
-                                        if (v) realm = ogs_strndup(v, OGS_MAX_FQDN_LEN);
-                                    } else if (!strcmp(plmn_id_key, "mcc")) {
-                                        mcc = ogs_yaml_iter_value(
-                                                &plmn_id_iter);
-                                    } else if (!strcmp(plmn_id_key, "mnc")) {
-                                        mnc = ogs_yaml_iter_value(
-                                                &plmn_id_iter);
+                        while (ogs_yaml_iter_next(&tenant_control_iter)) {
+                            const char *tenant_key =
+                                ogs_yaml_iter_key(&tenant_control_iter);
+                            ogs_assert(tenant_key);
+                            
+                            if (!strcmp(tenant_key, "tenant_id")) {
+                                const char *v = ogs_yaml_iter_value(&tenant_control_iter);
+                                if (v) {
+                                    ogs_cpystrn(
+                                        self.tenant_control[self.num_of_tenant_control].tenant_id,
+                                        v, sizeof(self.tenant_control[self.num_of_tenant_control].tenant_id));
+                                }
+                            } else if (!strcmp(tenant_key, "tac")) {
+                                const char *v = ogs_yaml_iter_value(&tenant_control_iter);
+                                if (v) {
+                                    self.tenant_control[self.num_of_tenant_control].tac = atoi(v);
+                                }
+                            } else if (!strcmp(tenant_key, "allowed_imsi")) {
+                                ogs_yaml_iter_t imsi_array;
+                                ogs_yaml_iter_recurse(&tenant_control_iter, &imsi_array);
+                                
+                                self.tenant_control[self.num_of_tenant_control].num_of_imsi_range = 0;
+                                
+                                do {
+                                    if (!ogs_yaml_iter_next(&imsi_array))
+                                        break;
+                                        
+                                    const char *imsi_range = ogs_yaml_iter_value(&imsi_array);
+                                    if (imsi_range) {
+                                        int range_idx = self.tenant_control[self.num_of_tenant_control].num_of_imsi_range;
+                                        if (range_idx < 32) {
+                                            char *dash = strchr(imsi_range, '-');
+                                            if (dash) {
+                                                /* Range format: start-end */
+                                                size_t start_len = dash - imsi_range;
+                                                ogs_cpystrn(self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].start_imsi,
+                                                           imsi_range, start_len + 1);
+                                                ogs_cpystrn(self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].end_imsi,
+                                                           dash + 1, OGS_MAX_IMSI_BCD_LEN + 1);
+                                                self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].is_single = false;
+                                            } else {
+                                                /* Single IMSI */
+                                                ogs_cpystrn(self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].start_imsi,
+                                                           imsi_range, OGS_MAX_IMSI_BCD_LEN + 1);
+                                                self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].is_single = true;
+                                            }
+                                            self.tenant_control[self.num_of_tenant_control].num_of_imsi_range++;
+                                        }
+                                    }
+                                } while (ogs_yaml_iter_type(&imsi_array) == YAML_SEQUENCE_NODE);
+                            } else if (!strcmp(tenant_key, "network_name")) {
+                                ogs_yaml_iter_t network_name_iter;
+                                ogs_yaml_iter_recurse(&tenant_control_iter, &network_name_iter);
+
+                                while (ogs_yaml_iter_next(&network_name_iter)) {
+                                    const char *network_name_key =
+                                        ogs_yaml_iter_key(&network_name_iter);
+                                    ogs_assert(network_name_key);
+                                    if (!strcmp(network_name_key, "full")) {
+                                        ogs_nas_network_name_t *network_full_name =
+                                            &self.tenant_control[self.num_of_tenant_control].full_name;
+                                        const char *c_network_name =
+                                            ogs_yaml_iter_value(&network_name_iter);
+                                        uint8_t size = strlen(c_network_name);
+                                        uint8_t i;
+                                        for (i = 0; i < size; i++) {
+                                            /* Workaround to convert the ASCII to UCS-2 */
+                                            network_full_name->name[i*2] = 0;
+                                            network_full_name->name[(i*2)+1] =
+                                                c_network_name[i];
+                                        }
+                                        network_full_name->length = size*2+1;
+                                        network_full_name->coding_scheme = 1;
+                                        network_full_name->ext = 1;
+                                    } else if (!strcmp(network_name_key, "short")) {
+                                        ogs_nas_network_name_t *network_short_name =
+                                            &self.tenant_control[self.num_of_tenant_control].short_name;
+                                        const char *c_network_name =
+                                            ogs_yaml_iter_value(&network_name_iter);
+                                        uint8_t size = strlen(c_network_name);
+                                        uint8_t i;
+                                        for (i = 0; i < size; i++) {
+                                            /* Workaround to convert the ASCII to UCS-2 */
+                                            network_short_name->name[i*2] = 0;
+                                            network_short_name->name[(i*2)+1] =
+                                                c_network_name[i];
+                                        }
+                                        network_short_name->length = size*2+1;
+                                        network_short_name->coding_scheme = 1;
+                                        network_short_name->ext = 1;
+                                    } else {
+                                        ogs_warn("unknown key `%s` in network_name", network_name_key);
                                     }
                                 }
-
-                                if (mcc && mnc) {
-                                    ogs_plmn_id_t plmn_id;
-                                    mme_hssmap_t *hssmap = NULL;
-
-                                    ogs_plmn_id_build(&plmn_id,
-                                        atoi(mcc), atoi(mnc), strlen(mnc));
-
-                                    hssmap = mme_hssmap_add(&plmn_id, realm, host);
-                                    ogs_assert(hssmap);
-                                }
-                            } else
-                                ogs_warn("unknown key `%s`",
-                                        hss_map_key);
+                            } else {
+                                ogs_warn("unknown key `%s` in tenant_control", tenant_key);
+                            }
                         }
-                    } while (ogs_yaml_iter_type(&hss_map_array) ==
-                            YAML_SEQUENCE_NODE);
+                        
+                        self.num_of_tenant_control++;
+                        
+                    } while (ogs_yaml_iter_type(&tenant_control_array) == YAML_SEQUENCE_NODE);
                 } else if (!strcmp(mme_key, "security")) {
                     ogs_yaml_iter_t security_iter;
                     ogs_yaml_iter_recurse(&mme_iter, &security_iter);
@@ -2050,9 +2106,9 @@ int mme_context_parse_config(void)
                     while (ogs_yaml_iter_next(&sgsap_iter)) {
                         const char *sgsap_key = ogs_yaml_iter_key(&sgsap_iter);
                         ogs_assert(sgsap_key);
-                        if (!strcmp(sgsap_key, "client")) {
-                            ogs_yaml_iter_t client_iter, client_array;
-                            ogs_yaml_iter_recurse(&sgsap_iter, &client_array);
+                        if (!strcmp(sgsap_key, "server")) {
+                            ogs_yaml_iter_t server_iter, server_array;
+                            ogs_yaml_iter_recurse(&sgsap_iter, &server_array);
                             do {
                                 mme_vlr_t *vlr = NULL;
                                 ogs_plmn_id_t plmn_id;
@@ -2063,39 +2119,38 @@ int mme_context_parse_config(void)
                                     const char *tac, *lac;
                                 } map[MAX_NUM_OF_CSMAP];
                                 int map_num = 0;
-                                ogs_sockaddr_t *addr = NULL, *local_addr = NULL;
+                                ogs_sockaddr_t *addr = NULL;
                                 int family = AF_UNSPEC;
-                                int i, hostname_num = 0, local_hostname_num = 0;
-                                const char *hostname[OGS_MAX_NUM_OF_HOSTNAME],
-                                    *local_hostname[OGS_MAX_NUM_OF_HOSTNAME];
+                                int i, hostname_num = 0;
+                                const char *hostname[OGS_MAX_NUM_OF_HOSTNAME];
                                 uint16_t port = self.sgsap_port;
 
                                 ogs_sockopt_t option;
                                 bool is_option = false;
 
-                                if (ogs_yaml_iter_type(&client_array) ==
+                                if (ogs_yaml_iter_type(&server_array) ==
                                         YAML_MAPPING_NODE) {
-                                    memcpy(&client_iter, &client_array,
+                                    memcpy(&server_iter, &server_array,
                                             sizeof(ogs_yaml_iter_t));
-                                } else if (ogs_yaml_iter_type(&client_array) ==
+                                } else if (ogs_yaml_iter_type(&server_array) ==
                                     YAML_SEQUENCE_NODE) {
-                                    if (!ogs_yaml_iter_next(&client_array))
+                                    if (!ogs_yaml_iter_next(&server_array))
                                         break;
                                     ogs_yaml_iter_recurse(
-                                            &client_array, &client_iter);
-                                } else if (ogs_yaml_iter_type(&client_array) ==
+                                            &server_array, &server_iter);
+                                } else if (ogs_yaml_iter_type(&server_array) ==
                                     YAML_SCALAR_NODE) {
                                     break;
                                 } else
                                     ogs_assert_if_reached();
 
-                                while (ogs_yaml_iter_next(&client_iter)) {
-                                    const char *client_key =
-                                        ogs_yaml_iter_key(&client_iter);
-                                    ogs_assert(client_key);
-                                    if (!strcmp(client_key, "family")) {
+                                while (ogs_yaml_iter_next(&server_iter)) {
+                                    const char *server_key =
+                                        ogs_yaml_iter_key(&server_iter);
+                                    ogs_assert(server_key);
+                                    if (!strcmp(server_key, "family")) {
                                         const char *v =
-                                            ogs_yaml_iter_value(&client_iter);
+                                            ogs_yaml_iter_value(&server_iter);
                                         if (v) family = atoi(v);
                                         if (family != AF_UNSPEC &&
                                             family != AF_INET &&
@@ -2107,9 +2162,9 @@ int mme_context_parse_config(void)
                                                 AF_UNSPEC, AF_INET, AF_INET6);
                                             family = AF_UNSPEC;
                                         }
-                                    } else if (!strcmp(client_key, "address")) {
+                                    } else if (!strcmp(server_key, "address")) {
                                         ogs_yaml_iter_t hostname_iter;
-                                        ogs_yaml_iter_recurse(&client_iter,
+                                        ogs_yaml_iter_recurse(&server_iter,
                                                 &hostname_iter);
                                         ogs_assert(ogs_yaml_iter_type(
                                                     &hostname_iter) !=
@@ -2132,53 +2187,26 @@ int mme_context_parse_config(void)
                                         } while (ogs_yaml_iter_type(
                                                     &hostname_iter) ==
                                                 YAML_SEQUENCE_NODE);
-                                    } else if (!strcmp(client_key,
-                                                "local_address")) {
-                                        ogs_yaml_iter_t local_hostname_iter;
-                                        ogs_yaml_iter_recurse(&client_iter,
-                                                &local_hostname_iter);
-                                        ogs_assert(ogs_yaml_iter_type(
-                                                    &local_hostname_iter) !=
-                                                YAML_MAPPING_NODE);
-
-                                        do {
-                                            if (ogs_yaml_iter_type(
-                                                        &local_hostname_iter) ==
-                                                    YAML_SEQUENCE_NODE) {
-                                                if (!ogs_yaml_iter_next(
-                                                        &local_hostname_iter))
-                                                    break;
-                                            }
-
-                                            ogs_assert(local_hostname_num <
-                                                    OGS_MAX_NUM_OF_HOSTNAME);
-                                            local_hostname
-                                                [local_hostname_num++] =
-                                                ogs_yaml_iter_value(
-                                                        &local_hostname_iter);
-                                        } while (ogs_yaml_iter_type(
-                                                    &local_hostname_iter) ==
-                                                YAML_SEQUENCE_NODE);
-                                    } else if (!strcmp(client_key, "port")) {
+                                    } else if (!strcmp(server_key, "port")) {
                                         const char *v =
-                                            ogs_yaml_iter_value(&client_iter);
+                                            ogs_yaml_iter_value(&server_iter);
                                         if (v) {
                                             port = atoi(v);
                                             self.sgsap_port = port;
                                         }
-                                    } else if (!strcmp(client_key, "option")) {
+                                    } else if (!strcmp(server_key, "option")) {
                                         rv = ogs_app_parse_sockopt_config(
-                                                &client_iter, &option);
+                                                &server_iter, &option);
                                         if (rv != OGS_OK) {
                                             ogs_error("ogs_app_parse_sockopt_"
                                                     "config() failed");
                                             return rv;
                                         }
                                         is_option = true;
-                                    } else if (!strcmp(client_key, "map")) {
+                                    } else if (!strcmp(server_key, "map")) {
                                         ogs_yaml_iter_t map_iter;
                                         ogs_yaml_iter_recurse(
-                                                &client_iter, &map_iter);
+                                                &server_iter, &map_iter);
 
                                         map[map_num].tai_mcc = NULL;
                                         map[map_num].tai_mnc = NULL;
@@ -2348,13 +2376,13 @@ int mme_context_parse_config(void)
 
                                         map_num++;
 
-                                    } else if (!strcmp(client_key, "tai")) {
+                                    } else if (!strcmp(server_key, "tai")) {
                                         ogs_error(
                                             "tai/lai configuraton changed to "
                                             "map.tai/map.lai");
                                         ogs_log_print(OGS_LOG_ERROR,
                                             "sgsap:\n"
-                                            "  client\n"
+                                            "  server\n"
                                             "    address: 127.0.0.2\n"
                                             "    map:\n"
                                             "      tai:\n"
@@ -2368,13 +2396,13 @@ int mme_context_parse_config(void)
                                             "          mnc: 01\n"
                                             "        lac: 43691\n");
                                         return OGS_ERROR;
-                                    } else if (!strcmp(client_key, "lai")) {
+                                    } else if (!strcmp(server_key, "lai")) {
                                         ogs_error(
                                             "tai/lai configuraton changed to "
                                             "map.tai/map.lai");
                                         ogs_log_print(OGS_LOG_ERROR,
                                             "sgsap:\n"
-                                            "  client\n"
+                                            "  server\n"
                                             "    address: 127.0.0.2\n"
                                             "    map:\n"
                                             "      tai:\n"
@@ -2390,7 +2418,7 @@ int mme_context_parse_config(void)
                                         return OGS_ERROR;
                                     } else
                                         ogs_warn("unknown key `%s`",
-                                                client_key);
+                                                server_key);
 
                                 }
 
@@ -2414,20 +2442,7 @@ int mme_context_parse_config(void)
 
                                 if (addr == NULL) continue;
 
-                                local_addr = NULL;
-                                for (i = 0; i < local_hostname_num; i++) {
-                                    rv = ogs_addaddrinfo(&local_addr,
-                                            family, local_hostname[i], port, 0);
-                                    ogs_assert(rv == OGS_OK);
-                                }
-
-                                ogs_filter_ip_version(&local_addr,
-                                        ogs_global_conf()->parameter.no_ipv4,
-                                        ogs_global_conf()->parameter.no_ipv6,
-                                        ogs_global_conf()->parameter.
-                                        prefer_ipv4);
-
-                                vlr = mme_vlr_add(addr, local_addr,
+                                vlr = mme_vlr_add(addr,
                                         is_option ? &option : NULL);
                                 ogs_assert(vlr);
 
@@ -2450,7 +2465,7 @@ int mme_context_parse_config(void)
                                             &csmap->lai.nas_plmn_id, &plmn_id);
                                     csmap->lai.lac = atoi(map[i].lac);
                                 }
-                            } while (ogs_yaml_iter_type(&client_array) ==
+                            } while (ogs_yaml_iter_type(&server_array) ==
                                     YAML_SEQUENCE_NODE);
                         } else
                             ogs_warn("unknown key `%s`", sgsap_key);
@@ -2511,6 +2526,26 @@ int mme_context_parse_config(void)
                                 } else
                                     ogs_warn("unknown key `%s`", t3423_key);
                             }
+                        } else if (!strcmp(time_key, "t3413")) {
+                            ogs_yaml_iter_t t3413_iter;
+                            ogs_yaml_iter_recurse(&time_iter, &t3413_iter);
+
+                            while (ogs_yaml_iter_next(&t3413_iter)) {
+                                const char *t3413_key =
+                                    ogs_yaml_iter_key(&t3413_iter);
+                                ogs_assert(t3413_key);
+
+                                if (!strcmp(t3413_key, "value")) {
+                                    const char *v = ogs_yaml_iter_value(&t3413_iter);
+                                    if (v)
+                                        self.time.t3413.value = atoll(v);
+                                } else if (!strcmp(t3413_key, "max_count")) {
+                                    const char *v = ogs_yaml_iter_value(&t3413_iter);
+                                    if (v)
+                                        self.time.t3413.max_count = atoi(v);
+                                } else
+                                    ogs_warn("unknown key `%s`", t3413_key);
+                            }
                         } else if (!strcmp(time_key, "t3512")) {
                             /* handle config in amf */
                         } else if (!strcmp(time_key, "nf_instance")) {
@@ -2526,6 +2561,20 @@ int mme_context_parse_config(void)
                     }
                 } else if (!strcmp(mme_key, "metrics")) {
                     /* handle config in metrics library */
+                } else if (!strcmp(mme_key, "paging_failure_policy")) {
+                    const char *v = ogs_yaml_iter_value(&mme_iter);
+                    if (v) {
+                        if (!strcmp(v, "no_action")) {
+                            self.paging_failure_policy = MME_PAGING_FAILURE_POLICY_NO_ACTION;
+                            ogs_info("Paging failure policy set to: no_action");
+                        } else if (!strcmp(v, "delete_sessions")) {
+                            self.paging_failure_policy = MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS;
+                            ogs_info("Paging failure policy set to: delete_sessions");
+                        } else {
+                            ogs_warn("unknown paging_failure_policy value `%s`, using default 'no_action'", v);
+                            self.paging_failure_policy = MME_PAGING_FAILURE_POLICY_NO_ACTION;
+                        }
+                    }
                 } else
                     ogs_warn("unknown key `%s`", mme_key);
             }
@@ -2778,10 +2827,7 @@ ogs_sockaddr_t *mme_pgw_addr_find_by_apn_enb(
     return NULL;
 }
 
-mme_vlr_t *mme_vlr_add(
-        ogs_sockaddr_t *sa_list,
-        ogs_sockaddr_t *local_sa_list,
-        ogs_sockopt_t *option)
+mme_vlr_t *mme_vlr_add(ogs_sockaddr_t *sa_list, ogs_sockopt_t *option)
 {
     mme_vlr_t *vlr = NULL;
 
@@ -2795,7 +2841,6 @@ mme_vlr_t *mme_vlr_add(
     vlr->ostream_id = 0;
 
     vlr->sa_list = sa_list;
-    vlr->local_sa_list = local_sa_list;
     if (option) {
         vlr->max_num_of_ostreams = option->sctp.sinit_num_ostreams;
         vlr->option = ogs_memdup(option, sizeof *option);
@@ -2815,7 +2860,6 @@ void mme_vlr_remove(mme_vlr_t *vlr)
     mme_vlr_close(vlr);
 
     ogs_freeaddrinfo(vlr->sa_list);
-    ogs_freeaddrinfo(vlr->local_sa_list);
     if (vlr->option)
         ogs_free(vlr->option);
 
@@ -2840,13 +2884,13 @@ void mme_vlr_close(mme_vlr_t *vlr)
         ogs_sctp_destroy(vlr->sock);
 }
 
-mme_vlr_t *mme_vlr_find_by_sock(const ogs_sock_t *sock)
+mme_vlr_t *mme_vlr_find_by_addr(const ogs_sockaddr_t *addr)
 {
     mme_vlr_t *vlr = NULL;
-    ogs_assert(sock);
+    ogs_assert(addr);
 
     ogs_list_for_each(&self.vlr_list, vlr) {
-        if (vlr->sock == sock)
+        if (ogs_sockaddr_is_equal(vlr->addr, addr) == true)
             return vlr;
     }
 
@@ -2916,76 +2960,10 @@ mme_csmap_t *mme_csmap_find_by_nas_lai(const ogs_nas_lai_t *lai)
     return NULL;
 }
 
-mme_hssmap_t *mme_hssmap_add(ogs_plmn_id_t *plmn_id, const char *realm,
-                             const char *host)
-{
-    mme_hssmap_t *hssmap = NULL;
-
-    ogs_assert(plmn_id);
-
-    ogs_pool_alloc(&mme_hssmap_pool, &hssmap);
-    ogs_assert(hssmap);
-    memset(hssmap, 0, sizeof *hssmap);
-
-    hssmap->plmn_id = *plmn_id;
-    if (realm)
-        hssmap->realm = ogs_strdup(realm);
-    else
-        hssmap->realm = ogs_epc_domain_from_plmn_id(plmn_id);
-
-    if (host)
-        hssmap->host = ogs_strdup(host);
-    else
-        hssmap->host = NULL;
-
-    ogs_list_add(&self.hssmap_list, hssmap);
-
-    return hssmap;
-}
-
-void mme_hssmap_remove(mme_hssmap_t *hssmap)
-{
-    ogs_assert(hssmap);
-
-    ogs_list_remove(&self.hssmap_list, hssmap);
-
-    if (hssmap->realm != NULL)
-        ogs_free(hssmap->realm);
-
-    if (hssmap->host != NULL)
-        ogs_free(hssmap->host);
-
-    ogs_pool_free(&mme_hssmap_pool, hssmap);
-}
-
-void mme_hssmap_remove_all(void)
-{
-    mme_hssmap_t *hssmap = NULL, *next_hssmap = NULL;
-
-    ogs_list_for_each_safe(&self.hssmap_list, next_hssmap, hssmap)
-        mme_hssmap_remove(hssmap);
-}
-
-mme_hssmap_t *mme_hssmap_find_by_imsi_bcd(const char *imsi_bcd)
-{
-    mme_hssmap_t *hssmap = NULL;
-    ogs_assert(imsi_bcd);
-
-    ogs_list_for_each(&self.hssmap_list, hssmap) {
-        char plmn_id_str[OGS_PLMNIDSTRLEN] = "";
-
-        ogs_plmn_id_to_string(&hssmap->plmn_id, plmn_id_str);
-        if (strncmp(plmn_id_str, imsi_bcd, strlen(plmn_id_str)) == 0) {
-            return hssmap;
-        }
-    }
-
-    return NULL;
-}
-
 mme_enb_t *mme_enb_add(ogs_sock_t *sock, ogs_sockaddr_t *addr)
 {
     mme_enb_t *enb = NULL;
+    mme_enb_t *enb_tmp = NULL; /* ktsubouc */
     mme_event_t e;
 
     ogs_assert(sock);
@@ -3023,6 +3001,12 @@ mme_enb_t *mme_enb_add(ogs_sock_t *sock, ogs_sockaddr_t *addr)
 
     ogs_list_add(&self.enb_list, enb);
     mme_metrics_inst_global_inc(MME_METR_GLOB_GAUGE_ENB);
+    /* ktsubouc - start */
+    ogs_list_for_each(&self.enb_list, enb_tmp) {
+        char buf[OGS_ADDRSTRLEN];
+        printf("ktsubouc: enb - %s\n", OGS_ADDR(enb_tmp->sctp.addr, buf));
+    }
+    /* ktsubouc - end */
 
     ogs_info("[Added] Number of eNBs is now %d",
             ogs_list_count(&self.enb_list));
@@ -3045,8 +3029,7 @@ int mme_enb_remove(mme_enb_t *enb)
 
     ogs_hash_set(self.enb_addr_hash,
             enb->sctp.addr, sizeof(ogs_sockaddr_t), NULL);
-    if (enb->enb_id_presence == true)
-        ogs_hash_set(self.enb_id_hash, &enb->enb_id, sizeof(enb->enb_id), NULL);
+    ogs_hash_set(self.enb_id_hash, &enb->enb_id, sizeof(enb->enb_id), NULL);
 
     /*
      * CHECK:
@@ -3093,13 +3076,10 @@ int mme_enb_set_enb_id(mme_enb_t *enb, uint32_t enb_id)
 {
     ogs_assert(enb);
 
-    if (enb->enb_id_presence == true)
-        ogs_hash_set(self.enb_id_hash, &enb->enb_id, sizeof(enb->enb_id), NULL);
+    ogs_hash_set(self.enb_id_hash, &enb->enb_id, sizeof(enb->enb_id), NULL);
 
     enb->enb_id = enb_id;
     ogs_hash_set(self.enb_id_hash, &enb->enb_id, sizeof(enb->enb_id), enb);
-
-    enb->enb_id_presence = true;
 
     return OGS_OK;
 }
@@ -3350,7 +3330,7 @@ void mme_ue_new_guti(mme_ue_t *mme_ue)
     ogs_assert(served_gummei->num_of_mme_gid > 0);
     ogs_assert(served_gummei->num_of_mme_code > 0);
 
-    if (MME_NEXT_GUTI_IS_AVAILABLE(mme_ue)) {
+    if (mme_ue->next.m_tmsi) {
         ogs_warn("GUTI has already been allocated");
         return;
     }
@@ -3370,9 +3350,9 @@ void mme_ue_new_guti(mme_ue_t *mme_ue)
 
 void mme_ue_confirm_guti(mme_ue_t *mme_ue)
 {
-    ogs_assert(MME_NEXT_GUTI_IS_AVAILABLE(mme_ue));
+    ogs_assert(mme_ue->next.m_tmsi);
 
-    if (MME_CURRENT_GUTI_IS_AVAILABLE(mme_ue)) {
+    if (mme_ue->current.m_tmsi) {
         /* MME has a VALID GUTI
          * As such, we need to remove previous GUTI in hash table */
         ogs_hash_set(self.guti_ue_hash,
@@ -3396,37 +3376,6 @@ void mme_ue_confirm_guti(mme_ue_t *mme_ue)
               mme_ue->current.guti.mme_gid,
               mme_ue->current.guti.mme_code,
               mme_ue->current.guti.m_tmsi);
-}
-
-void mme_ue_set_p_tmsi(
-        mme_ue_t *mme_ue,
-        ogs_nas_mobile_identity_tmsi_t *nas_mobile_identity_tmsi)
-{
-    ogs_assert(mme_ue);
-    ogs_assert(nas_mobile_identity_tmsi);
-
-    /*
-     * If the P-TMSI received from MSC/VLR is different from the current P-TMSI
-     * known by the MME, store this new P-TMSI as 'Next P-TMSI'. This value will
-     * be sent to the UE through the Attach Accept or TAU Accept message.
-     *
-     * When the UE sends an Attach Complete or TAU Complete message,
-     * the MME updates the 'Current P-TMSI' with the value in 'Next P-TMSI',
-     * thereby confirming and saving the new P-TMSI.
-     */
-    mme_ue->next.p_tmsi = be32toh(nas_mobile_identity_tmsi->tmsi);
-    if (mme_ue->next.p_tmsi != INVALID_P_TMSI) {
-        if (mme_ue->current.p_tmsi == mme_ue->next.p_tmsi)
-            mme_ue->next.p_tmsi = INVALID_P_TMSI;
-    }
-}
-void mme_ue_confirm_p_tmsi(mme_ue_t *mme_ue)
-{
-    ogs_assert(mme_ue);
-    ogs_assert(mme_ue->next.p_tmsi);
-
-    mme_ue->current.p_tmsi = mme_ue->next.p_tmsi;
-    mme_ue->next.p_tmsi = INVALID_P_TMSI;
 }
 
 static bool compare_ue_info(mme_sgw_t *node, enb_ue_t *enb_ue)
@@ -3574,7 +3523,6 @@ mme_ue_t *mme_ue_add(enb_ue_t *enb_ue)
         ogs_pool_id_free(&mme_ue_pool, mme_ue);
         return NULL;
     }
-    mme_ue->gn.gtp_xact_id = OGS_INVALID_POOL_ID;
 
     mme_ebi_pool_init(mme_ue);
 
@@ -3617,6 +3565,9 @@ mme_ue_t *mme_ue_add(enb_ue_t *enb_ue)
     mme_ue->csmap = NULL;
     mme_ue->vlr_ostream_id = 0;
 
+    /* Initialize Purge UE flag */
+    mme_ue->purge_ue_in_progress = false;
+
     mme_ue_fsm_init(mme_ue);
 
     ogs_list_add(&self.mme_ue_list, mme_ue);
@@ -3648,15 +3599,14 @@ void mme_ue_remove(mme_ue_t *mme_ue)
         ogs_hash_set(mme_self()->imsi_ue_hash,
                 mme_ue->imsi, mme_ue->imsi_len, NULL);
 
-    if (MME_CURRENT_GUTI_IS_AVAILABLE(mme_ue)) {
+    if (mme_ue->current.m_tmsi) {
         ogs_hash_set(self.guti_ue_hash,
                 &mme_ue->current.guti, sizeof(ogs_nas_eps_guti_t), NULL);
         ogs_assert(mme_m_tmsi_free(mme_ue->current.m_tmsi) == OGS_OK);
     }
 
-    if (MME_NEXT_GUTI_IS_AVAILABLE(mme_ue)) {
+    if (mme_ue->next.m_tmsi)
         ogs_assert(mme_m_tmsi_free(mme_ue->next.m_tmsi) == OGS_OK);
-    }
 
     /* Clear the saved PDN Connectivity Request */
     OGS_NAS_CLEAR_DATA(&mme_ue->pdn_connectivity_request);
@@ -3947,6 +3897,83 @@ mme_ue_t *mme_ue_find_by_message(const ogs_nas_eps_message_t *message)
     return mme_ue;
 }
 
+/**
+ * Check if MME-UE has incomplete sessions that should not be migrated
+ *
+ * A session is considered "incomplete" if any of the following applies:
+ * 1. MME-UE is not in EMM-REGISTERED state
+ * 2. Session has no PDN context (session->session == NULL)
+ * 3. Session has no Bearers
+ * 4. Any Bearer has no TEIDs (sgw_s1u_teid or enb_s1u_teid == 0)
+ * 5. Any Bearer is not in esm_state_active
+ * 6. Session deletion is in progress
+ */
+static bool has_incomplete_sessions(mme_ue_t *mme_ue)
+{
+    mme_sess_t *sess = NULL;
+    mme_bearer_t *bearer = NULL;
+
+    ogs_assert(mme_ue);
+
+    /* No sessions = not incomplete */
+    if (!SESSION_CONTEXT_IS_AVAILABLE(mme_ue)) {
+        return false;
+    }
+
+    /* EMM state check: if not fully registered, sessions are incomplete */
+    if (!OGS_FSM_CHECK(&mme_ue->sm, emm_state_registered)) {
+        ogs_debug("[%s] MME-UE not in EMM-REGISTERED state",
+                  mme_ue->imsi_bcd);
+        return true;
+    }
+
+    /* Check each session */
+    ogs_list_for_each(&mme_ue->sess_list, sess) {
+        /* No PDN context = incomplete */
+        if (!sess->session) {
+            ogs_debug("[%s] Session without PDN context",
+                      mme_ue->imsi_bcd);
+            return true;
+        }
+
+        /* Deletion in progress = incomplete */
+        if (sess->deletion_in_progress) {
+            ogs_debug("[%s] Session deletion in progress",
+                      mme_ue->imsi_bcd);
+            return true;
+        }
+
+        /* No Bearers = incomplete */
+        if (ogs_list_count(&sess->bearer_list) == 0) {
+            ogs_debug("[%s] Session without bearers",
+                      mme_ue->imsi_bcd);
+            return true;
+        }
+
+        /* Check each Bearer */
+        ogs_list_for_each(&sess->bearer_list, bearer) {
+            /* No TEIDs = incomplete (not established) */
+            if (bearer->sgw_s1u_teid == 0 || bearer->enb_s1u_teid == 0) {
+                ogs_debug("[%s] Bearer[EBI:%d] without complete TEIDs "
+                          "(SGW:%u, eNB:%u)",
+                          mme_ue->imsi_bcd, bearer->ebi,
+                          bearer->sgw_s1u_teid, bearer->enb_s1u_teid);
+                return true;
+            }
+
+            /* Bearer not active = incomplete */
+            if (!OGS_FSM_CHECK(&bearer->sm, esm_state_active)) {
+                ogs_debug("[%s] Bearer[EBI:%d] not in esm_state_active",
+                          mme_ue->imsi_bcd, bearer->ebi);
+                return true;
+            }
+        }
+    }
+
+    /* All checks passed = all sessions are complete */
+    return false;
+}
+
 int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
 {
     mme_ue_t *old_mme_ue = NULL;
@@ -3965,6 +3992,23 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
         if (ogs_pool_index(&mme_ue_pool, mme_ue) !=
             ogs_pool_index(&mme_ue_pool, old_mme_ue)) {
             ogs_warn("[%s] OLD UE Context Release", mme_ue->imsi_bcd);
+
+            /* Check for incomplete sessions in ECM-IDLE state */
+            if (ECM_IDLE(old_mme_ue) && has_incomplete_sessions(old_mme_ue)) {
+                ogs_warn("[%s] OLD MME-UE in ECM-IDLE with incomplete sessions",
+                         mme_ue->imsi_bcd);
+                ogs_warn("[%s] Cleaning up old context instead of migration",
+                         mme_ue->imsi_bcd);
+
+                /* Remove old context - UE starts fresh */
+                mme_ue_remove(old_mme_ue);
+
+                /* Set IMSI hash for new UE */
+                ogs_hash_set(self.imsi_ue_hash,
+                            mme_ue->imsi, mme_ue->imsi_len, mme_ue);
+                return OGS_OK;
+            }
+
             if (ECM_CONNECTED(old_mme_ue)) {
                 enb_ue_t *enb_ue = enb_ue_find_by_id(old_mme_ue->enb_ue_id);
                 /* Implcit S1 release */
@@ -4010,6 +4054,37 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
             memcpy(&mme_ue->sess_list,
                     &old_mme_ue->sess_list, sizeof(mme_ue->sess_list));
 
+            /* Phase-2.5 : Rebind session pointers to new UE's session array */
+            old_sess = NULL;
+            ogs_list_for_each(&mme_ue->sess_list, old_sess) {
+                if (old_sess->session) {
+                    /* Calculate index in old session array */
+                    int index = old_sess->session - old_mme_ue->session;
+
+                    if (index >= 0 && index < OGS_MAX_NUM_OF_SESS) {
+                        /* Copy subscription data structure */
+                        mme_ue->session[index] = old_mme_ue->session[index];
+
+                        /* Duplicate APN name string before old UE is freed */
+                        if (old_mme_ue->session[index].name) {
+                            mme_ue->session[index].name =
+                                ogs_strdup(old_mme_ue->session[index].name);
+                        }
+
+                        /* Rebind pointer to new session array */
+                        old_sess->session = &mme_ue->session[index];
+
+                        ogs_debug("Rebound session pointer: index=%d, APN=%s",
+                                  index, mme_ue->session[index].name);
+                    } else {
+                        ogs_error("Invalid session index: %d (sess=%p, old_sess_array=%p)",
+                                  index, old_sess->session, old_mme_ue->session);
+                        old_sess->session = NULL;
+                    }
+                }
+            }
+            mme_ue->num_of_session = old_mme_ue->num_of_session;
+
             /* Phase-3 : Clear Session Context in OLD MME-UE Context */
             memset(&old_mme_ue->sess_list, 0, sizeof(old_mme_ue->sess_list));
 
@@ -4020,6 +4095,53 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
             ogs_assert(old_sgw_ue);
             sgw_ue->sgw_s11_teid = old_sgw_ue->sgw_s11_teid;
 
+            /* Phase-5 : Inherit CS Domain and Identity Information */
+
+            /* P-TMSI (值型) */
+            mme_ue->p_tmsi = old_mme_ue->p_tmsi;
+            old_mme_ue->p_tmsi = 0;
+
+            /* CSMAP (共有リソース - 参照のみコピー) */
+            mme_ue->csmap = old_mme_ue->csmap;
+            mme_ue->vlr_ostream_id = old_mme_ue->vlr_ostream_id;
+
+            /* Current GUTI/M-TMSI */
+            if (old_mme_ue->current.m_tmsi) {
+                /*
+                 * Note: mme_ue (NEW UE) has no GUTI at this point because:
+                 * - Created by mme_ue_add() using ogs_pool_id_calloc()
+                 * - ogs_pool_id_calloc() performs memset() zero-initialization
+                 * - Therefore mme_ue->current.m_tmsi = NULL is guaranteed
+                 * - GUTI will be allocated later by mme_ue_new_guti()
+                 */
+
+                /* Remove old GUTI from hash */
+                ogs_hash_set(self.guti_ue_hash,
+                        &old_mme_ue->current.guti, sizeof(ogs_nas_eps_guti_t), NULL);
+
+                /* Move pointer ownership */
+                mme_ue->current.m_tmsi = old_mme_ue->current.m_tmsi;
+                mme_ue->current.guti = old_mme_ue->current.guti;
+                old_mme_ue->current.m_tmsi = NULL;
+
+                /* Add new GUTI to hash */
+                ogs_hash_set(self.guti_ue_hash,
+                        &mme_ue->current.guti, sizeof(ogs_nas_eps_guti_t), mme_ue);
+
+                ogs_debug("[%s] Inherited GUTI[G:%d,C:%d,M_TMSI:0x%x]",
+                          mme_ue->imsi_bcd,
+                          mme_ue->current.guti.mme_gid,
+                          mme_ue->current.guti.mme_code,
+                          mme_ue->current.guti.m_tmsi);
+            }
+
+            /* Next GUTI/M-TMSI (usually unallocated, but handle just in case) */
+            if (old_mme_ue->next.m_tmsi) {
+                mme_ue->next.m_tmsi = old_mme_ue->next.m_tmsi;
+                mme_ue->next.guti = old_mme_ue->next.guti;
+                old_mme_ue->next.m_tmsi = NULL;
+            }
+
             mme_ue_remove(old_mme_ue);
         }
     }
@@ -4029,18 +4151,6 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
                 mme_ue->imsi, mme_ue->imsi_len, NULL);
 
     ogs_hash_set(self.imsi_ue_hash, mme_ue->imsi, mme_ue->imsi_len, mme_ue);
-
-    mme_ue->hssmap = mme_hssmap_find_by_imsi_bcd(mme_ue->imsi_bcd);
-    if (mme_ue->hssmap) {
-        char plmn_id_str[OGS_PLMNIDSTRLEN];
-        const char *realm = mme_ue->hssmap->realm ? mme_ue->hssmap->realm : "NULL";
-        const char *host = mme_ue->hssmap->host ? mme_ue->hssmap->host : "NULL";
-
-        ogs_plmn_id_to_string(&mme_ue->hssmap->plmn_id, plmn_id_str);
-        ogs_debug("[%s]: HSS Map HPLMN[%s] Realm[%s] Host[%s]",
-                   mme_ue->imsi_bcd, plmn_id_str, realm, host);
-
-    }
 
     return OGS_OK;
 }
@@ -4195,6 +4305,13 @@ void enb_ue_source_deassociate_target(enb_ue_t *enb_ue)
         source_ue = enb_ue;
         target_ue = enb_ue_find_by_id(enb_ue->target_ue_id);
 
+        if (!target_ue) {
+            ogs_warn("Target UE already freed for UE ID %d",
+                    enb_ue->target_ue_id);
+            source_ue->target_ue_id = OGS_INVALID_POOL_ID;
+            return;
+        }
+
         ogs_assert(source_ue->target_ue_id >= OGS_MIN_POOL_ID &&
                 source_ue->target_ue_id <= OGS_MAX_POOL_ID);
         ogs_assert(target_ue->source_ue_id >= OGS_MIN_POOL_ID &&
@@ -4205,6 +4322,13 @@ void enb_ue_source_deassociate_target(enb_ue_t *enb_ue)
                 enb_ue->source_ue_id <= OGS_MAX_POOL_ID) {
         target_ue = enb_ue;
         source_ue = enb_ue_find_by_id(enb_ue->source_ue_id);
+
+        if (!source_ue) {
+            ogs_warn("Source UE already freed for UE ID %d",
+                    enb_ue->source_ue_id);
+            target_ue->source_ue_id = OGS_INVALID_POOL_ID;
+            return;
+        }
 
         ogs_assert(source_ue->target_ue_id >= OGS_MIN_POOL_ID &&
                 source_ue->target_ue_id <= OGS_MAX_POOL_ID);
@@ -4373,8 +4497,14 @@ mme_sess_t *mme_sess_find_by_apn(const mme_ue_t *mme_ue, const char *apn)
     while (sess) {
         if (sess->session) {
             ogs_assert(sess->session->name);
-            if (ogs_strcasecmp(sess->session->name, apn) == 0)
-                return sess;
+            if (ogs_strcasecmp(sess->session->name, apn) == 0) {
+                /* Skip sessions that are being deleted to prevent
+                 * "APN duplicated" false positives during TAU bearer
+                 * status mismatch handling */
+                if (!sess->deletion_in_progress) {
+                    return sess;
+                }
+            }
         }
         sess = mme_sess_next(sess);
     }
@@ -4471,6 +4601,10 @@ void mme_bearer_remove(mme_bearer_t *bearer)
     ogs_timer_delete(bearer->t3489.timer);
 
     ogs_list_remove(&sess->bearer_list, bearer);
+
+    /* Remove from bearer_to_modify_list if present */
+    if (ogs_list_exists(&mme_ue->bearer_to_modify_list, &bearer->to_modify_node))
+        ogs_list_remove(&mme_ue->bearer_to_modify_list, &bearer->to_modify_node);
 
     OGS_TLV_CLEAR_DATA(&bearer->tft);
 
@@ -5053,4 +5187,510 @@ static void stats_remove_mme_session(void)
     mme_metrics_inst_global_dec(MME_METR_GLOB_GAUGE_MME_SESS);
     num_of_mme_sess = num_of_mme_sess - 1;
     ogs_info("[Removed] Number of MME-Sessions is now %d", num_of_mme_sess);
+}
+
+
+static bool mme_imsi_in_range(const char *imsi, 
+                              const char *start_imsi, 
+                              const char *end_imsi, 
+                              bool is_single)
+{
+    if (is_single) {
+        return strcmp(imsi, start_imsi) == 0;
+    } else {
+        return (strcmp(imsi, start_imsi) >= 0 && 
+                strcmp(imsi, end_imsi) <= 0);
+    }
+}
+
+bool mme_check_tenant_access(mme_ue_t *mme_ue, uint16_t tac)
+{
+    mme_context_t *self = mme_self();
+    int i, j;
+    bool result = false;
+    
+    /* Lock mutex for thread-safe access */
+    ogs_thread_mutex_lock(&self->tenant_control_mutex);
+    
+    /* No tenant control configured - allow all */
+    if (self->num_of_tenant_control == 0) {
+        ogs_thread_mutex_unlock(&self->tenant_control_mutex);
+        return true;
+    }
+    
+    /* No IMSI available - reject */
+    if (!MME_UE_HAVE_IMSI(mme_ue)) {
+        ogs_warn("No IMSI available for tenant access check");
+        ogs_thread_mutex_unlock(&self->tenant_control_mutex);
+        return false;
+    }
+    
+    /* Check each tenant configuration */
+    for (i = 0; i < self->num_of_tenant_control; i++) {
+        if (self->tenant_control[i].tac == tac) {
+            /* Found matching TAC - check IMSI ranges */
+            for (j = 0; j < self->tenant_control[i].num_of_imsi_range; j++) {
+                if (mme_imsi_in_range(mme_ue->imsi_bcd,
+                        self->tenant_control[i].imsi_range[j].start_imsi,
+                        self->tenant_control[i].imsi_range[j].end_imsi,
+                        self->tenant_control[i].imsi_range[j].is_single)) {
+                    ogs_debug("IMSI[%s] allowed on TAC[%d] - Tenant[%s]",
+                              mme_ue->imsi_bcd, tac, 
+                              self->tenant_control[i].tenant_id);
+                    result = true;
+                    goto unlock_and_return;
+                }
+            }
+            /* TAC matched but IMSI not in allowed ranges */
+            ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant[%s]",
+                     mme_ue->imsi_bcd, tac, 
+                     self->tenant_control[i].tenant_id);
+            result = false;
+            goto unlock_and_return;
+        }
+    }
+    
+    /* TAC not found in tenant control - reject by default */
+    ogs_warn("TAC[%d] not found in tenant control configuration", tac);
+    result = false;
+    
+unlock_and_return:
+    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
+    return result;
+}
+
+bool mme_get_network_name_for_tac(uint16_t tac,
+                                   ogs_nas_network_name_t **full_name,
+                                   ogs_nas_network_name_t **short_name)
+{
+    mme_context_t *self = mme_self();
+    int i;
+
+    ogs_assert(full_name);
+    ogs_assert(short_name);
+
+    /* Lock mutex for thread-safe access */
+    ogs_thread_mutex_lock(&self->tenant_control_mutex);
+
+    /* Search for TAC-specific network name */
+    for (i = 0; i < self->num_of_tenant_control; i++) {
+        if (self->tenant_control[i].tac == tac) {
+            /* Check if TAC-specific network name is configured */
+            ogs_debug("Found tenant for TAC[%d], full_name.length=%d",
+                      tac, self->tenant_control[i].full_name.length);
+            if (self->tenant_control[i].full_name.length > 0) {
+                *full_name = &self->tenant_control[i].full_name;
+                *short_name = &self->tenant_control[i].short_name;
+                ogs_debug("Using TAC-specific network name for TAC[%d]", tac);
+                ogs_thread_mutex_unlock(&self->tenant_control_mutex);
+                return true;
+            }
+            ogs_debug("TAC[%d] matched but network_name not configured, falling back to global", tac);
+            break;
+        }
+    }
+
+    /* Use global network name as fallback */
+    *full_name = &self->full_name;
+    *short_name = &self->short_name;
+    ogs_debug("Using global network name for TAC[%d]: global full_name.length=%d",
+              tac, self->full_name.length);
+
+    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
+    return true;
+}
+
+json_t *mme_tenant_control_to_json(void)
+{
+    mme_context_t *self = mme_self();
+    json_t *root, *tenants, *tenant, *imsi_array, *imsi_item;
+    int i, j;
+    
+    root = json_object();
+    tenants = json_array();
+    
+    /* Lock mutex for thread-safe access */
+    ogs_thread_mutex_lock(&self->tenant_control_mutex);
+    
+    for (i = 0; i < self->num_of_tenant_control; i++) {
+        tenant = json_object();
+        json_object_set_new(tenant, "tenant_id", 
+                           json_string(self->tenant_control[i].tenant_id));
+        json_object_set_new(tenant, "tac", 
+                           json_integer(self->tenant_control[i].tac));
+        
+        imsi_array = json_array();
+        for (j = 0; j < self->tenant_control[i].num_of_imsi_range; j++) {
+            if (self->tenant_control[i].imsi_range[j].is_single) {
+                imsi_item = json_string(self->tenant_control[i].imsi_range[j].start_imsi);
+            } else {
+                char range_str[OGS_MAX_IMSI_BCD_LEN*2 + 2];
+                snprintf(range_str, sizeof(range_str), "%s-%s",
+                        self->tenant_control[i].imsi_range[j].start_imsi,
+                        self->tenant_control[i].imsi_range[j].end_imsi);
+                imsi_item = json_string(range_str);
+            }
+            json_array_append_new(imsi_array, imsi_item);
+        }
+        json_object_set_new(tenant, "allowed_imsi", imsi_array);
+        json_array_append_new(tenants, tenant);
+    }
+    
+    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
+    
+    json_object_set_new(root, "tenant_control", tenants);
+    return root;
+}
+
+typedef struct {
+    char tenant_id[64];
+    uint16_t tac;
+    int num_of_imsi_range;
+    struct {
+        char start_imsi[OGS_MAX_IMSI_BCD_LEN+1];
+        char end_imsi[OGS_MAX_IMSI_BCD_LEN+1];
+        bool is_single;
+    } imsi_range[32];
+    /* TAC-specific Network Name */
+    ogs_nas_network_name_t short_name;
+    ogs_nas_network_name_t full_name;
+} tenant_config_backup_t;
+
+static json_t *compare_tenant_configs(mme_context_t *self,
+                                      tenant_config_backup_t *old_config,
+                                      int old_count)
+{
+    json_t *diff, *added, *removed, *modified;
+    int i, j, k;
+    bool found;
+
+    diff = json_object();
+    added = json_array();
+    removed = json_array();
+    modified = json_array();
+
+    /* Find added tenants */
+    for (i = 0; i < self->num_of_tenant_control; i++) {
+        found = false;
+        for (j = 0; j < old_count; j++) {
+            if (strcmp(self->tenant_control[i].tenant_id, old_config[j].tenant_id) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            json_t *tenant = json_object();
+            json_object_set_new(tenant, "tenant_id",
+                               json_string(self->tenant_control[i].tenant_id));
+            json_object_set_new(tenant, "tac",
+                               json_integer(self->tenant_control[i].tac));
+            json_array_append_new(added, tenant);
+        }
+    }
+
+    /* Find removed tenants */
+    for (i = 0; i < old_count; i++) {
+        found = false;
+        for (j = 0; j < self->num_of_tenant_control; j++) {
+            if (strcmp(old_config[i].tenant_id, self->tenant_control[j].tenant_id) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            json_t *tenant = json_object();
+            json_object_set_new(tenant, "tenant_id",
+                               json_string(old_config[i].tenant_id));
+            json_object_set_new(tenant, "tac",
+                               json_integer(old_config[i].tac));
+            json_array_append_new(removed, tenant);
+        }
+    }
+
+    /* Find modified tenants */
+    for (i = 0; i < self->num_of_tenant_control; i++) {
+        for (j = 0; j < old_count; j++) {
+            if (strcmp(self->tenant_control[i].tenant_id, old_config[j].tenant_id) == 0) {
+                json_t *changes = json_object();
+                bool has_changes = false;
+
+                /* Check TAC change */
+                if (self->tenant_control[i].tac != old_config[j].tac) {
+                    json_t *tac_change = json_object();
+                    json_object_set_new(tac_change, "old", json_integer(old_config[j].tac));
+                    json_object_set_new(tac_change, "new", json_integer(self->tenant_control[i].tac));
+                    json_object_set_new(changes, "tac", tac_change);
+                    has_changes = true;
+                }
+
+                /* Check IMSI ranges - find added */
+                json_t *imsi_added = json_array();
+                for (k = 0; k < self->tenant_control[i].num_of_imsi_range; k++) {
+                    bool range_found = false;
+                    for (int l = 0; l < old_config[j].num_of_imsi_range; l++) {
+                        if (self->tenant_control[i].imsi_range[k].is_single ==
+                                old_config[j].imsi_range[l].is_single) {
+                            if (strcmp(self->tenant_control[i].imsi_range[k].start_imsi,
+                                      old_config[j].imsi_range[l].start_imsi) == 0) {
+                                if (self->tenant_control[i].imsi_range[k].is_single) {
+                                    range_found = true;
+                                    break;
+                                } else if (strcmp(self->tenant_control[i].imsi_range[k].end_imsi,
+                                                 old_config[j].imsi_range[l].end_imsi) == 0) {
+                                    range_found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!range_found) {
+                        char range_str[OGS_MAX_IMSI_BCD_LEN*2 + 2];
+                        if (self->tenant_control[i].imsi_range[k].is_single) {
+                            snprintf(range_str, sizeof(range_str), "%s",
+                                    self->tenant_control[i].imsi_range[k].start_imsi);
+                        } else {
+                            snprintf(range_str, sizeof(range_str), "%s-%s",
+                                    self->tenant_control[i].imsi_range[k].start_imsi,
+                                    self->tenant_control[i].imsi_range[k].end_imsi);
+                        }
+                        json_array_append_new(imsi_added, json_string(range_str));
+                        has_changes = true;
+                    }
+                }
+                if (json_array_size(imsi_added) > 0) {
+                    json_object_set_new(changes, "imsi_added", imsi_added);
+                } else {
+                    json_decref(imsi_added);
+                }
+
+                /* Check IMSI ranges - find removed */
+                json_t *imsi_removed = json_array();
+                for (k = 0; k < old_config[j].num_of_imsi_range; k++) {
+                    bool range_found = false;
+                    for (int l = 0; l < self->tenant_control[i].num_of_imsi_range; l++) {
+                        if (old_config[j].imsi_range[k].is_single ==
+                                self->tenant_control[i].imsi_range[l].is_single) {
+                            if (strcmp(old_config[j].imsi_range[k].start_imsi,
+                                      self->tenant_control[i].imsi_range[l].start_imsi) == 0) {
+                                if (old_config[j].imsi_range[k].is_single) {
+                                    range_found = true;
+                                    break;
+                                } else if (strcmp(old_config[j].imsi_range[k].end_imsi,
+                                                 self->tenant_control[i].imsi_range[l].end_imsi) == 0) {
+                                    range_found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!range_found) {
+                        char range_str[OGS_MAX_IMSI_BCD_LEN*2 + 2];
+                        if (old_config[j].imsi_range[k].is_single) {
+                            snprintf(range_str, sizeof(range_str), "%s",
+                                    old_config[j].imsi_range[k].start_imsi);
+                        } else {
+                            snprintf(range_str, sizeof(range_str), "%s-%s",
+                                    old_config[j].imsi_range[k].start_imsi,
+                                    old_config[j].imsi_range[k].end_imsi);
+                        }
+                        json_array_append_new(imsi_removed, json_string(range_str));
+                        has_changes = true;
+                    }
+                }
+                if (json_array_size(imsi_removed) > 0) {
+                    json_object_set_new(changes, "imsi_removed", imsi_removed);
+                } else {
+                    json_decref(imsi_removed);
+                }
+
+                if (has_changes) {
+                    json_t *mod_tenant = json_object();
+                    json_object_set_new(mod_tenant, "tenant_id",
+                                       json_string(self->tenant_control[i].tenant_id));
+                    json_object_set_new(mod_tenant, "changes", changes);
+                    json_array_append_new(modified, mod_tenant);
+                } else {
+                    json_decref(changes);
+                }
+                break;
+            }
+        }
+    }
+
+    json_object_set_new(diff, "added", added);
+    json_object_set_new(diff, "removed", removed);
+    json_object_set_new(diff, "modified", modified);
+
+    return diff;
+}
+
+
+json_t *mme_reload_tenant_control_with_diff(void)
+{
+    mme_context_t *self = mme_self();
+    json_t *result = json_object();
+    
+    /* Backup current configuration */
+    tenant_config_backup_t old_config[16];
+    int old_count;
+    
+    /* Lock mutex and backup current configuration */
+    ogs_thread_mutex_lock(&self->tenant_control_mutex);
+    old_count = self->num_of_tenant_control;
+    memcpy(old_config, self->tenant_control, sizeof(self->tenant_control));
+    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
+    
+    /* Parse YAML configuration file */
+    FILE *file;
+    yaml_parser_t parser;
+    yaml_document_t *document = NULL;
+    
+    const char *config_file = ogs_app()->file;
+    if (!config_file) {
+        config_file = "/etc/open5gs/mme.yaml";
+    }
+    
+    file = fopen(config_file, "rb");
+    if (!file) {
+        json_object_set_new(result, "status", json_string("error"));
+        json_object_set_new(result, "message", 
+                           json_string("Cannot open configuration file"));
+        return result;
+    }
+    
+    if (!yaml_parser_initialize(&parser)) {
+        fclose(file);
+        json_object_set_new(result, "status", json_string("error"));
+        json_object_set_new(result, "message", 
+                           json_string("Failed to initialize YAML parser"));
+        return result;
+    }
+    
+    yaml_parser_set_input_file(&parser, file);
+    
+    document = calloc(1, sizeof(yaml_document_t));
+    if (!yaml_parser_load(&parser, document)) {
+        free(document);
+        yaml_parser_delete(&parser);
+        fclose(file);
+        json_object_set_new(result, "status", json_string("error"));
+        json_object_set_new(result, "message", 
+                           json_string("Failed to parse YAML configuration"));
+        return result;
+    }
+    
+    /* Clear current tenant control configuration */
+    ogs_thread_mutex_lock(&self->tenant_control_mutex);
+    self->num_of_tenant_control = 0;
+    
+    /* Parse tenant_control section from YAML */
+    ogs_yaml_iter_t root_iter, mme_iter;
+    ogs_yaml_iter_init(&root_iter, document);
+    
+    while (ogs_yaml_iter_next(&root_iter)) {
+        const char *root_key = ogs_yaml_iter_key(&root_iter);
+        if (!root_key)
+            continue;
+            
+        if (strcmp(root_key, "mme") == 0) {
+            ogs_yaml_iter_recurse(&root_iter, &mme_iter);
+            while (ogs_yaml_iter_next(&mme_iter)) {
+                const char *mme_key = ogs_yaml_iter_key(&mme_iter);
+                if (!mme_key)
+                    continue;
+                    
+                if (strcmp(mme_key, "tenant_control") == 0) {
+                    ogs_yaml_iter_t tenant_control_array, tenant_control_iter;
+                    ogs_yaml_iter_recurse(&mme_iter, &tenant_control_array);
+                    
+                    do {
+                        if (!ogs_yaml_iter_next(&tenant_control_array))
+                            break;
+                        ogs_yaml_iter_recurse(&tenant_control_array, &tenant_control_iter);
+                        
+                        if (self->num_of_tenant_control >= 16)
+                            break;
+                        
+                        while (ogs_yaml_iter_next(&tenant_control_iter)) {
+                            const char *tenant_key = ogs_yaml_iter_key(&tenant_control_iter);
+                            if (!tenant_key)
+                                continue;
+                            
+                            if (strcmp(tenant_key, "tenant_id") == 0) {
+                                const char *v = ogs_yaml_iter_value(&tenant_control_iter);
+                                if (v) {
+                                    ogs_cpystrn(
+                                        self->tenant_control[self->num_of_tenant_control].tenant_id,
+                                        v, sizeof(self->tenant_control[self->num_of_tenant_control].tenant_id));
+                                }
+                            } else if (strcmp(tenant_key, "tac") == 0) {
+                                const char *v = ogs_yaml_iter_value(&tenant_control_iter);
+                                if (v) {
+                                    self->tenant_control[self->num_of_tenant_control].tac = atoi(v);
+                                }
+                            } else if (strcmp(tenant_key, "allowed_imsi") == 0) {
+                                ogs_yaml_iter_t imsi_array;
+                                ogs_yaml_iter_recurse(&tenant_control_iter, &imsi_array);
+                                
+                                self->tenant_control[self->num_of_tenant_control].num_of_imsi_range = 0;
+                                
+                                do {
+                                    if (!ogs_yaml_iter_next(&imsi_array))
+                                        break;
+                                        
+                                    const char *imsi_range = ogs_yaml_iter_value(&imsi_array);
+                                    if (imsi_range) {
+                                        int range_idx = self->tenant_control[self->num_of_tenant_control].num_of_imsi_range;
+                                        if (range_idx < 32) {
+                                            char *dash = strchr(imsi_range, '-');
+                                            if (dash) {
+                                                /* Range format: start-end */
+                                                size_t start_len = dash - imsi_range;
+                                                ogs_cpystrn(self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].start_imsi,
+                                                           imsi_range, start_len + 1);
+                                                ogs_cpystrn(self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].end_imsi,
+                                                           dash + 1, OGS_MAX_IMSI_BCD_LEN + 1);
+                                                self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].is_single = false;
+                                            } else {
+                                                /* Single IMSI */
+                                                ogs_cpystrn(self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].start_imsi,
+                                                           imsi_range, OGS_MAX_IMSI_BCD_LEN + 1);
+                                                self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].is_single = true;
+                                            }
+                                            self->tenant_control[self->num_of_tenant_control].num_of_imsi_range++;
+                                        }
+                                    }
+                                } while (ogs_yaml_iter_type(&imsi_array) == YAML_SEQUENCE_NODE);
+                            }
+                        }
+                        
+                        /* Increment tenant count if we successfully parsed this tenant */
+                        if (strlen(self->tenant_control[self->num_of_tenant_control].tenant_id) > 0) {
+                            self->num_of_tenant_control++;
+                        }
+                        
+                    } while (ogs_yaml_iter_type(&tenant_control_array) == YAML_SEQUENCE_NODE);
+                }
+            }
+        }
+    }
+    
+    /* Calculate differences */
+    json_t *changes = compare_tenant_configs(self, old_config, old_count);
+
+    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
+
+    /* Clean up */
+    yaml_document_delete(document);
+    free(document);
+    yaml_parser_delete(&parser);
+    fclose(file);
+
+    /* Build result */
+    json_object_set_new(result, "status", json_string("success"));
+    json_object_set_new(result, "changes", changes);
+
+    ogs_info("Tenant control configuration reloaded from %s", config_file);
+
+    return result;
 }

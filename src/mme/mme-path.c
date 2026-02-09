@@ -170,6 +170,53 @@ void mme_send_release_access_bearer_or_ue_context_release(enb_ue_t *enb_ue)
     }
 }
 
+void mme_send_delete_all_sessions_on_paging_failure(mme_ue_t *mme_ue)
+{
+    enb_ue_t *enb_ue = NULL;
+
+    ogs_assert(mme_ue);
+
+    ogs_warn("[%s] Paging failed - trigger implicit detach (policy=delete_sessions)",
+             mme_ue->imsi_bcd);
+
+    /* Set detach type for implicit detach */
+    mme_ue->detach_type = MME_DETACH_TYPE_MME_IMPLICIT;
+
+    /* Send Purge-UE-Request to HSS (3GPP TS 29.272 7.2.14)
+     * This informs HSS that MME has deleted the UE context */
+    if (!mme_ue->purge_ue_in_progress) {
+        mme_ue->purge_ue_in_progress = true;
+        mme_s6a_send_pur(NULL, mme_ue);
+        ogs_info("[%s] Purge-UE-Request sent to HSS after paging failure",
+                 mme_ue->imsi_bcd);
+    }
+
+    /* Try to find eNB-UE context */
+    enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
+
+    if (enb_ue) {
+        /* S1 context exists - use normal implicit detach path */
+        ogs_info("[%s] Delete Session Request sent (paging failure)",
+                 mme_ue->imsi_bcd);
+        mme_send_delete_session_or_detach(enb_ue, mme_ue);
+    } else {
+        /* S1 context already removed - directly delete sessions */
+        ogs_warn("[%s] ENB-S1 Context already removed, "
+                 "sending Delete Session Request without S1 context",
+                 mme_ue->imsi_bcd);
+
+        /* Delete all PDN sessions */
+        ogs_info("[%s] Delete Session Request sent (paging failure, no S1 context)",
+                 mme_ue->imsi_bcd);
+        mme_gtp_send_delete_all_sessions(NULL, mme_ue,
+            OGS_GTP_DELETE_NO_ACTION);
+
+        /* Note: UE context will be removed by FSM when delete session completes
+         * or by exception handler if no sessions are pending.
+         * Do not call mme_ue_remove() here as FSM may still need the context. */
+    }
+}
+
 void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
 {
     int r;
@@ -190,6 +237,12 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
             ogs_assert(OGS_OK ==
                 mme_gtp_send_downlink_data_notification_ack(
                     bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE));
+
+            /* Check paging failure policy */
+            if (mme_self()->paging_failure_policy ==
+                MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS) {
+                mme_send_delete_all_sessions_on_paging_failure(mme_ue);
+            }
         } else {
             ogs_assert(OGS_OK ==
                 mme_gtp_send_downlink_data_notification_ack(
@@ -208,6 +261,12 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
             ogs_assert(OGS_OK ==
                 mme_gtp_send_create_bearer_response(
                     bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE));
+
+            /* Check paging failure policy */
+            if (mme_self()->paging_failure_policy ==
+                MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS) {
+                mme_send_delete_all_sessions_on_paging_failure(mme_ue);
+            }
         } else {
             r = nas_eps_send_activate_dedicated_bearer_context_request(bearer);
             ogs_expect(r == OGS_OK);
@@ -226,6 +285,12 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
             ogs_assert(OGS_OK ==
                 mme_gtp_send_update_bearer_response(
                     bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE));
+
+            /* Check paging failure policy */
+            if (mme_self()->paging_failure_policy ==
+                MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS) {
+                mme_send_delete_all_sessions_on_paging_failure(mme_ue);
+            }
         } else {
             ogs_gtp_xact_t *xact = NULL;
 
@@ -268,6 +333,12 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
             ogs_assert(OGS_OK ==
                 mme_gtp_send_delete_bearer_response(
                     bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE));
+
+            /* Check paging failure policy */
+            if (mme_self()->paging_failure_policy ==
+                MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS) {
+                mme_send_delete_all_sessions_on_paging_failure(mme_ue);
+            }
         } else {
             r = nas_eps_send_deactivate_bearer_context_request(bearer);
             ogs_expect(r == OGS_OK);
@@ -302,7 +373,7 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
             r = nas_eps_send_detach_request(mme_ue);
             ogs_expect(r == OGS_OK);
             ogs_assert(r != OGS_ERROR);
-            if (MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+            if (MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
                 ogs_assert(OGS_OK == sgsap_send_detach_indication(mme_ue));
             } else {
                 enb_ue_t *enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);

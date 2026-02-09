@@ -331,11 +331,11 @@ ogs_pkbuf_t *mme_s11_build_create_session_request(
             pgw_s5u_teid[i].teid = htobe32(bearer->pgw_s5u_teid);
             ogs_assert(OGS_OK == ogs_gtp2_ip_to_f_teid(
                 &bearer->pgw_s5u_ip, &pgw_s5u_teid[i], &pgw_s5u_len[i]));
-            req->bearer_contexts_to_be_created[i].s5_s8_u_sgw_f_teid.
+            req->bearer_contexts_to_be_created[i].s4_u_sgsn_f_teid.
                 presence = 1;
-            req->bearer_contexts_to_be_created[i].s5_s8_u_sgw_f_teid.data =
+            req->bearer_contexts_to_be_created[i].s4_u_sgsn_f_teid.data =
                 &pgw_s5u_teid[i];
-            req->bearer_contexts_to_be_created[i].s5_s8_u_sgw_f_teid.len =
+            req->bearer_contexts_to_be_created[i].s4_u_sgsn_f_teid.len =
                 pgw_s5u_len[i];
         }
 
@@ -446,18 +446,42 @@ ogs_pkbuf_t *mme_s11_build_modify_bearer_request(
 
     /* Indication */
     memset(&indication, 0, sizeof(ogs_gtp2_indication_t));
-    ogs_list_for_each_entry(
-            &mme_ue->bearer_to_modify_list, bearer, to_modify_node) {
-        mme_sess_t *sess = mme_sess_find_by_id(bearer->sess_id);
-        ogs_assert(sess);
-
-        if (sess->ue_request_type.value == OGS_NAS_EPS_REQUEST_TYPE_HANDOVER) {
-            indication.handover_indication = 1;
-            req->indication_flags.presence = 1;
-            req->indication_flags.data = &indication;
-            req->indication_flags.len = sizeof(ogs_gtp2_indication_t);
-            break;
+    
+    /* 
+     * The handover indication flag must be set only for actual handovers and not for
+     * other scenarios like paging responses (service requests). This check determines
+     * if we're in a real handover scenario.
+     */
+    bool is_handover = false;
+    
+    /* First check: If this is a service request, it's definitely not a handover */
+    if (mme_ue->nas_eps.type != MME_EPS_TYPE_SERVICE_REQUEST) {
+        /* Second check: See if any session has handover as request type */
+        ogs_list_for_each_entry(&mme_ue->bearer_to_modify_list, bearer, to_modify_node) {
+            mme_sess_t *sess = mme_sess_find_by_id(bearer->sess_id);
+            ogs_assert(sess);
+            
+            if (sess->ue_request_type.value == OGS_NAS_EPS_REQUEST_TYPE_HANDOVER) {
+                /* This is a valid handover */
+                is_handover = true;
+                ogs_debug("    Setting handover_indication: Bearer ID=%d, Session ID=%d",
+                         bearer->ebi, sess->pti);
+                break;
+            }
         }
+    } else {
+        ogs_debug("    Not setting handover_indication flag: this is a service request (paging response)");
+    }
+    
+    /* Set indication flag only for genuine handover scenarios */
+    if (is_handover) {
+        indication.handover_indication = 1;
+        req->indication_flags.presence = 1;
+        req->indication_flags.data = &indication;
+        req->indication_flags.len = sizeof(ogs_gtp2_indication_t);
+        ogs_debug("    Handover indication flag set");
+    } else {
+        ogs_debug("    Handover indication flag NOT set");
     }
 
     /* User Location Information(ULI) */

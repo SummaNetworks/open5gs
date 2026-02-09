@@ -1,0 +1,134 @@
+diff --git a/src/smf/n4-handler.c b/src/smf/n4-handler.c
+index c3c42cdfb..2c7a0a1a5 100644
+--- a/src/smf/n4-handler.c
++++ b/src/smf/n4-handler.c
+@@ -539,8 +539,8 @@ static void bearer_modification_response(
+             }
+ 
+         } else {
+-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown flags [0x%llx], ignoring", (long long)flags);
++            return;
+         }
+     } else if (flags & OGS_PFCP_MODIFY_CREATE) {
+         if (flags & OGS_PFCP_MODIFY_INDIRECT) {
+@@ -584,8 +584,8 @@ static void bearer_modification_response(
+             smf_namf_comm_send_n1_n2_message_transfer(sess, &param);
+ 
+         } else {
+-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown flags [0x%llx], ignoring", (long long)flags);
++            return;
+         }
+     } else if (flags &
+             (OGS_PFCP_MODIFY_TFT_UPDATE|OGS_PFCP_MODIFY_QOS_UPDATE)) {
+@@ -664,8 +664,7 @@ static void bearer_modification_response(
+             smf_sbi_send_sm_context_updated_data_n1_n2_message(sess, stream,
+                     n1smbuf, OpenAPI_n2_sm_info_type_PDU_RES_MOD_REQ, n2smbuf);
+         } else {
+-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown flags [0x%llx], ignoring", (long long)flags);
+         }
+     }
+ }
+@@ -714,8 +713,8 @@ static void error_indication(
+             ogs_strerror(trigger, strerror);
+             break;
+         } else {
+-            ogs_fatal("Unknown trigger [%d]", trigger);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown trigger [%d], ignoring", trigger);
++            return;
+         }
+ 
+         ogs_error("%s", strerror);
+diff --git a/src/smf/gsm-handler.c b/src/smf/gsm-handler.c
+index 5b43b6ae6..a6d9c8a8d 100644
+--- a/src/smf/gsm-handler.c
++++ b/src/smf/gsm-handler.c
+@@ -470,8 +470,8 @@ int smf_5gc_n1_handle_pdu_session_modification_request(
+                     ogs_debug("Param Index 0x%x", param_index);
+                     break;
+                 default:
+-                    ogs_fatal("Unknown qos_flow parameter identifier [%d]",
+-                            param_index);
++                    ogs_warn("Unknown qos_flow parameter identifier [%d], skipping",
++                             param_index);
+                     ogs_assert_if_reached();
+                 }
+             } while (ogs_nas_qos_mo_rule_param_next(
+@@ -511,8 +511,8 @@ int smf_5gc_n1_handle_pdu_session_modification_request(
+                 }
+             }
+         } else {
+-        ogs_fatal("Unknown PFCP-Flags : [0x%llx]", (long long)pfcp_flags);
+-        ogs_assert_if_reached();
++        ogs_warn("Unknown PFCP-Flags : [0x%llx], ignoring", (long long)pfcp_flags);
++        return OGS_ERROR;
+         }
+     }
+ 
+diff --git a/src/smf/gsm-sm.c b/src/smf/gsm-sm.c
+index a7693bff7..15a6d6f0b 100644
+--- a/src/smf/gsm-sm.c
++++ b/src/smf/gsm-sm.c
+@@ -1541,8 +1541,8 @@ static void check_session_deletion(smf_sess_t *sess, ngap_state_e ngap_state)
+                 } else if (trigger == OGS_DIAM_RX_STR) {
+                     ogs_strerror(OGS_DIAM_RX_STR, strerror);
+                 } else {
+-                    ogs_fatal("Unknown trigger [%d]", trigger);
+-                    ogs_assert_if_reached();
++                    ogs_warn("Unknown trigger [%d], ignoring", trigger);
++                    break;
+                 }
+                 ogs_assert(strerror);
+ 
+diff --git a/src/smf/pfcp-path.c b/src/smf/pfcp-path.c
+index d67ed7e4c..0ad9bbcda 100644
+--- a/src/smf/pfcp-path.c
++++ b/src/smf/pfcp-path.c
+@@ -293,8 +293,8 @@ static void sess_timeout(ogs_pfcp_xact_t *xact, void *data)
+             ogs_gtp_send_error_message(xact_data->gtp_xact, sess_data->gnode,
+                 OGS_GTP_CREATE_BEARER_RESPONSE_TYPE, cause_value);
+         } else {
+-            ogs_fatal("Unknown trigger [%d]", trigger);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown trigger [%d], ignoring", trigger);
++            return;
+         }
+     }
+ 
+diff --git a/src/amf/ngap-handler.c b/src/amf/ngap-handler.c
+index 91f4ee8fc..d5e6f5eb3 100644
+--- a/src/amf/ngap-handler.c
++++ b/src/amf/ngap-handler.c
+@@ -1120,9 +1120,9 @@ void ngap_handle_uplink_nas_transport(
+                     break;
+                 }
+ 
+-                ogs_fatal("Unknown GSM Message Type[%d]",
++                ogs_warn("Unknown GSM Message Type[%d], ignoring",
+                         message.gsm.h.message_type);
+-                ogs_assert_if_reached();
++                break;
+             }
+             break;
+         default:
+diff --git a/lib/pfcp/context.c b/lib/pfcp/context.c
+index 18dcf8ab5..e97ef1a5e 100644
+--- a/lib/pfcp/context.c
++++ b/lib/pfcp/context.c
+@@ -1239,8 +1239,8 @@ ogs_pfcp_object_t *ogs_pfcp_object_find_by_pfcp_session_report(
+     case OGS_PFCP_OBJ_SESS_TYPE:
+         return pfcp_object;
+     default:
+-        ogs_fatal("Unknown type [%d]", type);
+-        ogs_assert_if_reached();
++        ogs_warn("Unknown type [%d], no matching object found", type);
++        return NULL;
+     }
+ 
+     return NULL;

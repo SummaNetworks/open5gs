@@ -123,26 +123,10 @@ uint8_t mme_s6a_handle_ula(
             return OGS_NAS_EMM_CAUSE_NO_EPS_BEARER_CONTEXT_ACTIVATED;
         }
 
-        /* Update CSMAP from Tracking area update request */
-        mme_ue->csmap = mme_csmap_find_by_tai(&mme_ue->tai);
-        if (mme_ue->csmap &&
-            mme_ue->network_access_mode ==
-                OGS_NETWORK_ACCESS_MODE_PACKET_AND_CIRCUIT &&
-            (mme_ue->nas_eps.update.value ==
-             OGS_NAS_EPS_UPDATE_TYPE_COMBINED_TA_LA_UPDATING ||
-             mme_ue->nas_eps.update.value ==
-             OGS_NAS_EPS_UPDATE_TYPE_COMBINED_TA_LA_UPDATING_WITH_IMSI_ATTACH)) {
-
-            mme_ue->tracking_area_update_request_type =
-                MME_TAU_TYPE_UNPROTECTED_INGERITY;
-            ogs_assert(OGS_OK == sgsap_send_location_update_request(mme_ue));
-
-        } else {
-            r = nas_eps_send_tau_accept(mme_ue,
-                    S1AP_ProcedureCode_id_InitialContextSetup);
-            ogs_expect(r == OGS_OK);
-            ogs_assert(r != OGS_ERROR);
-        }
+        r = nas_eps_send_tau_accept(mme_ue,
+                S1AP_ProcedureCode_id_InitialContextSetup);
+        ogs_expect(r == OGS_OK);
+        ogs_assert(r != OGS_ERROR);
     } else {
         ogs_error("Invalid Type[%d]", mme_ue->nas_eps.type);
         return OGS_NAS_EMM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED;
@@ -160,6 +144,12 @@ uint8_t mme_s6a_handle_pua(
     ogs_assert(s6a_message);
     pua_message = &s6a_message->pua_message;
     ogs_assert(pua_message);
+
+    /* Clear Purge UE in-progress flag */
+    if (mme_ue->purge_ue_in_progress) {
+        ogs_debug("[%s] Purge UE completed", mme_ue->imsi_bcd);
+        mme_ue->purge_ue_in_progress = false;
+    }
 
     if (s6a_message->result_code != ER_DIAMETER_SUCCESS) {
         ogs_error("Purge UE failed for IMSI[%s] [%d]", mme_ue->imsi_bcd,
@@ -291,7 +281,7 @@ void mme_s6a_handle_clr(mme_ue_t *mme_ue, ogs_diam_s6a_message_t *s6a_message)
             r = nas_eps_send_detach_request(mme_ue);
             ogs_expect(r == OGS_OK);
             ogs_assert(r != OGS_ERROR);
-            if (MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+            if (MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
                 ogs_assert(OGS_OK == sgsap_send_detach_indication(mme_ue));
             } else {
                 enb_ue_t *enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
@@ -320,7 +310,7 @@ void mme_s6a_handle_clr(mme_ue_t *mme_ue, ogs_diam_s6a_message_t *s6a_message)
          * There is no need to send NAS or S1AP message to the UE.
          * So, we don't have to check whether UE is IDLE or not.
          */
-        if (MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+        if (MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
             ogs_assert(OGS_OK == sgsap_send_detach_indication(mme_ue));
         } else {
             enb_ue_t *enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);

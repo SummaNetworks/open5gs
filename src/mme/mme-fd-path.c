@@ -1377,11 +1377,14 @@ static void mme_s6a_ula_cb(void *data, struct msg **msg)
                 sess_data->mme_ue_id);
         return;
     }
-    enb_ue = enb_ue_find_by_id(sess_data->enb_ue_id);
-    if (!enb_ue) {
-        ogs_error("[%s] ENB-S1 Context has already been removed [%d]",
-                mme_ue->imsi_bcd, sess_data->enb_ue_id);
-        return;
+
+    /* enb_ue may not exist if S1 connection was already released */
+    if (sess_data->enb_ue_id != OGS_INVALID_POOL_ID) {
+        enb_ue = enb_ue_find_by_id(sess_data->enb_ue_id);
+        if (!enb_ue) {
+            ogs_warn("[%s] ENB-S1 Context has already been removed",
+                    mme_ue->imsi_bcd);
+        }
     }
 
     /* Set Update-Location Command */
@@ -1526,7 +1529,7 @@ static void mme_s6a_ula_cb(void *data, struct msg **msg)
         e = mme_event_new(MME_EVENT_S6A_MESSAGE);
         ogs_assert(e);
         e->mme_ue_id = mme_ue->id;
-        e->enb_ue_id = enb_ue->id;
+        e->enb_ue_id = enb_ue ? enb_ue->id : OGS_INVALID_POOL_ID;
         e->s6a_message = s6a_message;
         rv = ogs_queue_push(ogs_app()->queue, e);
         if (rv != OGS_OK) {
@@ -1603,18 +1606,13 @@ void mme_s6a_send_pur(enb_ue_t *enb_ue, mme_ue_t *mme_ue)
         return;
     }
 
-    if (!enb_ue) {
-        ogs_error("S1 context has already been removed");
-        return;
-    }
-
     ogs_debug("[MME] Purge-UE-Request");
 
     /* Create the random value to store with the session */
     sess_data = ogs_calloc(1, sizeof(*sess_data));
     ogs_assert(sess_data);
     sess_data->mme_ue_id = mme_ue->id;
-    sess_data->enb_ue_id = enb_ue->id;
+    sess_data->enb_ue_id = enb_ue ? enb_ue->id : OGS_INVALID_POOL_ID;
 
     /* Create the request */
     ret = fd_msg_new(ogs_diam_s6a_cmd_pur, MSGFL_ALLOC_ETEID, &req);
@@ -1737,11 +1735,14 @@ static void mme_s6a_pua_cb(void *data, struct msg **msg)
                 sess_data->mme_ue_id);
         return;
     }
-    enb_ue = enb_ue_find_by_id(sess_data->enb_ue_id);
-    if (!enb_ue) {
-        ogs_error("[%s] ENB-S1 Context has already been removed [%d]",
-                mme_ue->imsi_bcd, sess_data->enb_ue_id);
-        return;
+
+    /* enb_ue may not exist if S1 connection was already released */
+    if (sess_data->enb_ue_id != OGS_INVALID_POOL_ID) {
+        enb_ue = enb_ue_find_by_id(sess_data->enb_ue_id);
+        if (!enb_ue) {
+            ogs_warn("[%s] ENB-S1 Context has already been removed",
+                    mme_ue->imsi_bcd);
+        }
     }
 
     /* Set Purge-UE Command */
@@ -1840,7 +1841,7 @@ static void mme_s6a_pua_cb(void *data, struct msg **msg)
         e = mme_event_new(MME_EVENT_S6A_MESSAGE);
         ogs_assert(e);
         e->mme_ue_id = mme_ue->id;
-        e->enb_ue_id = enb_ue->id;
+        e->enb_ue_id = enb_ue ? enb_ue->id : OGS_INVALID_POOL_ID;
         e->s6a_message = s6a_message;
         rv = ogs_queue_push(ogs_app()->queue, e);
         if (rv != OGS_OK) {

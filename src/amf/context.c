@@ -1258,8 +1258,7 @@ void amf_gnb_remove(amf_gnb_t *gnb)
 
     ogs_hash_set(self.gnb_addr_hash,
             gnb->sctp.addr, sizeof(ogs_sockaddr_t), NULL);
-    if (gnb->gnb_id_presence == true)
-        ogs_hash_set(self.gnb_id_hash, &gnb->gnb_id, sizeof(gnb->gnb_id), NULL);
+    ogs_hash_set(self.gnb_id_hash, &gnb->gnb_id, sizeof(gnb->gnb_id), NULL);
 
     ogs_sctp_flush_and_destroy(&gnb->sctp);
 
@@ -1295,13 +1294,10 @@ int amf_gnb_set_gnb_id(amf_gnb_t *gnb, uint32_t gnb_id)
 {
     ogs_assert(gnb);
 
-    if (gnb->gnb_id_presence == true)
-        ogs_hash_set(self.gnb_id_hash, &gnb->gnb_id, sizeof(gnb->gnb_id), NULL);
+    ogs_hash_set(self.gnb_id_hash, &gnb->gnb_id, sizeof(gnb->gnb_id), NULL);
 
     gnb->gnb_id = gnb_id;
     ogs_hash_set(self.gnb_id_hash, &gnb->gnb_id, sizeof(gnb->gnb_id), gnb);
-
-    gnb->gnb_id_presence = true;
 
     return OGS_OK;
 }
@@ -2265,7 +2261,6 @@ amf_sess_t *amf_sess_add(amf_ue_t *amf_ue, uint8_t psi)
 
     sess->s_nssai.sst = 0;
     sess->s_nssai.sd.v = OGS_S_NSSAI_NO_SD_VALUE;
-    sess->mapped_hplmn_presence = false;
     sess->mapped_hplmn.sst = 0;
     sess->mapped_hplmn.sd.v = OGS_S_NSSAI_NO_SD_VALUE;
 
@@ -2366,6 +2361,7 @@ void amf_sbi_select_nf(
 {
     OpenAPI_nf_type_e target_nf_type = OpenAPI_nf_type_NULL;
     ogs_sbi_nf_instance_t *nf_instance = NULL;
+    amf_sess_t *sess = NULL;
 
     ogs_assert(sbi_object);
     ogs_assert(service_type);
@@ -2373,11 +2369,35 @@ void amf_sbi_select_nf(
     ogs_assert(target_nf_type);
     ogs_assert(requester_nf_type);
 
-    nf_instance = ogs_sbi_nf_instance_find_by_discovery_param(
-                    target_nf_type, requester_nf_type, discovery_option);
-    if (nf_instance)
-        OGS_SBI_SETUP_NF_INSTANCE(
-                sbi_object->service_type_array[service_type], nf_instance);
+    switch(sbi_object->type) {
+    case OGS_SBI_OBJ_UE_TYPE:
+        nf_instance = ogs_sbi_nf_instance_find_by_discovery_param(
+                        target_nf_type, requester_nf_type, discovery_option);
+        if (nf_instance)
+            OGS_SBI_SETUP_NF_INSTANCE(
+                    sbi_object->service_type_array[service_type], nf_instance);
+        break;
+    case OGS_SBI_OBJ_SESS_TYPE:
+        sess = (amf_sess_t *)sbi_object;
+        ogs_assert(sess);
+
+        ogs_list_for_each(&ogs_sbi_self()->nf_instance_list, nf_instance) {
+            if (ogs_sbi_discovery_param_is_matched(
+                    nf_instance,
+                    target_nf_type, requester_nf_type, discovery_option) ==
+                        false)
+                continue;
+
+            OGS_SBI_SETUP_NF_INSTANCE(
+                    sbi_object->service_type_array[service_type], nf_instance);
+            break;
+        }
+        break;
+    default:
+        ogs_fatal("(NF discover search result) Not implemented [%d]",
+                    sbi_object->type);
+        ogs_assert_if_reached();
+    }
 }
 
 int amf_sess_xact_count(amf_ue_t *amf_ue)
@@ -2888,8 +2908,6 @@ bool amf_update_allowed_nssai(amf_ue_t *amf_ue)
 
                 allowed->sst = requested->sst;
                 allowed->sd.v = requested->sd.v;
-                allowed->mapped_hplmn_sst_presence =
-                        requested->mapped_hplmn_sst_presence;
                 allowed->mapped_hplmn_sst = requested->mapped_hplmn_sst;
                 allowed->mapped_hplmn_sd.v = requested->mapped_hplmn_sd.v;
 
@@ -2926,7 +2944,6 @@ bool amf_update_allowed_nssai(amf_ue_t *amf_ue)
 
                 allowed->sst = slice->s_nssai.sst;
                 allowed->sd.v = slice->s_nssai.sd.v;
-                allowed->mapped_hplmn_sst_presence = false;
                 allowed->mapped_hplmn_sst = 0;
                 allowed->mapped_hplmn_sd.v = OGS_S_NSSAI_NO_SD_VALUE;
 

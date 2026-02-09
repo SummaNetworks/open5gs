@@ -220,6 +220,18 @@ int emm_handle_attach_request(enb_ue_t *enb_ue, mme_ue_t *mme_ue,
 
         ogs_info("    IMSI[%s]", imsi_bcd);
 
+        /* Check Tenant Control after IMSI is set */
+        if (!mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
+            ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation", 
+                     mme_ue->imsi_bcd, mme_ue->tai.tac);
+            r = nas_eps_send_attach_reject(enb_ue, mme_ue,
+                    OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA,
+                    OGS_NAS_ESM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+            return OGS_ERROR;
+        }
+
         break;
     case OGS_NAS_EPS_MOBILE_IDENTITY_GUTI:
         eps_mobile_identity_guti = &eps_mobile_identity->guti;
@@ -243,6 +255,21 @@ int emm_handle_attach_request(enb_ue_t *enb_ue, mme_ue_t *mme_ue,
 
     OGS_NAS_STORE_DATA(
             &mme_ue->pdn_connectivity_request, esm_message_container);
+
+    /* Check Tenant Control for both IMSI and GUTI attach */
+    if (MME_UE_HAVE_IMSI(mme_ue)) {
+        if (!mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
+            ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation", 
+                     mme_ue->imsi_bcd, mme_ue->tai.tac);
+            r = nas_eps_send_attach_reject(enb_ue, mme_ue,
+                    OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA,
+                    OGS_NAS_ESM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+            return OGS_ERROR;
+        }
+    }
+    /* Note: If GUTI attach without IMSI, tenant check will be done after Identity Response */
 
     return OGS_OK;
 }
@@ -299,18 +326,28 @@ int emm_handle_attach_complete(
     message.emm.h.protocol_discriminator = OGS_NAS_PROTOCOL_DISCRIMINATOR_EMM;
     message.emm.h.message_type = OGS_NAS_EPS_EMM_INFORMATION;
 
-    if (mme_self()->full_name.length) {
+    /* Get TAC-specific network name or fallback to global */
+    ogs_nas_network_name_t *full_name = NULL;
+    ogs_nas_network_name_t *short_name = NULL;
+    mme_get_network_name_for_tac(mme_ue->tai.tac, &full_name, &short_name);
+
+    ogs_debug("Network name for TAC[%d]: full_length=%d, short_length=%d",
+              mme_ue->tai.tac,
+              full_name ? full_name->length : 0,
+              short_name ? short_name->length : 0);
+
+    if (full_name && full_name->length) {
         emm_information->presencemask |=
             OGS_NAS_EPS_EMM_INFORMATION_FULL_NAME_FOR_NETWORK_PRESENT;
         memcpy(&emm_information->full_name_for_network,
-            &mme_self()->full_name, sizeof(ogs_nas_network_name_t));
+            full_name, sizeof(ogs_nas_network_name_t));
     }
 
-    if (mme_self()->short_name.length) {
+    if (short_name && short_name->length) {
         emm_information->presencemask |=
             OGS_NAS_EPS_EMM_INFORMATION_SHORT_NAME_FOR_NETWORK_PRESENT;
         memcpy(&emm_information->short_name_for_network,
-            &mme_self()->short_name, sizeof(ogs_nas_network_name_t));
+            short_name, sizeof(ogs_nas_network_name_t));
     }
 
     if (!ogs_global_conf()->parameter.no_time_zone_information) {
@@ -422,6 +459,20 @@ int emm_handle_identity_response(
         }
 
         ogs_info("    IMSI[%s]", mme_ue->imsi_bcd);
+
+        /* Check Tenant Control after IMSI is obtained from Identity Response */
+        if (mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST) {
+            if (!mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
+                ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation",
+                         mme_ue->imsi_bcd, mme_ue->tai.tac);
+                r = nas_eps_send_attach_reject(enb_ue, mme_ue,
+                        OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA,
+                        OGS_NAS_ESM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED);
+                ogs_expect(r == OGS_OK);
+                ogs_assert(r != OGS_ERROR);
+                return OGS_ERROR;
+            }
+        }
     } else {
         ogs_warn("Not supported Identity type[%d]", mobile_identity->imsi.type);
     }
@@ -664,6 +715,18 @@ int emm_handle_tau_request(
     }
     ogs_debug("    SERVED_TAI_INDEX[%d]", served_tai_index);
 
+    /* Check Tenant Control only when IMSI is known */
+    if (MME_UE_HAVE_IMSI(mme_ue) &&
+        !mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
+        ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation",
+                 mme_ue->imsi_bcd, mme_ue->tai.tac);
+        r = nas_eps_send_tau_reject(enb_ue, mme_ue,
+                OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA);
+        ogs_expect(r == OGS_OK);
+        ogs_assert(r != OGS_ERROR);
+        return OGS_ERROR;
+    }
+
     /* Store UE specific information */
     if (tau_request->presencemask &
         OGS_NAS_EPS_TRACKING_AREA_UPDATE_REQUEST_LAST_VISITED_REGISTERED_TAI_PRESENT) {
@@ -731,6 +794,74 @@ int emm_handle_tau_request(
         ogs_error("Not implemented[%d]", eps_mobile_identity->imsi.type);
 
         return OGS_OK;
+    }
+
+    /* Check EPS bearer context status from UE */
+    if (tau_request->presencemask &
+        OGS_NAS_EPS_TRACKING_AREA_UPDATE_REQUEST_EPS_BEARER_CONTEXT_STATUS_PRESENT) {
+
+        ogs_nas_eps_bearer_context_status_t *ue_status =
+            &tau_request->eps_bearer_context_status;
+
+        mme_sess_t *sess = NULL, *next_sess = NULL;
+
+        ogs_debug("    Checking EPS bearer context status from UE");
+
+        ogs_list_for_each_safe(&mme_ue->sess_list, next_sess, sess) {
+            mme_bearer_t *bearer = mme_bearer_first(sess);
+            bool pdn_mismatch = false;
+
+            /* Initialize mismatch flag */
+            sess->ue_pdn_status_mismatch = false;
+
+            while (bearer) {
+                bool ue_active = false;
+
+                /* Check UE-side bearer status */
+                switch (bearer->ebi) {
+                    case 5: ue_active = ue_status->ebi5; break;
+                    case 6: ue_active = ue_status->ebi6; break;
+                    case 7: ue_active = ue_status->ebi7; break;
+                    case 8: ue_active = ue_status->ebi8; break;
+                    case 9: ue_active = ue_status->ebi9; break;
+                    case 10: ue_active = ue_status->ebi10; break;
+                    case 11: ue_active = ue_status->ebi11; break;
+                    case 12: ue_active = ue_status->ebi12; break;
+                    case 13: ue_active = ue_status->ebi13; break;
+                    case 14: ue_active = ue_status->ebi14; break;
+                    case 15: ue_active = ue_status->ebi15; break;
+                    default: break;
+                }
+
+                /* MME:Active, UE:Inactive = Mismatch */
+                if (!ue_active) {
+                    mme_bearer_t *default_bearer = mme_default_bearer_in_sess(sess);
+
+                    if (bearer == default_bearer) {
+                        /* Default bearer mismatch -> Mark PDN for deletion */
+                        ogs_warn("[%s] Default Bearer[EBI:%d] mismatch "
+                                "(MME:Active / UE:Inactive) - "
+                                "PDN[%s] will be locally deactivated",
+                                mme_ue->imsi_bcd, bearer->ebi,
+                                sess->session ? sess->session->name : "unknown");
+                        pdn_mismatch = true;
+                        break;  /* This PDN will be deleted */
+                    } else {
+                        /* Dedicated bearer mismatch - warning only */
+                        ogs_warn("[%s] Dedicated Bearer[EBI:%d] mismatch "
+                                "(MME:Active / UE:Inactive)",
+                                mme_ue->imsi_bcd, bearer->ebi);
+                    }
+                }
+
+                bearer = mme_bearer_next(bearer);
+            }
+
+            /* Mark PDN deletion flag */
+            if (pdn_mismatch) {
+                sess->ue_pdn_status_mismatch = true;
+            }
+        }
     }
 
     return OGS_OK;

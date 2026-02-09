@@ -127,9 +127,6 @@ bool nrf_nnrf_nfm_send_nf_status_notify_all(
                 ogs_sbi_nf_service_is_allowed_nf_type(
                     nf_service, subscription_data->req_nf_type) == false)
                 continue;
-        } else if (subscription_data->subscr_cond.nf_instance_id) {
-            if (strcmp(subscription_data->subscr_cond.nf_instance_id, nf_instance->id) != 0)
-                continue;
         }
 
         if (subscription_data->req_nf_type &&

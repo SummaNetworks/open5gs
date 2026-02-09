@@ -1,0 +1,132 @@
+From: Claude Code Analysis
+Date: 2025-10-24
+Subject: [PATCH] Fix SMF duplicate code and UPF NULL pointer dereference risk
+
+This patch fixes two bugs found during code analysis comparing with
+GitHub remote branch origin/fix-tau-unknown-guti-tenant-control:
+
+1. SMF binding.c - Remove duplicate bearer->create_pending assignment
+2. UPF gtp-path.c - Add missing continue statement to prevent NULL pointer dereference
+
+Both fixes align the code with the GitHub remote branch implementation.
+
+---
+ src/smf/binding.c   | 3 ---
+ src/upf/gtp-path.c  | 1 +
+ 2 files changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/src/smf/binding.c b/src/smf/binding.c
+index xxxxx..xxxxx 100644
+--- a/src/smf/binding.c
++++ b/src/smf/binding.c
+@@ -442,9 +442,6 @@ int smf_gtp2_send_create_bearer_request(smf_bearer_t *bearer)
+     /* Mark bearer as waiting for Create Bearer Response */
+     bearer->create_pending = true;
+
+-    /* Mark bearer as waiting for Create Bearer Response */
+-    bearer->create_pending = true;
+-
+     rv = ogs_gtp_xact_commit(xact);
+     ogs_expect(rv == OGS_OK);
+
+
+diff --git a/src/upf/gtp-path.c b/src/upf/gtp-path.c
+index xxxxx..xxxxx 100644
+--- a/src/upf/gtp-path.c
++++ b/src/upf/gtp-path.c
+@@ -176,6 +176,7 @@ static void _gtpv1_tun_recv_common_cb(
+         far = pdr->far;
+         if (!far) {
+             ogs_warn("PDR [ID:%d] has no associated FAR - skipping", pdr->id);
++            continue;
+         }
+
+         /* Check if PDR is Downlink */
+
+---
+
+## Bug 1: SMF binding.c - Duplicate Code
+
+**Problem:**
+The statement `bearer->create_pending = true;` was duplicated (lines 443 and 446).
+This was harmless but unnecessary code duplication.
+
+**Fix:**
+Removed the duplicate line at 446.
+
+**Impact:**
+- Severity: Low
+- Improves code readability
+- No functional change
+
+---
+
+## Bug 2: UPF gtp-path.c - Missing continue Statement
+
+**Problem:**
+In function `_gtpv1_tun_recv_common_cb`, when a PDR has no associated FAR:
+- A warning is logged (line 178)
+- But processing continues without the `continue;` statement
+- This causes the code to access `far->dst_if` at line 189, resulting in NULL pointer dereference
+
+**Context:**
+This is inside a loop searching for an appropriate PDR to handle downlink packets:
+```c
+ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
+    // ... PDR validation
+
+    far = pdr->far;
+    if (!far) {
+        ogs_warn("PDR [ID:%d] has no associated FAR - skipping", pdr->id);
+        // Missing: continue;  ← Should skip to next PDR
+    }
+
+    // Accessing far->dst_if here when far == NULL → CRASH
+    if (far->dst_if != OGS_PFCP_INTERFACE_ACCESS)
+        continue;
+}
+```
+
+**Fix:**
+Added `continue;` statement after the warning to skip to the next PDR in the list.
+
+**Impact:**
+- Severity: Critical
+- Prevents NULL pointer dereference crash
+- Allows proper PDR search to continue with other valid PDRs
+- Enables fallback PDR mechanism to work correctly
+
+**Analysis (via Codex MCP):**
+The analysis confirmed this is a PDR search loop where:
+- Multiple PDRs may exist
+- The function should try other PDRs if current one has no FAR
+- A fallback PDR mechanism exists (line 211: `if (!pdr) pdr = fallback_pdr;`)
+- Using `continue` is correct for search phase
+- Another location (line 530) correctly uses `goto cleanup` because it's in processing phase, not search phase
+
+---
+
+## Verification
+
+Both fixes were verified against GitHub remote branch:
+- origin/fix-tau-unknown-guti-tenant-control
+
+After applying these fixes, the code is functionally identical to the remote branch.
+
+## Build Status
+
+✅ Build successful
+✅ All 6 affected targets compiled cleanly:
+- src/upf/libupf.a.p/gtp-path.c.o
+- src/upf/libupf.a
+- src/upf/open5gs-upfd
+- src/smf/libsmf.a.p/binding.c.o
+- src/smf/libsmf.a
+- src/smf/open5gs-smfd
+
+---
+
+**Date:** 2025-10-24
+**Branch:** summa-1.0
+**Analysis Tool:** Claude Code with Codex MCP
+**Signed-off-by:** Claude Code <noreply@anthropic.com>

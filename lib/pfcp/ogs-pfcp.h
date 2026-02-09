@@ -29,7 +29,7 @@
 #define OGS_MAX_NUM_OF_PDR              16
 #define OGS_MAX_NUM_OF_FAR              16
 #define OGS_MAX_NUM_OF_URR              16
-#define OGS_MAX_NUM_OF_QER              4
+#define OGS_MAX_NUM_OF_QER              16
 #define OGS_MAX_NUM_OF_BAR              1
 
 #define OGS_PFCP_INSIDE
@@ -43,7 +43,6 @@
 #include "pfcp/path.h"
 #include "pfcp/xact.h"
 #include "pfcp/handler.h"
-#include "pfcp/util.h"
 
 #ifdef __cplusplus
 extern "C" {

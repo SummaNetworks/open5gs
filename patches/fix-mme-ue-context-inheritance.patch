@@ -1,0 +1,146 @@
+From 26b77984e3bcd232cf5e24910bfb7a5579587c79 Mon Sep 17 00:00:00 2001
+From: Eureka bot <engg.eurekawireless@gmail.com>
+Date: Mon, 27 Oct 2025 12:50:17 +0900
+Subject: [PATCH] Fix UE context inheritance bugs in mme_ue_set_imsi() for
+ known UE by IMSI scenario
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When "known UE by IMSI" scenario occurs (e.g., Attach → interruption → re-Attach),
+mme_ue_set_imsi() migrates session context from old UE to new UE. This commit fixes
+multiple inheritance bugs that caused crashes and functional issues.
+
+## Root Causes:
+
+### 1. Use-After-Free Bug (Phase-2.5)
+- ogs_list_copy() shallow copy left sess->session pointing to old array
+- Old UE freed → dangling pointers → crash or duplicate sessions
+
+### 2. CS Domain/Identity Loss (Phase-5)
+- P-TMSI not inherited → CS Fallback failure
+- CSMAP not inherited → VLR linkage failure
+- GUTI not inherited → UE privacy degradation
+
+## Fixes:
+
+### Phase-2.5: Session Pointer Rebinding
+- Rebind sess->session to new UE's session[] array
+- Duplicate APN name strings
+- Copy num_of_session count
+
+### Phase-5: CS Domain/Identity Inheritance
+- P-TMSI, CSMAP, VLR Stream ID
+- Current/Next GUTI/M-TMSI with hash table updates
+
+## Problems Resolved:
+✅ MME crash / ✅ CS Fallback failure / ✅ VLR loss / ✅ UE privacy
+
+Location: src/mme/mme-context.c (Lines 3963-4050)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/mme/mme-context.c | 78 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
+
+diff --git a/src/mme/mme-context.c b/src/mme/mme-context.c
+index 667fa4ccb..5708f5016 100644
+--- a/src/mme/mme-context.c
++++ b/src/mme/mme-context.c
+@@ -3960,6 +3960,37 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
+             memcpy(&mme_ue->sess_list,
+                     &old_mme_ue->sess_list, sizeof(mme_ue->sess_list));
+ 
++            /* Phase-2.5 : Rebind session pointers to new UE's session array */
++            old_sess = NULL;
++            ogs_list_for_each(&mme_ue->sess_list, old_sess) {
++                if (old_sess->session) {
++                    /* Calculate index in old session array */
++                    int index = old_sess->session - old_mme_ue->session;
++
++                    if (index >= 0 && index < OGS_MAX_NUM_OF_SESS) {
++                        /* Copy subscription data structure */
++                        mme_ue->session[index] = old_mme_ue->session[index];
++
++                        /* Duplicate APN name string before old UE is freed */
++                        if (old_mme_ue->session[index].name) {
++                            mme_ue->session[index].name =
++                                ogs_strdup(old_mme_ue->session[index].name);
++                        }
++
++                        /* Rebind pointer to new session array */
++                        old_sess->session = &mme_ue->session[index];
++
++                        ogs_debug("Rebound session pointer: index=%d, APN=%s",
++                                  index, mme_ue->session[index].name);
++                    } else {
++                        ogs_error("Invalid session index: %d (sess=%p, old_sess_array=%p)",
++                                  index, old_sess->session, old_mme_ue->session);
++                        old_sess->session = NULL;
++                    }
++                }
++            }
++            mme_ue->num_of_session = old_mme_ue->num_of_session;
++
+             /* Phase-3 : Clear Session Context in OLD MME-UE Context */
+             memset(&old_mme_ue->sess_list, 0, sizeof(old_mme_ue->sess_list));
+ 
+@@ -3970,6 +4001,53 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
+             ogs_assert(old_sgw_ue);
+             sgw_ue->sgw_s11_teid = old_sgw_ue->sgw_s11_teid;
+ 
++            /* Phase-5 : Inherit CS Domain and Identity Information */
++
++            /* P-TMSI (值型) */
++            mme_ue->p_tmsi = old_mme_ue->p_tmsi;
++            old_mme_ue->p_tmsi = 0;
++
++            /* CSMAP (共有リソース - 参照のみコピー) */
++            mme_ue->csmap = old_mme_ue->csmap;
++            mme_ue->vlr_ostream_id = old_mme_ue->vlr_ostream_id;
++
++            /* Current GUTI/M-TMSI */
++            if (old_mme_ue->current.m_tmsi) {
++                /*
++                 * Note: mme_ue (NEW UE) has no GUTI at this point because:
++                 * - Created by mme_ue_add() using ogs_pool_id_calloc()
++                 * - ogs_pool_id_calloc() performs memset() zero-initialization
++                 * - Therefore mme_ue->current.m_tmsi = NULL is guaranteed
++                 * - GUTI will be allocated later by mme_ue_new_guti()
++                 */
++
++                /* Remove old GUTI from hash */
++                ogs_hash_set(self.guti_ue_hash,
++                        &old_mme_ue->current.guti, sizeof(ogs_nas_eps_guti_t), NULL);
++
++                /* Move pointer ownership */
++                mme_ue->current.m_tmsi = old_mme_ue->current.m_tmsi;
++                mme_ue->current.guti = old_mme_ue->current.guti;
++                old_mme_ue->current.m_tmsi = NULL;
++
++                /* Add new GUTI to hash */
++                ogs_hash_set(self.guti_ue_hash,
++                        &mme_ue->current.guti, sizeof(ogs_nas_eps_guti_t), mme_ue);
++
++                ogs_debug("[%s] Inherited GUTI[G:%d,C:%d,M_TMSI:0x%x]",
++                          mme_ue->imsi_bcd,
++                          mme_ue->current.guti.mme_gid,
++                          mme_ue->current.guti.mme_code,
++                          mme_ue->current.guti.m_tmsi);
++            }
++
++            /* Next GUTI/M-TMSI (usually unallocated, but handle just in case) */
++            if (old_mme_ue->next.m_tmsi) {
++                mme_ue->next.m_tmsi = old_mme_ue->next.m_tmsi;
++                mme_ue->next.guti = old_mme_ue->next.guti;
++                old_mme_ue->next.m_tmsi = NULL;
++            }
++
+             mme_ue_remove(old_mme_ue);
+         }
+     }
+-- 
+2.34.1
+

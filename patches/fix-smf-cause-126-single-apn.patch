@@ -1,0 +1,61 @@
+From 1c08c05f368cb4dd0ea1a8f0421703c68391f790 Mon Sep 17 00:00:00 2001
+From: Eureka bot <engg.eurekawireless@gmail.com>
+Date: Mon, 29 Sep 2025 14:07:37 +0900
+Subject: [PATCH] Fix Cause 126 error for single APN WLAN handover
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Remove incorrect EUTRAN session count check that was preventing
+WLAN connections when only a single APN (IMS) was configured.
+
+The removed code was incorrectly skipping same-APN sessions when
+counting, causing legitimate single-APN handovers to fail with
+"Multiple accesses to a PDN connection not allowed" error.
+
+This fix allows WLAN connections (HI=0) even when VoLTE is active,
+enabling proper VoLTE to VoWiFi handover scenarios.
+
+🤖 Generated with [Claude Code](https://claude.ai/code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/smf/s5c-handler.c | 22 ----------------------
+ 1 file changed, 22 deletions(-)
+
+diff --git a/src/smf/s5c-handler.c b/src/smf/s5c-handler.c
+index a88fd5ef0..5c7b38bce 100644
+--- a/src/smf/s5c-handler.c
++++ b/src/smf/s5c-handler.c
+@@ -231,28 +231,6 @@ uint8_t smf_s5c_handle_create_session_request(
+         memcpy(&sess->e_tai, &uli.tai, sizeof(sess->e_tai));
+         memcpy(&sess->e_cgi, &uli.e_cgi, sizeof(sess->e_cgi));
+ 
+-    } else if (sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_WLAN) {
+-        /* Even after handover to WLAN,
+-         * there must be at least one EUTRAN session */
+-        smf_sess_t *eutran_sess = smf_sess_find_by_apn(
+-                smf_ue, sess->session.name, OGS_GTP2_RAT_TYPE_EUTRAN);
+-        if (eutran_sess) {
+-            /* Need to check handover is possible */
+-            int eutran_session_count = 0;
+-            ogs_list_reverse_for_each(&smf_ue->sess_list, eutran_sess) {
+-                if (eutran_sess->gtp_rat_type != OGS_GTP2_RAT_TYPE_EUTRAN)
+-                    continue;
+-                if (strcmp(eutran_sess->session.name, sess->session.name) == 0)
+-                    continue;
+-
+-                eutran_session_count++;
+-            }
+-
+-            if (eutran_session_count < 1) {
+-                ogs_error("Cannot handover to WLAN");
+-                return OGS_GTP2_CAUSE_MULTIPLE_ACCESSES_TO_A_PDN_CONNECTION_NOT_ALLOWED;
+-            }
+-        }
+     }
+ 
+     /* Serving Network */
+-- 
+2.34.1
+

@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eureka bot <engg.eurekawireless@gmail.com>
+Date: Sun, 26 Jan 2026 14:30:00 +0900
+Subject: [PATCH] Fix MME crash when source eNB S1 context removed during
+ handover
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+MME crashed with assertion failure during S1/X2 handover:
+
+  01/26 08:23:59.580: [mme] FATAL: mme_s11_handle_create_indirect_data_forwarding_tunnel_response:
+  Assertion `source_ue' failed. (../src/mme/mme-s11-handler.c:1906)
+
+## Root Cause
+
+Race condition between GTP-C and S1AP processing:
+1. MME sends Create Indirect Data Forwarding Tunnel Request to SGW
+2. Source eNB sends UE CONTEXT RELEASE or HO CANCEL (S1 context removed)
+3. SGW responds with Create Indirect Data Forwarding Tunnel Response
+4. MME tries to find source_ue → NULL → CRASH
+
+## Fix
+
+Replace ogs_assert(source_ue) with graceful error handling:
+- Log error with IMSI for debugging
+- Call mme_ue_clear_indirect_tunnel() to cleanup indirect tunnel state
+- Return gracefully instead of crashing
+
+This matches the existing error handling pattern in the same file
+(lines 1826-1830, 1844-1848, 1858-1862).
+
+🤖 Generated with [Claude Code](https://claude.ai/code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/mme/mme-s11-handler.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/mme/mme-s11-handler.c b/src/mme/mme-s11-handler.c
+index cb1cf7d62..93f567070 100644
+--- a/src/mme/mme-s11-handler.c
++++ b/src/mme/mme-s11-handler.c
+@@ -1903,7 +1903,12 @@ void mme_s11_handle_create_indirect_data_forwarding_tunnel_response(
+     }
+
+     source_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
+-    ogs_assert(source_ue);
++    if (!source_ue) {
++        ogs_error("[%s] Source ENB-S1 context has already been removed",
++                mme_ue->imsi_bcd);
++        mme_ue_clear_indirect_tunnel(mme_ue);
++        return;
++    }
+
+     r = s1ap_send_handover_command(source_ue);
+     ogs_expect(r == OGS_OK);
+--
+2.34.1

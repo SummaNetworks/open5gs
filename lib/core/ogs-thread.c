@@ -108,7 +108,8 @@ ogs_thread_t *ogs_thread_create(void (*func)(void *), void *data)
 
 void ogs_thread_destroy(ogs_thread_t *thread)
 {
-    const ogs_time_t deadline = ogs_get_monotonic_time() + 5 * 1000 * 1000;
+    const ogs_time_t thread_term_timeout = 10 * 1000 * 1000; /* 10 seconds */
+    const ogs_time_t deadline = ogs_get_monotonic_time() + thread_term_timeout;
     ogs_assert(thread);
 
     ogs_debug("[%p] thread running(%d)", thread, thread->running);
@@ -126,7 +127,7 @@ void ogs_thread_destroy(ogs_thread_t *thread)
     ogs_debug("[%p] thread destroy", thread);
     ogs_thread_mutex_lock(&thread->mutex);
     if (thread->running) {
-        ogs_fatal("thread still running after 3 seconds");
+        ogs_fatal("thread still running after %ld seconds", thread_term_timeout/1000/1000);
         ogs_assert_if_reached();
     }
     ogs_thread_mutex_unlock(&thread->mutex);

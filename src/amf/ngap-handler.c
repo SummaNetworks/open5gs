@@ -38,16 +38,14 @@ static bool maximum_number_of_gnbs_is_reached(void)
 
 static bool gnb_plmn_id_is_foreign(amf_gnb_t *gnb)
 {
-    int i, j, k;
-    for (i = 0; i < amf_self()->num_of_plmn_support; i++) {
-        for (j = 0; j < gnb->num_of_supported_ta_list; j++) {
-            for (k = 0; k < gnb->supported_ta_list[j].num_of_bplmn_list; k++) {
-                if (memcmp(&amf_self()->plmn_support[i].plmn_id,
-                           &gnb->supported_ta_list[j].bplmn_list[k].plmn_id,
-                           OGS_PLMN_ID_LEN) == 0){
-                    return false;
-                }
-            }
+    int i, j;
+
+    for (i = 0; i < gnb->num_of_supported_ta_list; i++) {
+        for (j = 0; j < gnb->supported_ta_list[i].num_of_bplmn_list; j++) {
+            if (memcmp(&gnb->plmn_id,
+                        &gnb->supported_ta_list[i].bplmn_list[j].plmn_id,
+                        OGS_PLMN_ID_LEN) == 0)
+                return false;
         }
     }
 
@@ -1122,9 +1120,9 @@ void ngap_handle_initial_context_setup_response(
 
                 break;
             default:
-                ogs_fatal("Unknown GSM Message Type[%d]",
+                ogs_warn("Unknown GSM Message Type[%d], ignoring",
                         sess->gsm_message.type);
-                ogs_assert_if_reached();
+                break;
             }
         }
     } else if (PAGING_ONGOING(amf_ue) == true) {

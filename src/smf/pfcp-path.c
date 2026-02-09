@@ -101,11 +101,7 @@ static void pfcp_recv_cb(short when, ogs_socket_t fd, void *data)
     ogs_pkbuf_t *pkbuf = NULL;
     ogs_sockaddr_t from;
     ogs_pfcp_node_t *node = NULL;
-    ogs_pfcp_message_t *message = NULL;
     ogs_pfcp_header_t *h = NULL;
-
-    ogs_pfcp_status_e pfcp_status;;
-    ogs_pfcp_node_id_t node_id;
 
     ogs_assert(fd != INVALID_SOCKET);
 
@@ -146,105 +142,28 @@ static void pfcp_recv_cb(short when, ogs_socket_t fd, void *data)
     e = smf_event_new(SMF_EVT_N4_MESSAGE);
     ogs_assert(e);
 
-    /*
-     * Issue #1911
-     *
-     * Because ogs_pfcp_message_t is over 80kb in size,
-     * it can cause stack overflow.
-     * To avoid this, the pfcp_message structure uses heap memory.
-     */
-    if ((message = ogs_pfcp_parse_msg(pkbuf)) == NULL) {
-        ogs_error("ogs_pfcp_parse_msg() failed");
-        ogs_pkbuf_free(pkbuf);
-        ogs_event_free(e);
-        return;
-    }
-
-    pfcp_status = ogs_pfcp_extract_node_id(message, &node_id);
-    switch (pfcp_status) {
-    case OGS_PFCP_STATUS_SUCCESS:
-    case OGS_PFCP_STATUS_NODE_ID_NONE:
-    case OGS_PFCP_STATUS_NODE_ID_OPTIONAL_ABSENT:
-        ogs_debug("ogs_pfcp_extract_node_id() "
-                "type [%d] pfcp_status [%d] node_id [%s] from %s",
-                message->h.type, pfcp_status,
-                pfcp_status == OGS_PFCP_STATUS_SUCCESS ?
-                    ogs_pfcp_node_id_to_string_static(&node_id) :
-                    "NULL",
-                ogs_sockaddr_to_string_static(&from));
-        break;
-
-    case OGS_PFCP_ERROR_SEMANTIC_INCORRECT_MESSAGE:
-    case OGS_PFCP_ERROR_NODE_ID_NOT_PRESENT:
-    case OGS_PFCP_ERROR_NODE_ID_NOT_FOUND:
-    case OGS_PFCP_ERROR_UNKNOWN_MESSAGE:
-        ogs_error("ogs_pfcp_extract_node_id() failed "
-                "type [%d] pfcp_status [%d] from %s",
-                message->h.type, pfcp_status,
-                ogs_sockaddr_to_string_static(&from));
-        goto cleanup;
-
-    default:
-        ogs_error("Unexpected pfcp_status "
-                "type [%d] pfcp_status [%d] from %s",
-                message->h.type, pfcp_status,
-                ogs_sockaddr_to_string_static(&from));
-        goto cleanup;
-    }
-
-    node = ogs_pfcp_node_find(&ogs_pfcp_self()->pfcp_peer_list,
-            pfcp_status == OGS_PFCP_STATUS_SUCCESS ? &node_id : NULL, &from);
+    node = ogs_pfcp_node_find(&ogs_pfcp_self()->pfcp_peer_list, &from);
     if (!node) {
-        if (message->h.type == OGS_PFCP_ASSOCIATION_SETUP_REQUEST_TYPE ||
-            message->h.type == OGS_PFCP_ASSOCIATION_SETUP_RESPONSE_TYPE) {
-            ogs_assert(pfcp_status == OGS_PFCP_STATUS_SUCCESS);
-            node = ogs_pfcp_node_add(&ogs_pfcp_self()->pfcp_peer_list,
-                    &node_id, &from);
-            if (!node) {
-                ogs_error("No memory: ogs_pfcp_node_add() failed");
-                goto cleanup;
-            }
-            ogs_debug("Added PFCP-Node: addr_list %s",
-                    ogs_sockaddr_to_string_static(node->addr_list));
-
-            pfcp_node_fsm_init(node, false);
-
-        } else {
-            ogs_error("Cannot find PFCP-Node: type [%d] node_id %s from %s",
-                    message->h.type,
-                    pfcp_status == OGS_PFCP_STATUS_SUCCESS ?
-                        ogs_pfcp_node_id_to_string_static(&node_id) :
-                        "NULL",
-                    ogs_sockaddr_to_string_static(&from));
-            goto cleanup;
+        node = ogs_pfcp_node_add(&ogs_pfcp_self()->pfcp_peer_list, &from);
+        if (!node) {
+            ogs_error("No memory: ogs_pfcp_node_add() failed");
+            ogs_pkbuf_free(e->pkbuf);
+            ogs_event_free(e);
+            return;
         }
-    } else {
-        ogs_debug("Found PFCP-Node: addr_list %s",
-                ogs_sockaddr_to_string_static(node->addr_list));
-        ogs_expect(OGS_OK == ogs_pfcp_node_merge(
-                    node,
-                    pfcp_status == OGS_PFCP_STATUS_SUCCESS ?  &node_id : NULL,
-                    &from));
-        ogs_debug("Merged PFCP-Node: addr_list %s",
-                ogs_sockaddr_to_string_static(node->addr_list));
-    }
 
+        node->sock = data;
+        pfcp_node_fsm_init(node, false);
+    }
     e->pfcp_node = node;
     e->pkbuf = pkbuf;
-    e->pfcp_message = message;
 
     rv = ogs_queue_push(ogs_app()->queue, e);
     if (rv != OGS_OK) {
         ogs_error("ogs_queue_push() failed:%d", (int)rv);
-        goto cleanup;
+        ogs_pkbuf_free(e->pkbuf);
+        ogs_event_free(e);
     }
-
-    return;
-
-cleanup:
-    ogs_pkbuf_free(pkbuf);
-    ogs_pfcp_message_free(message);
-    ogs_event_free(e);
 }
 
 int smf_pfcp_open(void)
@@ -374,8 +293,8 @@ static void sess_5gc_timeout(ogs_pfcp_xact_t *xact, void *data)
                     OGS_SBI_HTTP_STATUS_GATEWAY_TIMEOUT, NULL, strerror,
                     NULL, NULL));
         } else {
-            ogs_fatal("Unknown trigger [%d]", trigger);
-            ogs_assert_if_reached();
+            ogs_warn("Unknown trigger [%d], ignoring", trigger);
+            return;
         }
 
         ogs_free(strerror);
@@ -818,6 +737,38 @@ int smf_epc_pfcp_send_all_pdr_modification_request(
     return rv;
 }
 
+/* Check if the UE has an active S2b interface during bearer modification */
+static smf_sess_t *smf_find_s2b_session_for_ue(smf_sess_t *current_sess) 
+{
+    smf_ue_t *smf_ue = NULL;
+    smf_sess_t *sess = NULL;
+
+    ogs_assert(current_sess);
+    smf_ue = smf_ue_find_by_id(current_sess->smf_ue_id);
+    ogs_assert(smf_ue);
+
+    /* Find session with WLAN RAT type and same IP address */
+    ogs_list_for_each(&smf_ue->sess_list, sess) {
+        if (sess == current_sess) {
+            continue;
+        }
+
+        /* We're looking for a WLAN session */
+        if (sess->gtp_rat_type != OGS_GTP2_RAT_TYPE_WLAN) {
+            continue;
+        }
+
+        /* Check if IP addresses match */
+        if (memcmp(&sess->session.ue_ip, &current_sess->session.ue_ip,
+                sizeof(sess->session.ue_ip)) == 0) {
+            ogs_debug("    Found S2b session with same IP address during bearer modification");
+            return sess;
+        }
+    }
+
+    return NULL;
+}
+
 int smf_epc_pfcp_send_one_bearer_modification_request(
         smf_bearer_t *bearer, ogs_pool_id_t gtp_xact_id,
         uint64_t flags, uint8_t gtp_pti, uint8_t gtp_cause)
@@ -825,10 +776,27 @@ int smf_epc_pfcp_send_one_bearer_modification_request(
     int rv;
     ogs_pfcp_xact_t *xact = NULL;
     smf_sess_t *sess = NULL;
+    smf_sess_t *s2b_sess = NULL;
 
     ogs_assert(bearer);
     sess = smf_sess_find_by_id(bearer->sess_id);
     ogs_assert(sess);
+
+    /* During bearer removal (MODIFY_REMOVE), check if this is a VoLTE to VoWiFi
+     * handover case where we need to ensure packets continue flowing via S2b */
+    if ((flags & OGS_PFCP_MODIFY_REMOVE) && 
+        (sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_EUTRAN)) {
+        
+        s2b_sess = smf_find_s2b_session_for_ue(sess);
+        if (s2b_sess) {
+            ogs_debug("    VoLTE to VoWiFi handover detected during bearer modification");
+            ogs_debug("    Ensuring packet forwarding via S2b interface");
+            
+            /* For VoLTE to VoWiFi handover, we want to keep the forwarding rule
+             * active through the S2b interface, so only remove the S5/S8 path */
+            flags |= OGS_PFCP_MODIFY_HANDOVER;
+        }
+    }
 
     xact = ogs_pfcp_xact_local_create(
             sess->pfcp_node, bearer_epc_timeout,
@@ -937,22 +905,18 @@ int smf_epc_pfcp_send_deactivation(smf_sess_t *sess, uint8_t gtp_cause)
         wlan_sess = smf_sess_find_by_apn(
                 smf_ue, sess->session.name, OGS_GTP2_RAT_TYPE_WLAN);
         if (!wlan_sess) {
-            ogs_error("smf_sess_find_by_apn() failed");
-            return OGS_ERROR;
-        }
-        if (ogs_list_first(&wlan_sess->bearer_list) == NULL) {
-            ogs_error("No Bearer List in WLAN Session");
-            return OGS_ERROR;
+            ogs_warn("WLAN session not found during 3GPP handover");
+            return OGS_OK; /* Session might already be cleaned up */
         }
 
-        /* Deactivate WLAN Session */
+        /* Deactivate WLAN Session - Even if no bearers, we should clean up */
         rv = smf_epc_pfcp_send_all_pdr_modification_request(
                 wlan_sess, OGS_INVALID_POOL_ID, NULL,
                 OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE,
                 OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
                 OGS_GTP2_CAUSE_ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP);
         if (rv != OGS_OK) {
-            ogs_error("smf_epc_pfcp_send_all_pdr_modification_requestO() "
+            ogs_error("smf_epc_pfcp_send_all_pdr_modification_request() "
                     "failed");
             return OGS_ERROR;
         }
@@ -962,23 +926,21 @@ int smf_epc_pfcp_send_deactivation(smf_sess_t *sess, uint8_t gtp_cause)
         /* Handover from 3GPP to Non-3GPP */
         eutran_sess = smf_sess_find_by_apn(
                 smf_ue, sess->session.name, OGS_GTP2_RAT_TYPE_EUTRAN);
-        if (eutran_sess) {
-            if (ogs_list_first(&eutran_sess->bearer_list) == NULL) {
-                ogs_error("No Bearer List in E-URAN Session");
-                return OGS_ERROR;
-            }
+        if (!eutran_sess) {
+            ogs_warn("E-UTRAN session not found during non-3GPP handover");
+            return OGS_OK; /* Session might already be cleaned up */
+        }
 
-            /* Deactivate EUTRAN Session */
-            rv = smf_epc_pfcp_send_all_pdr_modification_request(
-                    eutran_sess, OGS_INVALID_POOL_ID, NULL,
-                    OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE,
-                    OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
-                    OGS_GTP2_CAUSE_RAT_CHANGED_FROM_3GPP_TO_NON_3GPP);
-            if (rv != OGS_OK) {
-                ogs_error("smf_epc_pfcp_send_all_pdr_modification_request() "
-                        "failed");
-                return OGS_ERROR;
-            }
+        /* Deactivate EUTRAN Session - Even if no bearers, we should clean up */
+        rv = smf_epc_pfcp_send_all_pdr_modification_request(
+                eutran_sess, OGS_INVALID_POOL_ID, NULL,
+                OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE,
+                OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
+                OGS_GTP2_CAUSE_RAT_CHANGED_FROM_3GPP_TO_NON_3GPP);
+        if (rv != OGS_OK) {
+            ogs_error("smf_epc_pfcp_send_all_pdr_modification_request() "
+                    "failed");
+            return OGS_ERROR;
         }
         break;
 

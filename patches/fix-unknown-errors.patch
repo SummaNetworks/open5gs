@@ -1,0 +1,89 @@
+--- src/smf/n4-handler.c.orig
++++ src/smf/n4-handler.c
+@@ -540,8 +540,7 @@
+ 
+         } else {
+-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown flags [0x%llx], continuing with default behavior", (long long)flags);
+         }
+     } else if (flags & OGS_PFCP_MODIFY_CREATE) {
+ 
+@@ -585,8 +584,7 @@
+             ogs_assert(OGS_OK == ngap_send_to_ran_ue(amf_ue, n2smbuf));
+             OGS_FSM_TRAN(&sess->sm, &smf_gsm_state_wait_5gc_n2_pdu_session_resource_setup_complete);
+         } else {
+-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown flags [0x%llx], continuing with default behavior", (long long)flags);
+         }
+     } else if (flags & OGS_PFCP_MODIFY_REMOVE) {
+ 
+@@ -662,8 +660,7 @@
+                 ogs_pkbuf_free(n2smbuf);
+             }
+         } else {
+-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown flags [0x%llx], continuing with default behavior", (long long)flags);
+         }
+     } else {
+         ogs_error("Unknown flags [0x%x]", flags);
+@@ -714,8 +711,7 @@
+             ogs_assert(smf_sess->pfcp_node);
+             ogs_pfcp_up_send_session_modification_request(smf_sess, NULL, ue_ip_addr);
+         } else {
+-            ogs_fatal("Unknown trigger [%d]", trigger);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown trigger [%d], ignoring request", trigger);
+         }
+     }
+ 
+--- src/smf/pfcp-path.c.orig
++++ src/smf/pfcp-path.c
+@@ -293,8 +293,7 @@
+             ogs_error("No PDR or FAR Context");
+             xact->epc = true; /* EPC Transaction */
+         } else {
+-            ogs_fatal("Unknown trigger [%d]", trigger);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown trigger [%d], ignoring request", trigger);
+         }
+     } else if (sess->sgw_s5c_teid) {
+ 
+--- src/smf/gsm-handler.c.orig
++++ src/smf/gsm-handler.c
+@@ -473,8 +472,7 @@
+                     ie = (void *)param_obj;
+                     ogs_error("Not supported QoS parameter[%d]", ie->id);
+                 } else {
+-                    ogs_fatal("Unknown qos_flow parameter identifier [%d]",
+-                            param_obj->id);
++                    ogs_warn("Unknown qos_flow parameter identifier [%d], skipping", param_obj->id);
+                 }
+             }
+         }
+@@ -511,8 +509,7 @@
+     } else if (pfcp_flags &
+             (OGS_PFCP_MODIFY_ACTIVATE|OGS_PFCP_MODIFY_DEACTIVATE|
+             OGS_PFCP_MODIFY_UL_ONLY|OGS_PFCP_MODIFY_DL_ONLY)) {
+-        ogs_fatal("Unknown PFCP-Flags : [0x%llx]", (long long)pfcp_flags);
+-        ogs_assert_if_reached();
++        ogs_warn("Unknown PFCP-Flags : [0x%llx], ignoring", (long long)pfcp_flags);
+     }
+ 
+     return OGS_OK;
+ 
+--- src/amf/ngap-handler.c.orig
++++ src/amf/ngap-handler.c
+@@ -1121,9 +1120,8 @@
+                 }
+ 
+             } else {
+-                ogs_fatal("Unknown GSM Message Type[%d]",
++                ogs_warn("Unknown GSM Message Type[%d], ignoring message",
+                     OGS_NAS_5GS_PDU_SESSION_MANAGEMENT_MESSAGES_TYPE(nasbuf->data));
+-                ogs_assert_if_reached();
+             }
+         }
+     } else if (pdu_session_establishment_accept) {

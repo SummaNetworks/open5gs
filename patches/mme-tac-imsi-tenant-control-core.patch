@@ -1,0 +1,745 @@
+index de8e8be5c..e0aefbd60 100644
+--- a/src/mme/emm-handler.c
++++ b/src/mme/emm-handler.c
+@@ -220,6 +220,18 @@ int emm_handle_attach_request(enb_ue_t *enb_ue, mme_ue_t *mme_ue,
+ 
+         ogs_info("    IMSI[%s]", imsi_bcd);
+ 
++        /* Check Tenant Control after IMSI is set */
++        if (!mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
++            ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation", 
++                     mme_ue->imsi_bcd, mme_ue->tai.tac);
++            r = nas_eps_send_attach_reject(enb_ue, mme_ue,
++                    OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA,
++                    OGS_NAS_ESM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED);
++            ogs_expect(r == OGS_OK);
++            ogs_assert(r != OGS_ERROR);
++            return OGS_ERROR;
++        }
++
+         break;
+     case OGS_NAS_EPS_MOBILE_IDENTITY_GUTI:
+         eps_mobile_identity_guti = &eps_mobile_identity->guti;
+@@ -244,6 +256,21 @@ int emm_handle_attach_request(enb_ue_t *enb_ue, mme_ue_t *mme_ue,
+     OGS_NAS_STORE_DATA(
+             &mme_ue->pdn_connectivity_request, esm_message_container);
+ 
++    /* Check Tenant Control for both IMSI and GUTI attach */
++    if (MME_UE_HAVE_IMSI(mme_ue)) {
++        if (!mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
++            ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation", 
++                     mme_ue->imsi_bcd, mme_ue->tai.tac);
++            r = nas_eps_send_attach_reject(enb_ue, mme_ue,
++                    OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA,
++                    OGS_NAS_ESM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED);
++            ogs_expect(r == OGS_OK);
++            ogs_assert(r != OGS_ERROR);
++            return OGS_ERROR;
++        }
++    }
++    /* Note: If GUTI attach without IMSI, tenant check will be done after Identity Response */
++
+     return OGS_OK;
+ }
+ 
+@@ -422,6 +449,20 @@ int emm_handle_identity_response(
+         }
+ 
+         ogs_info("    IMSI[%s]", mme_ue->imsi_bcd);
++        
++        /* Check Tenant Control after IMSI is obtained from Identity Response */
++        if (mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST) {
++            if (!mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
++                ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation", 
++                         mme_ue->imsi_bcd, mme_ue->tai.tac);
++                r = nas_eps_send_attach_reject(enb_ue, mme_ue,
++                        OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA,
++                        OGS_NAS_ESM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED);
++                ogs_expect(r == OGS_OK);
++                ogs_assert(r != OGS_ERROR);
++                return OGS_ERROR;
++            }
++        }
+     } else {
+         ogs_warn("Not supported Identity type[%d]", mobile_identity->imsi.type);
+     }
+@@ -664,6 +705,18 @@ int emm_handle_tau_request(
+     }
+     ogs_debug("    SERVED_TAI_INDEX[%d]", served_tai_index);
+ 
++    /* Check Tenant Control */
++    if (!mme_check_tenant_access(mme_ue, mme_ue->tai.tac)) {
++        ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant separation violation", 
++                 MME_UE_HAVE_IMSI(mme_ue) ? mme_ue->imsi_bcd : "Unknown", 
++                 mme_ue->tai.tac);
++        r = nas_eps_send_tau_reject(enb_ue, mme_ue,
++                OGS_NAS_EMM_CAUSE_ROAMING_NOT_ALLOWED_IN_THIS_TRACKING_AREA);
++        ogs_expect(r == OGS_OK);
++        ogs_assert(r != OGS_ERROR);
++        return OGS_ERROR;
++    }
++
+     /* Store UE specific information */
+     if (tau_request->presencemask &
+         OGS_NAS_EPS_TRACKING_AREA_UPDATE_REQUEST_LAST_VISITED_REGISTERED_TAI_PRESENT) {
+diff --git a/src/mme/mme-context.c b/src/mme/mme-context.c
+index 24acfc627..6f4119c5c 100644
+--- a/src/mme/mme-context.c
++++ b/src/mme/mme-context.c
+@@ -28,6 +28,8 @@
+ #include "mme-sm.h"
+ #include "mme-gtp-path.h"
+ 
++#include <jansson.h>
++
+ #define MAX_CELL_PER_ENB            8
+ 
+ static mme_context_t self;
+@@ -125,6 +127,9 @@ void mme_context_init(void)
+     ogs_pool_assert_if_has_duplicate(&m_tmsi_pool);
+ #endif
+ 
++    /* Initialize tenant control mutex */
++    ogs_thread_mutex_init(&self.tenant_control_mutex);
++
+     self.enb_addr_hash = ogs_hash_make();
+     ogs_assert(self.enb_addr_hash);
+     self.enb_id_hash = ogs_hash_make();
+@@ -188,6 +193,9 @@ void mme_context_final(void)
+     ogs_pool_final(&mme_csmap_pool);
+     ogs_pool_final(&mme_vlr_pool);
+ 
++    /* Destroy tenant control mutex */
++    ogs_thread_mutex_destroy(&self.tenant_control_mutex);
++
+     context_initialized = 0;
+ }
+ 
+@@ -1832,6 +1840,75 @@ int mme_context_parse_config(void)
+ 
+                     } while (ogs_yaml_iter_type(&access_control_array) ==
+                             YAML_SEQUENCE_NODE);
++                } else if (!strcmp(mme_key, "tenant_control")) {
++                    ogs_yaml_iter_t tenant_control_array, tenant_control_iter;
++                    ogs_yaml_iter_recurse(&mme_iter, &tenant_control_array);
++                    do {
++                        if (!ogs_yaml_iter_next(&tenant_control_array))
++                            break;
++                        ogs_yaml_iter_recurse(&tenant_control_array,
++                                &tenant_control_iter);
++
++                        ogs_assert(self.num_of_tenant_control < 16);
++
++                        while (ogs_yaml_iter_next(&tenant_control_iter)) {
++                            const char *tenant_key =
++                                ogs_yaml_iter_key(&tenant_control_iter);
++                            ogs_assert(tenant_key);
++                            
++                            if (!strcmp(tenant_key, "tenant_id")) {
++                                const char *v = ogs_yaml_iter_value(&tenant_control_iter);
++                                if (v) {
++                                    ogs_cpystrn(
++                                        self.tenant_control[self.num_of_tenant_control].tenant_id,
++                                        v, sizeof(self.tenant_control[self.num_of_tenant_control].tenant_id));
++                                }
++                            } else if (!strcmp(tenant_key, "tac")) {
++                                const char *v = ogs_yaml_iter_value(&tenant_control_iter);
++                                if (v) {
++                                    self.tenant_control[self.num_of_tenant_control].tac = atoi(v);
++                                }
++                            } else if (!strcmp(tenant_key, "allowed_imsi")) {
++                                ogs_yaml_iter_t imsi_array;
++                                ogs_yaml_iter_recurse(&tenant_control_iter, &imsi_array);
++                                
++                                self.tenant_control[self.num_of_tenant_control].num_of_imsi_range = 0;
++                                
++                                do {
++                                    if (!ogs_yaml_iter_next(&imsi_array))
++                                        break;
++                                        
++                                    const char *imsi_range = ogs_yaml_iter_value(&imsi_array);
++                                    if (imsi_range) {
++                                        int range_idx = self.tenant_control[self.num_of_tenant_control].num_of_imsi_range;
++                                        if (range_idx < 32) {
++                                            char *dash = strchr(imsi_range, '-');
++                                            if (dash) {
++                                                /* Range format: start-end */
++                                                size_t start_len = dash - imsi_range;
++                                                ogs_cpystrn(self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].start_imsi,
++                                                           imsi_range, start_len + 1);
++                                                ogs_cpystrn(self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].end_imsi,
++                                                           dash + 1, OGS_MAX_IMSI_BCD_LEN + 1);
++                                                self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].is_single = false;
++                                            } else {
++                                                /* Single IMSI */
++                                                ogs_cpystrn(self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].start_imsi,
++                                                           imsi_range, OGS_MAX_IMSI_BCD_LEN + 1);
++                                                self.tenant_control[self.num_of_tenant_control].imsi_range[range_idx].is_single = true;
++                                            }
++                                            self.tenant_control[self.num_of_tenant_control].num_of_imsi_range++;
++                                        }
++                                    }
++                                } while (ogs_yaml_iter_type(&imsi_array) == YAML_SEQUENCE_NODE);
++                            } else {
++                                ogs_warn("unknown key `%s` in tenant_control", tenant_key);
++                            }
++                        }
++                        
++                        self.num_of_tenant_control++;
++                        
++                    } while (ogs_yaml_iter_type(&tenant_control_array) == YAML_SEQUENCE_NODE);
+                 } else if (!strcmp(mme_key, "security")) {
+                     ogs_yaml_iter_t security_iter;
+                     ogs_yaml_iter_recurse(&mme_iter, &security_iter);
+@@ -4827,3 +4904,463 @@ static void stats_remove_mme_session(void)
+     num_of_mme_sess = num_of_mme_sess - 1;
+     ogs_info("[Removed] Number of MME-Sessions is now %d", num_of_mme_sess);
+ }
++
++static bool mme_imsi_in_range(const char *imsi, 
++                              const char *start_imsi, 
++                              const char *end_imsi, 
++                              bool is_single)
++{
++    if (is_single) {
++        return strcmp(imsi, start_imsi) == 0;
++    } else {
++        return (strcmp(imsi, start_imsi) >= 0 && 
++                strcmp(imsi, end_imsi) <= 0);
++    }
++}
++
++bool mme_check_tenant_access(mme_ue_t *mme_ue, uint16_t tac)
++{
++    mme_context_t *self = mme_self();
++    int i, j;
++    bool result = false;
++    
++    /* Lock mutex for thread-safe access */
++    ogs_thread_mutex_lock(&self->tenant_control_mutex);
++    
++    /* No tenant control configured - allow all */
++    if (self->num_of_tenant_control == 0) {
++        ogs_thread_mutex_unlock(&self->tenant_control_mutex);
++        return true;
++    }
++    
++    /* No IMSI available - reject */
++    if (!MME_UE_HAVE_IMSI(mme_ue)) {
++        ogs_warn("No IMSI available for tenant access check");
++        ogs_thread_mutex_unlock(&self->tenant_control_mutex);
++        return false;
++    }
++    
++    /* Check each tenant configuration */
++    for (i = 0; i < self->num_of_tenant_control; i++) {
++        if (self->tenant_control[i].tac == tac) {
++            /* Found matching TAC - check IMSI ranges */
++            for (j = 0; j < self->tenant_control[i].num_of_imsi_range; j++) {
++                if (mme_imsi_in_range(mme_ue->imsi_bcd,
++                        self->tenant_control[i].imsi_range[j].start_imsi,
++                        self->tenant_control[i].imsi_range[j].end_imsi,
++                        self->tenant_control[i].imsi_range[j].is_single)) {
++                    ogs_debug("IMSI[%s] allowed on TAC[%d] - Tenant[%s]",
++                              mme_ue->imsi_bcd, tac, 
++                              self->tenant_control[i].tenant_id);
++                    result = true;
++                    goto unlock_and_return;
++                }
++            }
++            /* TAC matched but IMSI not in allowed ranges */
++            ogs_warn("IMSI[%s] not allowed on TAC[%d] - Tenant[%s]",
++                     mme_ue->imsi_bcd, tac, 
++                     self->tenant_control[i].tenant_id);
++            result = false;
++            goto unlock_and_return;
++        }
++    }
++    
++    /* TAC not found in tenant control - reject by default */
++    ogs_warn("TAC[%d] not found in tenant control configuration", tac);
++    result = false;
++    
++unlock_and_return:
++    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
++    return result;
++}
++
++json_t *mme_tenant_control_to_json(void)
++{
++    mme_context_t *self = mme_self();
++    json_t *root, *tenants, *tenant, *imsi_array, *imsi_item;
++    int i, j;
++    
++    root = json_object();
++    tenants = json_array();
++    
++    /* Lock mutex for thread-safe access */
++    ogs_thread_mutex_lock(&self->tenant_control_mutex);
++    
++    for (i = 0; i < self->num_of_tenant_control; i++) {
++        tenant = json_object();
++        json_object_set_new(tenant, "tenant_id", 
++                           json_string(self->tenant_control[i].tenant_id));
++        json_object_set_new(tenant, "tac", 
++                           json_integer(self->tenant_control[i].tac));
++        
++        imsi_array = json_array();
++        for (j = 0; j < self->tenant_control[i].num_of_imsi_range; j++) {
++            if (self->tenant_control[i].imsi_range[j].is_single) {
++                imsi_item = json_string(self->tenant_control[i].imsi_range[j].start_imsi);
++            } else {
++                char range_str[OGS_MAX_IMSI_BCD_LEN*2 + 2];
++                snprintf(range_str, sizeof(range_str), "%s-%s",
++                        self->tenant_control[i].imsi_range[j].start_imsi,
++                        self->tenant_control[i].imsi_range[j].end_imsi);
++                imsi_item = json_string(range_str);
++            }
++            json_array_append_new(imsi_array, imsi_item);
++        }
++        json_object_set_new(tenant, "allowed_imsi", imsi_array);
++        json_array_append_new(tenants, tenant);
++    }
++    
++    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
++    
++    json_object_set_new(root, "tenant_control", tenants);
++    return root;
++}
++
++typedef struct {
++    char tenant_id[64];
++    uint16_t tac;
++    int num_of_imsi_range;
++    struct {
++        char start_imsi[OGS_MAX_IMSI_BCD_LEN+1];
++        char end_imsi[OGS_MAX_IMSI_BCD_LEN+1];
++        bool is_single;
++    } imsi_range[32];
++} tenant_config_backup_t;
++
++static json_t *compare_tenant_configs(mme_context_t *self, 
++                                      tenant_config_backup_t *old_config,
++                                      int old_count)
++{
++    json_t *diff, *added, *removed, *modified;
++    int i, j, k;
++    bool found;
++    
++    diff = json_object();
++    added = json_array();
++    removed = json_array();
++    modified = json_array();
++    
++    /* Find added tenants */
++    for (i = 0; i < self->num_of_tenant_control; i++) {
++        found = false;
++        for (j = 0; j < old_count; j++) {
++            if (strcmp(self->tenant_control[i].tenant_id, old_config[j].tenant_id) == 0) {
++                found = true;
++                break;
++            }
++        }
++        if (!found) {
++            json_t *tenant = json_object();
++            json_object_set_new(tenant, "tenant_id", 
++                               json_string(self->tenant_control[i].tenant_id));
++            json_object_set_new(tenant, "tac", 
++                               json_integer(self->tenant_control[i].tac));
++            json_array_append_new(added, tenant);
++        }
++    }
++    
++    /* Find removed tenants */
++    for (i = 0; i < old_count; i++) {
++        found = false;
++        for (j = 0; j < self->num_of_tenant_control; j++) {
++            if (strcmp(old_config[i].tenant_id, self->tenant_control[j].tenant_id) == 0) {
++                found = true;
++                break;
++            }
++        }
++        if (!found) {
++            json_t *tenant = json_object();
++            json_object_set_new(tenant, "tenant_id", 
++                               json_string(old_config[i].tenant_id));
++            json_object_set_new(tenant, "tac", 
++                               json_integer(old_config[i].tac));
++            json_array_append_new(removed, tenant);
++        }
++    }
++    
++    /* Find modified tenants */
++    for (i = 0; i < self->num_of_tenant_control; i++) {
++        for (j = 0; j < old_count; j++) {
++            if (strcmp(self->tenant_control[i].tenant_id, old_config[j].tenant_id) == 0) {
++                json_t *changes = json_object();
++                bool has_changes = false;
++                
++                /* Check TAC change */
++                if (self->tenant_control[i].tac != old_config[j].tac) {
++                    json_t *tac_change = json_object();
++                    json_object_set_new(tac_change, "old", json_integer(old_config[j].tac));
++                    json_object_set_new(tac_change, "new", json_integer(self->tenant_control[i].tac));
++                    json_object_set_new(changes, "tac", tac_change);
++                    has_changes = true;
++                }
++                
++                /* Check IMSI ranges - find added */
++                json_t *imsi_added = json_array();
++                for (k = 0; k < self->tenant_control[i].num_of_imsi_range; k++) {
++                    bool range_found = false;
++                    for (int l = 0; l < old_config[j].num_of_imsi_range; l++) {
++                        if (self->tenant_control[i].imsi_range[k].is_single == 
++                            old_config[j].imsi_range[l].is_single) {
++                            if (strcmp(self->tenant_control[i].imsi_range[k].start_imsi,
++                                      old_config[j].imsi_range[l].start_imsi) == 0) {
++                                if (self->tenant_control[i].imsi_range[k].is_single) {
++                                    range_found = true;
++                                    break;
++                                } else if (strcmp(self->tenant_control[i].imsi_range[k].end_imsi,
++                                                 old_config[j].imsi_range[l].end_imsi) == 0) {
++                                    range_found = true;
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    if (!range_found) {
++                        char range_str[OGS_MAX_IMSI_BCD_LEN*2 + 2];
++                        if (self->tenant_control[i].imsi_range[k].is_single) {
++                            snprintf(range_str, sizeof(range_str), "%s",
++                                    self->tenant_control[i].imsi_range[k].start_imsi);
++                        } else {
++                            snprintf(range_str, sizeof(range_str), "%s-%s",
++                                    self->tenant_control[i].imsi_range[k].start_imsi,
++                                    self->tenant_control[i].imsi_range[k].end_imsi);
++                        }
++                        json_array_append_new(imsi_added, json_string(range_str));
++                        has_changes = true;
++                    }
++                }
++                if (json_array_size(imsi_added) > 0) {
++                    json_object_set_new(changes, "imsi_added", imsi_added);
++                } else {
++                    json_decref(imsi_added);
++                }
++                
++                /* Check IMSI ranges - find removed */
++                json_t *imsi_removed = json_array();
++                for (k = 0; k < old_config[j].num_of_imsi_range; k++) {
++                    bool range_found = false;
++                    for (int l = 0; l < self->tenant_control[i].num_of_imsi_range; l++) {
++                        if (old_config[j].imsi_range[k].is_single == 
++                            self->tenant_control[i].imsi_range[l].is_single) {
++                            if (strcmp(old_config[j].imsi_range[k].start_imsi,
++                                      self->tenant_control[i].imsi_range[l].start_imsi) == 0) {
++                                if (old_config[j].imsi_range[k].is_single) {
++                                    range_found = true;
++                                    break;
++                                } else if (strcmp(old_config[j].imsi_range[k].end_imsi,
++                                                 self->tenant_control[i].imsi_range[l].end_imsi) == 0) {
++                                    range_found = true;
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    if (!range_found) {
++                        char range_str[OGS_MAX_IMSI_BCD_LEN*2 + 2];
++                        if (old_config[j].imsi_range[k].is_single) {
++                            snprintf(range_str, sizeof(range_str), "%s",
++                                    old_config[j].imsi_range[k].start_imsi);
++                        } else {
++                            snprintf(range_str, sizeof(range_str), "%s-%s",
++                                    old_config[j].imsi_range[k].start_imsi,
++                                    old_config[j].imsi_range[k].end_imsi);
++                        }
++                        json_array_append_new(imsi_removed, json_string(range_str));
++                        has_changes = true;
++                    }
++                }
++                if (json_array_size(imsi_removed) > 0) {
++                    json_object_set_new(changes, "imsi_removed", imsi_removed);
++                } else {
++                    json_decref(imsi_removed);
++                }
++                
++                if (has_changes) {
++                    json_t *mod_tenant = json_object();
++                    json_object_set_new(mod_tenant, "tenant_id", 
++                                       json_string(self->tenant_control[i].tenant_id));
++                    json_object_set_new(mod_tenant, "changes", changes);
++                    json_array_append_new(modified, mod_tenant);
++                } else {
++                    json_decref(changes);
++                }
++                break;
++            }
++        }
++    }
++    
++    json_object_set_new(diff, "added", added);
++    json_object_set_new(diff, "removed", removed);
++    json_object_set_new(diff, "modified", modified);
++    
++    return diff;
++}
++
++json_t *mme_reload_tenant_control_with_diff(void)
++{
++    mme_context_t *self = mme_self();
++    json_t *result = json_object();
++    
++    /* Backup current configuration */
++    tenant_config_backup_t old_config[16];
++    int old_count;
++    
++    /* Lock mutex and backup current configuration */
++    ogs_thread_mutex_lock(&self->tenant_control_mutex);
++    old_count = self->num_of_tenant_control;
++    memcpy(old_config, self->tenant_control, sizeof(self->tenant_control));
++    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
++    
++    /* Parse YAML configuration file */
++    FILE *file;
++    yaml_parser_t parser;
++    yaml_document_t *document = NULL;
++    
++    const char *config_file = ogs_app()->file;
++    if (!config_file) {
++        config_file = "/etc/open5gs/mme.yaml";
++    }
++    
++    file = fopen(config_file, "rb");
++    if (!file) {
++        json_object_set_new(result, "status", json_string("error"));
++        json_object_set_new(result, "message", 
++                           json_string("Cannot open configuration file"));
++        return result;
++    }
++    
++    if (!yaml_parser_initialize(&parser)) {
++        fclose(file);
++        json_object_set_new(result, "status", json_string("error"));
++        json_object_set_new(result, "message", 
++                           json_string("Failed to initialize YAML parser"));
++        return result;
++    }
++    
++    yaml_parser_set_input_file(&parser, file);
++    
++    document = calloc(1, sizeof(yaml_document_t));
++    if (!yaml_parser_load(&parser, document)) {
++        free(document);
++        yaml_parser_delete(&parser);
++        fclose(file);
++        json_object_set_new(result, "status", json_string("error"));
++        json_object_set_new(result, "message", 
++                           json_string("Failed to parse YAML configuration"));
++        return result;
++    }
++    
++    /* Clear current tenant control configuration */
++    ogs_thread_mutex_lock(&self->tenant_control_mutex);
++    self->num_of_tenant_control = 0;
++    
++    /* Parse tenant_control section from YAML */
++    ogs_yaml_iter_t root_iter, mme_iter;
++    ogs_yaml_iter_init(&root_iter, document);
++    
++    while (ogs_yaml_iter_next(&root_iter)) {
++        const char *root_key = ogs_yaml_iter_key(&root_iter);
++        if (!root_key)
++            continue;
++            
++        if (strcmp(root_key, "mme") == 0) {
++            ogs_yaml_iter_recurse(&root_iter, &mme_iter);
++            while (ogs_yaml_iter_next(&mme_iter)) {
++                const char *mme_key = ogs_yaml_iter_key(&mme_iter);
++                if (!mme_key)
++                    continue;
++                    
++                if (strcmp(mme_key, "tenant_control") == 0) {
++                    ogs_yaml_iter_t tenant_control_array, tenant_control_iter;
++                    ogs_yaml_iter_recurse(&mme_iter, &tenant_control_array);
++                    
++                    do {
++                        if (!ogs_yaml_iter_next(&tenant_control_array))
++                            break;
++                        ogs_yaml_iter_recurse(&tenant_control_array, &tenant_control_iter);
++                        
++                        if (self->num_of_tenant_control >= 16)
++                            break;
++                        
++                        while (ogs_yaml_iter_next(&tenant_control_iter)) {
++                            const char *tenant_key = ogs_yaml_iter_key(&tenant_control_iter);
++                            if (!tenant_key)
++                                continue;
++                            
++                            if (strcmp(tenant_key, "tenant_id") == 0) {
++                                const char *v = ogs_yaml_iter_value(&tenant_control_iter);
++                                if (v) {
++                                    ogs_cpystrn(
++                                        self->tenant_control[self->num_of_tenant_control].tenant_id,
++                                        v, sizeof(self->tenant_control[self->num_of_tenant_control].tenant_id));
++                                }
++                            } else if (strcmp(tenant_key, "tac") == 0) {
++                                const char *v = ogs_yaml_iter_value(&tenant_control_iter);
++                                if (v) {
++                                    self->tenant_control[self->num_of_tenant_control].tac = atoi(v);
++                                }
++                            } else if (strcmp(tenant_key, "allowed_imsi") == 0) {
++                                ogs_yaml_iter_t imsi_array;
++                                ogs_yaml_iter_recurse(&tenant_control_iter, &imsi_array);
++                                
++                                self->tenant_control[self->num_of_tenant_control].num_of_imsi_range = 0;
++                                
++                                do {
++                                    if (!ogs_yaml_iter_next(&imsi_array))
++                                        break;
++                                        
++                                    const char *imsi_range = ogs_yaml_iter_value(&imsi_array);
++                                    if (imsi_range) {
++                                        int range_idx = self->tenant_control[self->num_of_tenant_control].num_of_imsi_range;
++                                        if (range_idx < 32) {
++                                            char *dash = strchr(imsi_range, '-');
++                                            if (dash) {
++                                                /* Range format: start-end */
++                                                size_t start_len = dash - imsi_range;
++                                                ogs_cpystrn(self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].start_imsi,
++                                                           imsi_range, start_len + 1);
++                                                ogs_cpystrn(self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].end_imsi,
++                                                           dash + 1, OGS_MAX_IMSI_BCD_LEN + 1);
++                                                self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].is_single = false;
++                                            } else {
++                                                /* Single IMSI */
++                                                ogs_cpystrn(self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].start_imsi,
++                                                           imsi_range, OGS_MAX_IMSI_BCD_LEN + 1);
++                                                self->tenant_control[self->num_of_tenant_control].imsi_range[range_idx].is_single = true;
++                                            }
++                                            self->tenant_control[self->num_of_tenant_control].num_of_imsi_range++;
++                                        }
++                                    }
++                                } while (ogs_yaml_iter_type(&imsi_array) == YAML_SEQUENCE_NODE);
++                            }
++                        }
++                        
++                        /* Increment tenant count if we successfully parsed this tenant */
++                        if (strlen(self->tenant_control[self->num_of_tenant_control].tenant_id) > 0) {
++                            self->num_of_tenant_control++;
++                        }
++                        
++                    } while (ogs_yaml_iter_type(&tenant_control_array) == YAML_SEQUENCE_NODE);
++                }
++            }
++        }
++    }
++    
++    /* Calculate differences */
++    json_t *changes = compare_tenant_configs(self, old_config, old_count);
++    
++    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
++    
++    /* Clean up */
++    yaml_document_delete(document);
++    free(document);
++    yaml_parser_delete(&parser);
++    fclose(file);
++    
++    /* Build result */
++    json_object_set_new(result, "status", json_string("success"));
++    json_object_set_new(result, "changes", changes);
++    
++    ogs_info("Tenant control configuration reloaded from %s", config_file);
++    
++    return result;
++}
+diff --git a/src/mme/mme-context.h b/src/mme/mme-context.h
+index b90941883..db607ecfc 100644
+--- a/src/mme/mme-context.h
++++ b/src/mme/mme-context.h
+@@ -120,6 +120,20 @@ typedef struct mme_context_s {
+         ogs_plmn_id_t plmn_id;
+     } access_control[OGS_MAX_NUM_OF_PLMN_PER_MME];
+ 
++    /* TAC-IMSI Tenant Control */
++    int num_of_tenant_control;
++    struct {
++        char tenant_id[64];
++        uint16_t tac;
++        int num_of_imsi_range;
++        struct {
++            char start_imsi[OGS_MAX_IMSI_BCD_LEN+1];
++            char end_imsi[OGS_MAX_IMSI_BCD_LEN+1];
++            bool is_single;  /* Single IMSI or range */
++        } imsi_range[32];
++    } tenant_control[16];
++    ogs_thread_mutex_t tenant_control_mutex;  /* Mutex for thread-safe tenant control access */
++
+     /* defined in 'nas_ies.h'
+      * #define NAS_SECURITY_ALGORITHMS_EIA0        0
+      * #define NAS_SECURITY_ALGORITHMS_128_EEA1    1
+@@ -1109,6 +1123,13 @@ void mme_ebi_pool_clear(mme_ue_t *mme_ue);
+ uint8_t mme_selected_int_algorithm(mme_ue_t *mme_ue);
+ uint8_t mme_selected_enc_algorithm(mme_ue_t *mme_ue);
+ 
++bool mme_check_tenant_access(mme_ue_t *mme_ue, uint16_t tac);
++
++/* Forward declaration for json_t */
++struct json_t;
++struct json_t *mme_tenant_control_to_json(void);
++struct json_t *mme_reload_tenant_control_with_diff(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/mme/mme-init.c b/src/mme/mme-init.c
+index ce375098b..f1e3cf9a8 100644
+--- a/src/mme/mme-init.c
++++ b/src/mme/mme-init.c
+@@ -231,6 +231,33 @@ int callback_set_log_level_fatal(const struct _u_request *request, struct _u_res
+ 	return U_CALLBACK_CONTINUE;
+ }
+ 
++static int callback_get_tenant_control(const struct _u_request *request,
++                                       struct _u_response *response, 
++                                       void *user_data)
++{
++    json_t *json_response = mme_tenant_control_to_json();
++    
++    ulfius_set_json_body_response(response, 200, json_response);
++    json_decref(json_response);
++    
++    return U_CALLBACK_CONTINUE;
++}
++
++static int callback_reload_tenant_control(const struct _u_request *request,
++                                          struct _u_response *response, 
++                                          void *user_data)
++{
++    json_t *json_response = mme_reload_tenant_control_with_diff();
++    
++    const char *status = json_string_value(json_object_get(json_response, "status"));
++    int http_code = (status && strcmp(status, "success") == 0) ? 200 : 500;
++    
++    ulfius_set_json_body_response(response, http_code, json_response);
++    json_decref(json_response);
++    
++    return U_CALLBACK_CONTINUE;
++}
++
+ static void rest_handler(void *arg)
+ {
+     struct _u_instance instance;
+@@ -247,6 +274,10 @@ static void rest_handler(void *arg)
+     ulfius_add_endpoint_by_val(&instance, "GET", NULL, "/ue/:imsi", 0, &callback_get_ue_by_id, NULL);
+     ulfius_add_endpoint_by_val(&instance, "GET", NULL, "/log_level", 0, &callback_get_log_level, NULL);
+     ulfius_add_endpoint_by_val(&instance, "GET", NULL, "/log_level_fatal", 0, &callback_set_log_level_fatal, NULL);
++    
++    // Tenant Control Endpoints
++    ulfius_add_endpoint_by_val(&instance, "GET", NULL, "/tenant_control", 0, &callback_get_tenant_control, NULL);
++    ulfius_add_endpoint_by_val(&instance, "POST", NULL, "/tenant_control/reload", 0, &callback_reload_tenant_control, NULL);
+ 
+     if (ulfius_start_framework(&instance) == U_OK) {
+         ogs_info("Starting OAM Rest-API server on port %d\n", instance.port);

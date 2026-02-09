@@ -83,6 +83,9 @@ typedef struct smf_context_s {
 
     ogs_list_t      sgw_s5c_list;   /* SGW GTPC Node List */
     ogs_list_t      ip_pool_list;
+    
+    ogs_timer_t     *t_gtp_node_cleanup;
+    bool            gtp_node_cleanup_enabled;  /* Enable/disable GTP node cleanup timer */
 
     ogs_hash_t      *supi_hash;     /* hash table (SUPI) */
     ogs_hash_t      *imsi_hash;     /* hash table (IMSI) */
@@ -215,6 +218,12 @@ typedef struct smf_bearer_s {
 
     uint8_t num_of_pf_to_delete;
     uint8_t pf_to_delete[OGS_MAX_NUM_OF_FLOW_IN_NAS];
+
+    /* Bearer state management for race condition handling */
+    bool create_pending;        /* Create Bearer Request sent, waiting for response */
+    bool delete_pending;        /* Delete requested while create_pending */
+    uint8_t delete_cause_value; /* Cause value for pending delete */
+    uint8_t delete_pti;         /* PTI for pending delete */
 
     ogs_pool_id_t   sess_id;
 } smf_bearer_t;
@@ -379,7 +388,6 @@ typedef struct smf_sess_s {
     /* S_NSSAI */
     ogs_s_nssai_t s_nssai;
     ogs_s_nssai_t mapped_hplmn;
-    bool mapped_hplmn_presence;
 
     /* PDN Configuration */
     ogs_session_t session;
@@ -404,6 +412,7 @@ typedef struct smf_sess_s {
         ogs_tlv_octet_t ue_pco;
         ogs_tlv_octet_t ue_apco;
         ogs_tlv_octet_t ue_epco;
+        bool ue_local_addr_in_tft;  /* MS supports local address in TFT */
         ogs_tlv_octet_t user_location_information;
         ogs_tlv_octet_t ue_timezone;
         ogs_tlv_octet_t charging_characteristics;
@@ -417,6 +426,7 @@ typedef struct smf_sess_s {
             ogs_gtp1_qos_profile_decoded_t qos_pdec;
             bool peer_supports_apn_ambr;
         } v1;  /* GTPv1C specific fields */
+        ogs_gtp_xact_t *stored_xact; /* Stored GTP transaction for delayed responses */
     } gtp; /* Saved from S5-C/Gn */
 
     struct {
@@ -487,12 +497,6 @@ typedef struct smf_sess_s {
         uint32_t id;
     } charging;
 
-    /* AAA Node Identifier */
-    struct {
-        char *name;
-        char *realm;
-    } aaa_server_identifier;
-
     /* Data Forwarding between the CP and UP functions */
     ogs_pfcp_pdr_t  *cp2up_pdr;
     ogs_pfcp_pdr_t  *up2cp_pdr;
@@ -557,6 +561,7 @@ smf_sess_t *smf_sess_find_by_ipv4(uint32_t addr);
 smf_sess_t *smf_sess_find_by_ipv6(uint32_t *addr6);
 smf_sess_t *smf_sess_find_by_paging_n1n2message_location(
         char *n1n2message_location);
+smf_sess_t *smf_sess_find_by_gx_sid(char *gx_sid);
 
 void smf_sess_create_indirect_data_forwarding(smf_sess_t *sess);
 bool smf_sess_have_indirect_data_forwarding(smf_sess_t *sess);

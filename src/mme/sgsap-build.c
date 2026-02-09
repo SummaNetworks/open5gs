@@ -34,8 +34,6 @@ ogs_pkbuf_t *sgsap_build_location_update_request(mme_ue_t *mme_ue)
     served_gummei_t *served_gummei = &mme_self()->served_gummei[0];
     char eps_update_type;
     ogs_nas_lai_t lai;
-    ogs_eps_tai_t tai;
-    ogs_e_cgi_t e_cgi;
 
     ogs_assert(mme_ue);
     csmap = mme_ue->csmap;
@@ -60,20 +58,6 @@ ogs_pkbuf_t *sgsap_build_location_update_request(mme_ue_t *mme_ue)
     lai.lac = htobe16(lai.lac);
     ogs_tlv_add(root, OGS_TLV_MODE_T1_L1, SGSAP_IE_LAI_TYPE,
             SGSAP_IE_LAI_LEN, 0, &lai);
-
-   /*
-    * TS 29.118 5.2.2.2.1
-    * The MME shall add the UE's current TAI and E-CGI
-    * to the SGsAP-LOCATION-UPDATE-REQUEST message.
-    */
-    memcpy(&tai, &mme_ue->tai, sizeof(ogs_eps_tai_t));
-    tai.tac = htobe16(tai.tac);
-    ogs_tlv_add(root, OGS_TLV_MODE_T1_L1, SGSAP_IE_TAI_TYPE,
-            SGSAP_IE_TAI_LEN, 0, &tai);
-    memcpy(&e_cgi, &mme_ue->e_cgi, sizeof(ogs_e_cgi_t));
-    e_cgi.cell_id = htobe32(e_cgi.cell_id);
-    ogs_tlv_add(root, OGS_TLV_MODE_T1_L1, SGSAP_IE_E_CGI_TYPE,
-            SGSAP_IE_E_CGI_LEN, 0, &e_cgi);
 
     pkbuf = ogs_pkbuf_alloc(NULL, OGS_MAX_SDU_LEN);
     if (!pkbuf) {
@@ -220,9 +204,15 @@ ogs_pkbuf_t *sgsap_build_mo_csfb_indication(mme_ue_t *mme_ue)
 
     ogs_assert(mme_ue);
     csmap = mme_ue->csmap;
-    ogs_assert(csmap);
+    if (!csmap) {
+        ogs_error("No CS domain mapping for UE[%s]", mme_ue->imsi_bcd);
+        return NULL;
+    }
     vlr = csmap->vlr;
-    ogs_assert(vlr);
+    if (!vlr) {
+        ogs_error("No VLR associated with CS domain mapping for UE[%s]", mme_ue->imsi_bcd);
+        return NULL;
+    }
 
     root = ogs_tlv_add(NULL, OGS_TLV_MODE_T1_L1, SGSAP_IE_IMSI_TYPE,
             SGSAP_IE_IMSI_LEN, 0, &mme_ue->nas_mobile_identity_imsi);

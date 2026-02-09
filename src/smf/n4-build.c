@@ -217,7 +217,10 @@ ogs_pkbuf_t *smf_n4_build_pdr_to_modify_list(
 
     ogs_list_for_each_entry(&sess->pdr_to_modify_list, pdr, to_modify_node) {
         ogs_pfcp_far_t *far = pdr->far;
-        ogs_assert(far);
+        if (!far) {
+            ogs_error("PDR[%d] has no associated FAR - skipping", pdr->id);
+            continue;
+        }
 
         if (((modify_flags &
               (OGS_PFCP_MODIFY_DL_ONLY|
@@ -489,13 +492,13 @@ ogs_pkbuf_t *smf_n4_build_qos_flow_to_modify_list(
                 if (qos_flow->dl_pdr) {
                     ogs_pfcp_build_update_pdr(
                             &req->update_pdr[num_of_update_pdr],
-                            num_of_update_pdr, qos_flow->dl_pdr, modify_flags);
+                            num_of_update_pdr, qos_flow->dl_pdr);
                     num_of_update_pdr++;
                 }
                 if (qos_flow->ul_pdr) {
                     ogs_pfcp_build_update_pdr(
                             &req->update_pdr[num_of_update_pdr],
-                            num_of_update_pdr, qos_flow->ul_pdr, modify_flags);
+                            num_of_update_pdr, qos_flow->ul_pdr);
                     num_of_update_pdr++;
                 }
                 if (qos_flow->urr) {

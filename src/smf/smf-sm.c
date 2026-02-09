@@ -105,34 +105,57 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
         ogs_assert(smf_gnode);
 
         if (ogs_gtp2_parse_msg(&gtp2_message, recvbuf) != OGS_OK) {
-            ogs_error("ogs_gtp2_parse_msg() failed");
+            ogs_error("ogs_gtp2_parse_msg() failed for message type %d", 
+                     recvbuf->len > 1 ? recvbuf->data[1] : 0);
             smf_metrics_inst_global_inc(SMF_METR_GLOB_CTR_S5C_RX_PARSE_FAILED);
             smf_metrics_inst_gtp_node_inc(smf_gnode->metrics, SMF_METR_GTP_NODE_CTR_S5C_RX_PARSE_FAILED);
             ogs_pkbuf_free(recvbuf);
             break;
         }
+        
+        ogs_info("SMF PARSED GTP message type: %d, TEID: 0x%x", 
+                 gtp2_message.h.type, gtp2_message.h.teid);
         e->gtp2_message = &gtp2_message;
 
         ogs_gtp2_sender_f_teid(&gtp2_sender_f_teid, &gtp2_message);
 
         rv = ogs_gtp_xact_receive(smf_gnode->gnode, &gtp2_message.h, &gtp_xact);
+        if (rv == OGS_RETRY) {
+            /* This is a duplicate message that was already handled */
+            ogs_debug("Duplicate message type %d - already processed", gtp2_message.h.type);
+            ogs_pkbuf_free(recvbuf);
+            break;
+        }
         if (rv != OGS_OK) {
+            ogs_error("ogs_gtp_xact_receive() failed with rv=%d for message type %d", rv, gtp2_message.h.type);
             ogs_pkbuf_free(recvbuf);
             break;
         }
         e->gtp_xact_id = gtp_xact ? gtp_xact->id : OGS_INVALID_POOL_ID;
 
         if (gtp2_message.h.teid_presence && gtp2_message.h.teid != 0) {
+            ogs_debug("Message type %d has TEID: 0x%x, looking up session", 
+                     gtp2_message.h.type, gtp2_message.h.teid);
             sess = smf_sess_find_by_teid(gtp2_message.h.teid);
+            if (!sess) {
+                ogs_debug("No session found for TEID: 0x%x, message type: %d", 
+                         gtp2_message.h.teid, gtp2_message.h.type);
+            }
         } else if (gtp_xact->local_teid) { /* rx no TEID or TEID=0 */
             /* 3GPP TS 29.274 5.5.2: we receive TEID=0 under some
              * conditions, such as cause "Session context not found". In those
              * cases, we still want to identify the local session which
              * originated the message, so try harder by using the TEID we
              * locally stored in xact when sending the original request: */
+            ogs_debug("Message type %d has no TEID, trying local_teid: 0x%x", 
+                     gtp2_message.h.type, gtp_xact->local_teid);
             sess = smf_sess_find_by_teid(gtp_xact->local_teid);
+        } else {
+            ogs_debug("Message type %d has no TEID and no local_teid", gtp2_message.h.type);
         }
 
+        ogs_info("SMF PROCESSING GTP message type: %d", gtp2_message.h.type);
+        
         switch(gtp2_message.h.type) {
         case OGS_GTP2_ECHO_REQUEST_TYPE:
             smf_s5c_handle_echo_request(gtp_xact, &gtp2_message.echo_request);
@@ -205,6 +228,22 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
             break;
         case OGS_GTP2_CREATE_BEARER_RESPONSE_TYPE:
             if (!gtp2_message.h.teid_presence) ogs_error("No TEID");
+            if (!sess) {
+                uint8_t gtp_cause = OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND;
+                ogs_warn("Create Bearer Response for removed session - SGW may have removed the session");
+                /* Get cause from response if available */
+                if (gtp2_message.create_bearer_response.cause.presence && 
+                    gtp2_message.create_bearer_response.cause.len > 0 &&
+                    gtp2_message.create_bearer_response.cause.data) {
+                    gtp_cause = *((uint8_t*)gtp2_message.create_bearer_response.cause.data);
+                }
+                ogs_info("Received cause [%d] from SGW for removed session", gtp_cause);
+                
+                /* Complete the transaction to avoid leaks */
+                rv = ogs_gtp_xact_commit(gtp_xact);
+                ogs_expect(rv == OGS_OK);
+                break;
+            }
             smf_s5c_handle_create_bearer_response(
                 sess, gtp_xact, &gtp2_message.create_bearer_response);
             break;
@@ -235,6 +274,76 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
             smf_s5c_handle_bearer_resource_command(
                 sess, gtp_xact,
                 &gtp2_message.bearer_resource_command, &gtp2_sender_f_teid);
+            break;
+        case OGS_GTP2_DELETE_BEARER_COMMAND_TYPE:
+            if (!gtp2_message.h.teid_presence) ogs_error("No TEID");
+            if (!sess) {
+                ogs_error("No Session for Delete Bearer Command (TEID: 0x%x)",
+                        gtp2_message.h.teid);
+                ogs_gtp2_send_error_message(gtp_xact,
+                        gtp2_sender_f_teid.teid_presence == true ?
+                            gtp2_sender_f_teid.teid : 0,
+                        OGS_GTP2_DELETE_BEARER_FAILURE_INDICATION_TYPE,
+                        OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND);
+                break;
+            }
+            smf_s5c_handle_delete_bearer_command(
+                sess, gtp_xact, &gtp2_message.delete_bearer_command);
+            break;
+        case OGS_GTP2_CHANGE_NOTIFICATION_REQUEST_TYPE:
+            ogs_info("Received Change Notification Request in session-dependent section");
+            
+            /* Build Change Notification Response (Type 39) */
+            {
+                ogs_gtp2_header_t h;
+                ogs_pkbuf_t *pkbuf = NULL;
+                uint8_t *p;
+                int payload_len = 5; /* Cause IE: 5 bytes */
+                
+                ogs_info("Building Change Notification Response header");
+                memset(&h, 0, sizeof(ogs_gtp2_header_t));
+                h.type = OGS_GTP2_CHANGE_NOTIFICATION_RESPONSE_TYPE;
+                h.teid = gtp2_sender_f_teid.teid_presence == true ? gtp2_sender_f_teid.teid : 0;
+                
+                ogs_info("Response TEID: 0x%x, Sender TEID present: %s", 
+                         h.teid, gtp2_sender_f_teid.teid_presence ? "YES" : "NO");
+                
+                /* Allocate packet buffer with proper headroom for GTP headers */
+                ogs_info("Allocating packet buffer with headroom, payload size: %d bytes", payload_len);
+                pkbuf = ogs_pkbuf_alloc(NULL, OGS_GTPV2C_HEADER_LEN + payload_len);
+                if (!pkbuf) {
+                    ogs_error("ogs_pkbuf_alloc() failed for Change Notification Response");
+                    break;
+                }
+                
+                /* Reserve headroom for GTP headers that will be added by ogs_gtp_xact_update_tx() */
+                ogs_pkbuf_reserve(pkbuf, OGS_GTPV2C_HEADER_LEN);
+                ogs_pkbuf_put(pkbuf, payload_len);
+                p = pkbuf->data;
+                
+                ogs_info("Adding Cause IE with REQUEST_ACCEPTED");
+                /* Add Cause IE: Type=2, Length=1, Value=REQUEST_ACCEPTED(16) */
+                *p++ = 2;   /* Cause IE type */
+                *(uint16_t*)p = htobe16(1); p += 2; /* Length = 1 */
+                *p++ = 0;   /* Instance/flags */
+                *p++ = OGS_GTP2_CAUSE_REQUEST_ACCEPTED; /* Cause value = 16 */
+                
+                ogs_info("Payload built successfully, calling ogs_gtp_xact_update_tx()");
+                rv = ogs_gtp_xact_update_tx(gtp_xact, &h, pkbuf);
+                if (rv != OGS_OK) {
+                    ogs_error("ogs_gtp_xact_update_tx() failed with rv=%d", rv);
+                    ogs_pkbuf_free(pkbuf);
+                    break;
+                }
+                
+                ogs_info("Response packet stored in transaction, calling ogs_gtp_xact_commit()");
+                rv = ogs_gtp_xact_commit(gtp_xact);
+                if (rv != OGS_OK) {
+                    ogs_error("ogs_gtp_xact_commit() failed with rv=%d", rv);
+                } else {
+                    ogs_info("Change Notification Response sent successfully!");
+                }
+            }
             break;
         default:
             ogs_warn("Not implemented(type:%d)", gtp2_message.h.type);
@@ -386,7 +495,29 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
         s6b_message = e->s6b_message;
         ogs_assert(s6b_message);
         sess = smf_sess_find_by_id(e->sess_id);
-        ogs_assert(sess);
+        if (!sess) {
+            /* Session might have been deleted by previous Gx/Gy message handling */
+            ogs_debug("Session not found for S6B message (session may have been deleted)");
+            ogs_free(s6b_message);
+            break;
+        }
+
+        /* Check if session is in a valid state for S6B messages */
+        ogs_fsm_handler_t current_state = sess->sm.state;
+        if (current_state == (ogs_fsm_handler_t)smf_gsm_state_epc_session_will_release ||
+            current_state == (ogs_fsm_handler_t)smf_gsm_state_exception) {
+            /* If this is a termination answer and we have a stored transaction, send DSResp */
+            if (s6b_message->cmd_code == OGS_DIAM_S6B_CMD_SESSION_TERMINATION &&
+                sess->gtp.stored_xact) {
+                ogs_debug("Session[%d] in release state - sending delayed DSResp", e->sess_id);
+                smf_gtp2_send_delete_session_response(sess, sess->gtp.stored_xact);
+                sess->gtp.stored_xact = NULL;
+            } else {
+                ogs_debug("Session[%d] in release/exception state - ignoring S6B message", e->sess_id);
+            }
+            ogs_free(s6b_message);
+            break;
+        }
 
         switch(s6b_message->cmd_code) {
         case OGS_DIAM_S6B_CMD_AUTHENTICATION_AUTHORIZATION:
@@ -405,11 +536,22 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
         ogs_assert(e);
         recvbuf = e->pkbuf;
         ogs_assert(recvbuf);
-        pfcp_message = e->pfcp_message;
-        ogs_assert(pfcp_message);
         pfcp_node = e->pfcp_node;
         ogs_assert(pfcp_node);
         ogs_assert(OGS_FSM_STATE(&pfcp_node->sm));
+
+        /*
+         * Issue #1911
+         *
+         * Because ogs_pfcp_message_t is over 80kb in size,
+         * it can cause stack overflow.
+         * To avoid this, the pfcp_message structure uses heap memory.
+         */
+        if ((pfcp_message = ogs_pfcp_parse_msg(recvbuf)) == NULL) {
+            ogs_error("ogs_pfcp_parse_msg() failed");
+            ogs_pkbuf_free(recvbuf);
+            break;
+        }
 
         rv = ogs_pfcp_xact_receive(pfcp_node, &pfcp_message->h, &pfcp_xact);
         if (rv != OGS_OK) {
@@ -418,6 +560,7 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
             break;
         }
 
+        e->pfcp_message = pfcp_message;
         e->pfcp_xact_id = pfcp_xact ? pfcp_xact->id : OGS_INVALID_POOL_ID;
 
         e->gtp2_message = NULL;

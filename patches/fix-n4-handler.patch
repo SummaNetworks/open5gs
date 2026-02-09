@@ -1,0 +1,41 @@
+diff --git a/src/smf/n4-handler.c b/src/smf/n4-handler.c
+index 123456789..987654321 a/src/smf/n4-handler.c
+--- a/src/smf/n4-handler.c
++++ b/src/smf/n4-handler.c
+@@ -542,8 +542,7 @@
+ 
+         } else {
+-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown flags [0x%llx], continuing with default behavior", (long long)flags);
+         }
+     } else if (flags & OGS_PFCP_MODIFY_CREATE) {
+ 
+@@ -585,8 +584,7 @@
+             OGS_FSM_TRAN(&sess->sm, &smf_gsm_state_wait_5gc_n2_pdu_session_resource_setup_complete);
+         } else {
+-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown flags [0x%llx], continuing with default behavior", (long long)flags);
+         }
+     } else if (flags & OGS_PFCP_MODIFY_REMOVE) {
+ 
+@@ -662,8 +660,7 @@
+                 ogs_pkbuf_free(n2smbuf);
+             }
+         } else {
+-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown flags [0x%llx], continuing with default behavior", (long long)flags);
+         }
+     } else {
+         ogs_error("Unknown flags [0x%x]", flags);
+@@ -714,8 +711,7 @@
+             ogs_assert(smf_sess->pfcp_node);
+             ogs_pfcp_up_send_session_modification_request(smf_sess, NULL, ue_ip_addr);
+         } else {
+-            ogs_fatal("Unknown trigger [%d]", trigger);
+-            ogs_assert_if_reached();
++            ogs_warn("Unknown trigger [%d], ignoring request", trigger);
+         }
+     }

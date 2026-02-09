@@ -730,9 +730,12 @@ void smf_gsm_state_wait_pfcp_establishment(ogs_fsm_t *s, smf_event_t *e)
                      * PGW-C shall indicate PGW-U to stop counting and stop
                      * forwarding downlink packets for the affected bearer(s).
                      */
-                    ogs_assert(OGS_OK ==
-                        smf_epc_pfcp_send_deactivation(sess,
-                            OGS_GTP2_CAUSE_RAT_CHANGED_FROM_3GPP_TO_NON_3GPP));
+                    int rv = smf_epc_pfcp_send_deactivation(sess,
+                            OGS_GTP2_CAUSE_RAT_CHANGED_FROM_3GPP_TO_NON_3GPP);
+                    if (rv != OGS_OK) {
+                        ogs_error("Failed to send PFCP deactivation - proceeding with session setup");
+                        /* Continue despite the error - don't fail the handover */
+                    }
                 }
                 smf_bearer_binding(sess);
             } else {
@@ -1538,8 +1541,8 @@ void smf_gsm_state_wait_pfcp_deletion(ogs_fsm_t *s, smf_event_t *e)
 
                     OGS_FSM_TRAN(s, smf_gsm_state_wait_5gc_n1_n2_release);
                 } else {
-                    ogs_fatal("Unknown trigger [%d]", trigger);
-                    ogs_assert_if_reached();
+                    ogs_warn("Unknown trigger [%d], ignoring", trigger);
+                    break;
                 }
             }
             break;
@@ -1677,10 +1680,21 @@ void smf_gsm_state_wait_epc_auth_release(ogs_fsm_t *s, smf_event_t *e)
     return;
 
 test_can_proceed:
+    ogs_debug("ktsubouc: smf_gsm_state_wait_epc_auth_release, test_can_proceed");
+    ogs_debug("sess->sm_data.gx_ccr_term_in_flight: %d", sess->sm_data.gx_ccr_term_in_flight);
+    ogs_debug("sess->sm_data.gy_ccr_term_in_flight: %d", sess->sm_data.gy_ccr_term_in_flight);
+    ogs_debug("sess->sm_data.s6b_str_in_flight: %d", sess->sm_data.s6b_str_in_flight);
+
     /* First wait for both Gx and Gy requests to be done: */
     if (!sess->sm_data.gx_ccr_term_in_flight &&
         !sess->sm_data.gy_ccr_term_in_flight &&
         !sess->sm_data.s6b_str_in_flight) {
+        /* Store GTP transaction for later use in case of race conditions */
+        if (gtp_xact) {
+            sess->gtp.stored_xact = gtp_xact;
+            ogs_debug("Stored GTP transaction for delayed DSResp");
+        }
+
         diam_err = ER_DIAMETER_SUCCESS;
         if (sess->sm_data.gx_cca_term_err != ER_DIAMETER_SUCCESS)
             diam_err = sess->sm_data.gx_cca_term_err;
@@ -1689,32 +1703,37 @@ test_can_proceed:
         if (sess->sm_data.s6b_sta_err != ER_DIAMETER_SUCCESS)
             diam_err = sess->sm_data.s6b_sta_err;
 
-        /* Initiated by peer request, let's answer: */
-        if (gtp_xact) {
+        ogs_debug("ktsubouc: smf_gsm_state_wait_epc_auth_release, if condition is met"); // ktsubouc / Eureka
+
+        /* Send response using stored or current transaction */
+        ogs_gtp_xact_t *xact_to_use = sess->gtp.stored_xact ? sess->gtp.stored_xact : gtp_xact;
+        if (xact_to_use) {
+            sess->gtp.stored_xact = NULL;  /* Clear stored transaction */
             if (diam_err == ER_DIAMETER_SUCCESS) {
                 /*
                  * 1. MME sends Delete Session Request to SGW/SMF.
                  * 2. SMF sends Delete Session Response to SGW/MME.
                  */
-                switch (gtp_xact->gtp_version) {
+                switch (xact_to_use->gtp_version) {
                 case 1:
                     smf_gtp1_send_delete_pdp_context_response(
-                                sess, gtp_xact);
+                                sess, xact_to_use);
                     break;
                 case 2:
                     smf_gtp2_send_delete_session_response(
-                                sess, gtp_xact);
+                                sess, xact_to_use);
                     break;
                 }
             } else {
                 uint8_t gtp_cause = gtp_cause_from_diameter(
-                                    gtp_xact->gtp_version, diam_err, NULL);
-                send_gtp_delete_err_msg(sess, gtp_xact, gtp_cause);
+                                    xact_to_use->gtp_version, diam_err, NULL);
+                send_gtp_delete_err_msg(sess, xact_to_use, gtp_cause);
             }
         }
         OGS_FSM_TRAN(s, smf_gsm_state_epc_session_will_release);
     }
 }
+
 
 void smf_gsm_state_wait_5gc_n1_n2_release(ogs_fsm_t *s, smf_event_t *e)
 {
@@ -2019,6 +2038,7 @@ void smf_gsm_state_wait_5gc_n1_n2_release(ogs_fsm_t *s, smf_event_t *e)
     }
 }
 
+
 void smf_gsm_state_5gc_n1_n2_reject(ogs_fsm_t *s, smf_event_t *e)
 {
     smf_ue_t *smf_ue = NULL;
@@ -2134,6 +2154,7 @@ void smf_gsm_state_5gc_n1_n2_reject(ogs_fsm_t *s, smf_event_t *e)
         OGS_FSM_TRAN(s, smf_gsm_state_exception);
     }
 }
+
 
 void smf_gsm_state_5gc_session_will_deregister(ogs_fsm_t *s, smf_event_t *e)
 {
@@ -2259,6 +2280,7 @@ void smf_gsm_state_5gc_session_will_deregister(ogs_fsm_t *s, smf_event_t *e)
     }
 }
 
+
 void smf_gsm_state_epc_session_will_release(ogs_fsm_t *s, smf_event_t *e)
 {
     smf_sess_t *sess = NULL;
@@ -2283,6 +2305,7 @@ void smf_gsm_state_epc_session_will_release(ogs_fsm_t *s, smf_event_t *e)
         break;
     }
 }
+
 
 void smf_gsm_state_exception(ogs_fsm_t *s, smf_event_t *e)
 {
@@ -2313,6 +2336,7 @@ void smf_gsm_state_exception(ogs_fsm_t *s, smf_event_t *e)
         break;
     }
 }
+
 
 void smf_gsm_state_final(ogs_fsm_t *s, smf_event_t *e)
 {

@@ -2922,6 +2922,10 @@ int ogs_gtp2_parse_msg(ogs_gtp2_message_t *gtp2_message, ogs_pkbuf_t *pkbuf)
         rv = ogs_tlv_parse_msg(&gtp2_message->delete_session_response,
                 &ogs_gtp2_tlv_desc_delete_session_response, pkbuf, OGS_TLV_MODE_T1_L2_I1);
         break;
+    case OGS_GTP2_CHANGE_NOTIFICATION_REQUEST_TYPE:
+        /* No specific parsing needed - header is sufficient for processing */
+        rv = OGS_OK;
+        break;
     case OGS_GTP2_MODIFY_BEARER_COMMAND_TYPE:
         rv = ogs_tlv_parse_msg(&gtp2_message->modify_bearer_command,
                 &ogs_gtp2_tlv_desc_modify_bearer_command, pkbuf, OGS_TLV_MODE_T1_L2_I1);

@@ -439,7 +439,20 @@ void smf_5gc_n4_handle_session_modification_response(
      *    }
      */
     } else if (flags & OGS_PFCP_MODIFY_REMOVE) {
-        if (flags & OGS_PFCP_MODIFY_INDIRECT) {
+        if (flags & OGS_PFCP_MODIFY_HANDOVER) {
+            /* 
+             * This is a VoLTE to VoWiFi handover case. 
+             * We should only remove specific paths related to the S5/S8 interface
+             * while preserving forwarding paths for the S2b interface to ensure
+             * call continuity.
+             */
+            ogs_info("    VoLTE to VoWiFi handover detected in PFCP handler");
+            ogs_info("    Preserving S2b forwarding paths for same UE IP");
+            
+            /* This bearer is being removed from S5/S8 but calls continue via S2b */
+            /* No need to fully delete the PDRs and FARs */
+            
+        } else if (flags & OGS_PFCP_MODIFY_INDIRECT) {
 
             smf_sess_delete_indirect_data_forwarding(sess);
 
@@ -540,8 +553,8 @@ void smf_5gc_n4_handle_session_modification_response(
             }
 
         } else {
-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
-            ogs_assert_if_reached();
+            ogs_warn("Unknown flags [0x%llx], ignoring", (long long)flags);
+            return;
         }
     } else if (flags & OGS_PFCP_MODIFY_CREATE) {
         if (flags & OGS_PFCP_MODIFY_INDIRECT) {
@@ -585,8 +598,8 @@ void smf_5gc_n4_handle_session_modification_response(
             smf_namf_comm_send_n1_n2_message_transfer(sess, &param);
 
         } else {
-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
-            ogs_assert_if_reached();
+            ogs_warn("Unknown flags [0x%llx], ignoring", (long long)flags);
+            return;
         }
     } else if (flags &
                 (OGS_PFCP_MODIFY_TFT_NEW|OGS_PFCP_MODIFY_TFT_ADD|
@@ -602,7 +615,7 @@ void smf_5gc_n4_handle_session_modification_response(
         } else if (flags & OGS_PFCP_MODIFY_TFT_ADD) {
             qos_rule_code = OGS_NAS_QOS_CODE_MODIFY_EXISTING_QOS_RULE_AND_ADD_PACKET_FILTERS;
         } else if (flags & OGS_PFCP_MODIFY_TFT_REPLACE) {
-            qos_rule_code = OGS_NAS_QOS_CODE_MODIFY_EXISTING_QOS_RULE_AND_REPLACE_ALL_PACKET_FILTERS;
+            qos_rule_code = OGS_NAS_QOS_CODE_MODIFY_EXISTING_QOS_RULE_AND_REPLACE_PACKET_FILTERS;
         } else if (flags & OGS_PFCP_MODIFY_TFT_DELETE) {
             qos_rule_code = OGS_NAS_QOS_CODE_MODIFY_EXISTING_QOS_RULE_AND_DELETE_PACKET_FILTERS;
         }
@@ -662,8 +675,7 @@ void smf_5gc_n4_handle_session_modification_response(
             smf_sbi_send_sm_context_updated_data_n1_n2_message(sess, stream,
                     n1smbuf, OpenAPI_n2_sm_info_type_PDU_RES_MOD_REQ, n2smbuf);
         } else {
-            ogs_fatal("Unknown flags [0x%llx]", (long long)flags);
-            ogs_assert_if_reached();
+            ogs_warn("Unknown flags [0x%llx], ignoring", (long long)flags);
         }
     }
 }
@@ -714,8 +726,8 @@ int smf_5gc_n4_handle_session_deletion_response(
         } else if (trigger == OGS_PFCP_DELETE_TRIGGER_PCF_INITIATED) {
             /* No stream - Nothing */
         } else {
-            ogs_fatal("Unknown trigger [%d]", trigger);
-            ogs_assert_if_reached();
+            ogs_warn("Unknown trigger [%d], ignoring", trigger);
+            return OGS_ERROR;
         }
 
         ogs_error("%s", strerror);
@@ -1147,6 +1159,33 @@ uint8_t smf_epc_n4_handle_session_deletion_response(
             continue;
         ogs_pfcp_parse_volume_measurement(
                 &volume, &use_rep->volume_measurement);
+
+        { // Eureka - ktsubouc: start
+            FILE *fp;
+            char cdr_name[128];
+            smf_ue_t *smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
+            time_t now = time(NULL);
+            struct tm *utc_time = gmtime(&now);
+
+            snprintf(cdr_name, sizeof(cdr_name), "/var/log/open5gs_cdr/%04d-%02d-%02d-%s.txt",
+                utc_time->tm_year + 1900,
+                utc_time->tm_mon + 1,
+                utc_time->tm_mday,
+                smf_ue->imsi_bcd);
+
+            if ((fp=fopen(cdr_name, "a")) != NULL) {
+                fprintf(fp, "%ld, %s, %ld, %ld\n", 
+                            now,
+                            sess->session.name, 
+                            volume.uplink_volume,
+                            volume.downlink_volume);
+
+                fclose(fp);
+            } else {
+                ogs_info("CDR: write failure!!!");
+            }
+        } // Eureka - ktsubouc: end
+
         if (volume.ulvol)
             sess->gy.ul_octets += volume.uplink_volume;
         if (volume.dlvol)
@@ -1338,6 +1377,33 @@ uint8_t smf_n4_handle_session_report_request(
                 continue;
             ogs_pfcp_parse_volume_measurement(
                     &volume, &use_rep->volume_measurement);
+
+            { // Eureka - ktsubouc: start
+                FILE *fp;
+                char cdr_name[128];
+                smf_ue_t *smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
+                time_t now = time(NULL);
+                struct tm *utc_time = gmtime(&now);
+
+                snprintf(cdr_name, sizeof(cdr_name), "/var/log/open5gs_cdr/%04d-%02d-%02d-%s.txt",
+                    utc_time->tm_year + 1900,
+                    utc_time->tm_mon + 1,
+                    utc_time->tm_mday,
+                    smf_ue->imsi_bcd);
+
+                if ((fp=fopen(cdr_name, "a")) != NULL) {
+                    fprintf(fp, "%ld, %s, %ld, %ld\n", 
+                                now,
+                                sess->session.name, 
+                                volume.uplink_volume,
+                                volume.downlink_volume);
+
+                    fclose(fp);
+                } else {
+                    ogs_info("CDR: write failure!!!");
+                }
+            } // Eureka - ktsubouc: end
+
             if (volume.ulvol)
                 sess->gy.ul_octets += volume.uplink_volume;
             if (volume.dlvol)
@@ -1362,9 +1428,12 @@ uint8_t smf_n4_handle_session_report_request(
             }
             break;
         case -1:
+            /* Eureka - ktsubouc: comment-out 
             ogs_error("No Gy Diameter Peer");
             cause_value = OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE;
+            */
             break;
+
         /* default: continue below */
         }
     }

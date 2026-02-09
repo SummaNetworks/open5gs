@@ -81,8 +81,15 @@ static void gtp_bearer_timeout(ogs_gtp_xact_t *xact, void *data)
  * TFT : Local <UE_IP> <UE_PORT> REMOTE <P-CSCF_RTP_IP> <P-CSCF_RTP_PORT>
  */
 static void encode_traffic_flow_template(
-        ogs_gtp2_tft_t *tft, smf_bearer_t *bearer, uint8_t tft_operation_code)
+        ogs_gtp2_tft_t *tft, smf_bearer_t *bearer, uint8_t tft_operation_code, smf_sess_t *sess)
 {
+    ogs_debug("[TFT] Encoding TFT for bearer ID %d, sess ptr:%p", bearer->id, sess);
+    if (sess) {
+        ogs_debug("[TFT] UE local addr support = %s", 
+                 sess->gtp.ue_local_addr_in_tft ? "TRUE" : "FALSE");
+    } else {
+        ogs_debug("[TFT] Session is NULL, cannot check local addr support");
+    }
     int i;
     smf_pf_t *pf = NULL;
 
@@ -107,10 +114,63 @@ static void encode_traffic_flow_template(
                 tft->pf[i].direction = pf->direction;
                 tft->pf[i].precedence = pf->precedence - 1;
 
+                /* 
+             * As per 3GPP standards, IPv4 local address type should only be included in TFT
+             * when UE indicates support (MS support of Local address in TFT indicator) in PCO
+             * and network indicates support (Network support of Local address in TFT indicator) in PCO
+             */
+                /* Parameter 'no_ipv4v6_local_addr_in_packet_filter' in ogs_pf_content_from_ipfw_rule:
+                 * - When true: Exclude local address types (do not include them in packet filter)
+                 * - When false: Include local address types (include them in packet filter)
+                 */
+                
+                /* Default: Exclude local address types for compatibility */
+                bool no_local_addr = true;
+                
+                /* Check if this UE has indicated support for Local Address in TFT */
+                if (sess && sess->gtp.ue_local_addr_in_tft) {
+                    /* UE supports local address, INCLUDE it in TFT (by setting no_local_addr to false) */
+                    no_local_addr = false;
+                    ogs_info("[TFT] Including IPv4 local address in TFT - UE explicitly supports it");
+                } else {
+                    /* UE doesn't support local address or we don't know, EXCLUDE it from TFT */
+                    ogs_info("[TFT] Excluding IPv4 local address from TFT - UE does not support it or unknown");
+                    if (!sess) {
+                        ogs_warn("[TFT] Session is NULL - assuming UE does not support local address");
+                    }
+                }
+                
+                /* Explicitly log what we're passing to ogs_pf_content_from_ipfw_rule */
+                ogs_info("[TFT] Calling ogs_pf_content_from_ipfw_rule with no_local_addr=%s", 
+                       no_local_addr ? "TRUE (exclude local addr)" : "FALSE (include local addr)");
+                
+                /* Call the function to encode packet filter content */
                 ogs_pf_content_from_ipfw_rule(
                         pf->direction, &tft->pf[i].content, &pf->ipfw_rule,
-                        ogs_global_conf()->parameter.
-                        no_ipv4v6_local_addr_in_packet_filter);
+                        no_local_addr);
+                
+                /* Double check: Enforce removal of IPv4 local address type if needed */
+                if (no_local_addr) {
+                    /* Scan through all components and remove any IPv4 local address type */
+                    int k;
+                    for (k = 0; k < OGS_MAX_NUM_OF_PACKET_FILTER_COMPONENT; k++) {
+                        if (tft->pf[i].content.component[k].type == OGS_PACKET_FILTER_IPV4_LOCAL_ADDRESS_TYPE) {
+                            ogs_warn("[TFT] Enforcing removal of IPv4 local address type - UE does not support it");
+                            /* Shift subsequent components to fill the gap */
+                            int m;
+                            for (m = k; m < OGS_MAX_NUM_OF_PACKET_FILTER_COMPONENT - 1; m++) {
+                                memcpy(&tft->pf[i].content.component[m],
+                                       &tft->pf[i].content.component[m+1],
+                                       sizeof(tft->pf[i].content.component[0]));
+                            }
+                            /* Clear the last component */
+                            memset(&tft->pf[i].content.component[OGS_MAX_NUM_OF_PACKET_FILTER_COMPONENT-1],
+                                  0, sizeof(tft->pf[i].content.component[0]));
+                            /* Decrement k to check the same position again as we shifted elements */
+                            k--;
+                        }
+                    }
+                }
             }
 
             i++;
@@ -123,286 +183,223 @@ void smf_bearer_binding(smf_sess_t *sess)
 {
     int rv;
     int i, j;
+    char ruleName[1024] = "";
+    smf_bearer_t *bearer = NULL;
+    ogs_pcc_rule_t *highest_priority_rule = NULL;
+    int highest_priority = -1;
 
     ogs_assert(sess);
 
+    /* First find the PCC rule with highest priority (lowest priority_level value) */
     for (i = 0; i < sess->policy.num_of_pcc_rule; i++) {
-        smf_bearer_t *bearer = NULL;
         ogs_pcc_rule_t *pcc_rule = &sess->policy.pcc_rule[i];
-
-        ogs_assert(pcc_rule);
-        if (pcc_rule->name == NULL) {
-            ogs_error("No PCC Rule Name");
-            continue;
-        }
-
+        ogs_debug("RuleName position %d -- %s",i,pcc_rule->name);
         if (pcc_rule->type == OGS_PCC_RULE_TYPE_INSTALL) {
-            bool bearer_created = false;
-            bool qos_presence = false;
+            if (highest_priority_rule == NULL || 
+                pcc_rule->qos.arp.priority_level < highest_priority) {
+                highest_priority_rule = pcc_rule;
+                highest_priority = pcc_rule->qos.arp.priority_level;
+            }
+        } else if (pcc_rule->type == OGS_PCC_RULE_TYPE_REMOVE){
+           ogs_debug("Finding bearer with name %s to be removed", pcc_rule->name);
+           bearer = smf_bearer_find_by_pcc_rule_name(sess, pcc_rule->name);
 
-            bearer = smf_bearer_find_by_pcc_rule_name(sess, pcc_rule->name);
-            if (!bearer) {
-                ogs_pfcp_pdr_t *dl_pdr = NULL, *ul_pdr = NULL;
+           if (!bearer) {
+              ogs_warn("No need to send 'Delete Bearer Request'");
+              ogs_warn("  - Bearer[Name:%s] has already been removed.",
+                   ruleName);
+              continue;
+           }
 
-                if (pcc_rule->num_of_flow == 0) {
-                    /* TFT is mandatory in
-                     * activate dedicated EPS bearer context request */
-                    ogs_error("No flow in PCC Rule");
-                    continue;
-                }
-
-                if (ogs_list_count(&sess->bearer_list) >=
-                        OGS_MAX_NUM_OF_BEARER) {
-                    ogs_error("Bearer Overflow[%d]",
-                            ogs_list_count(&sess->bearer_list));
-                    continue;
-                }
-
-                bearer = smf_bearer_add(sess);
-                ogs_assert(bearer);
-
-                dl_pdr = bearer->dl_pdr;
-                ogs_assert(dl_pdr);
-                ul_pdr = bearer->ul_pdr;
-                ogs_assert(ul_pdr);
-
-                /* Precedence is set to the order in which it was created */
-                dl_pdr->precedence = dl_pdr->id;
-                ul_pdr->precedence = ul_pdr->id;
-
-                ogs_assert(sess->pfcp_node);
-                if (sess->pfcp_node->up_function_features.ftup) {
-
-           /* TS 129 244 V16.5.0 8.2.3
-            *
-            * At least one of the V4 and V6 flags shall be set to "1",
-            * and both may be set to "1" for both scenarios:
-            *
-            * - when the CP function is providing F-TEID, i.e.
-            *   both IPv4 address field and IPv6 address field may be present;
-            *   or
-            * - when the UP function is requested to allocate the F-TEID,
-            *   i.e. when CHOOSE bit is set to "1",
-            *   and the IPv4 address and IPv6 address fields are not present.
+           ogs_debug("Bearer has been found, let's proceed to remove %s", pcc_rule->name);
+           /*
+            * TS23.214
+            * 6.3.1.7 Procedures with modification of bearer
+            * p50
+            * 2.  ...
+            * For "PGW/MME initiated bearer deactivation procedure",
+            * PGW-C shall indicate PGW-U to stop counting and stop
+            * forwarding downlink packets for the affected bearer(s).
             */
-
-                    ul_pdr->f_teid.ipv4 = 1;
-                    ul_pdr->f_teid.ipv6 = 1;
-                    ul_pdr->f_teid.ch = 1;
-                    ul_pdr->f_teid_len = 1;
-                } else {
-                    ogs_gtpu_resource_t *resource = NULL;
-                    resource = ogs_pfcp_find_gtpu_resource(
-                            &sess->pfcp_node->gtpu_resource_list,
-                            sess->session.name, ul_pdr->src_if);
-                    if (resource) {
-                        ogs_user_plane_ip_resource_info_to_sockaddr(
-                                &resource->info,
-                                &bearer->pgw_s5u_addr, &bearer->pgw_s5u_addr6);
-                        if (resource->info.teidri)
-                            bearer->pgw_s5u_teid = OGS_PFCP_GTPU_INDEX_TO_TEID(
-                                    ul_pdr->teid, resource->info.teidri,
-                                    resource->info.teid_range);
-                        else
-                            bearer->pgw_s5u_teid = ul_pdr->teid;
-                    } else {
-                        ogs_assert(sess->pfcp_node->addr_list);
-                        if (sess->pfcp_node->addr_list->ogs_sa_family ==
-                                AF_INET)
-                            ogs_assert(OGS_OK ==
-                                ogs_copyaddrinfo(&bearer->pgw_s5u_addr,
-                                    sess->pfcp_node->addr_list));
-                        else if (sess->pfcp_node->addr_list->ogs_sa_family ==
-                                AF_INET6)
-                            ogs_assert(OGS_OK ==
-                                ogs_copyaddrinfo(&bearer->pgw_s5u_addr6,
-                                    sess->pfcp_node->addr_list));
-                        else
-                            ogs_assert_if_reached();
-
-                        bearer->pgw_s5u_teid = ul_pdr->teid;
-                    }
-
-                    ogs_assert(OGS_OK ==
-                        ogs_pfcp_sockaddr_to_f_teid(
-                            bearer->pgw_s5u_addr, bearer->pgw_s5u_addr6,
-                            &ul_pdr->f_teid, &ul_pdr->f_teid_len));
-                    ul_pdr->f_teid.teid = bearer->pgw_s5u_teid;
-                }
-
-                bearer->pcc_rule.name = ogs_strdup(pcc_rule->name);
-                ogs_assert(bearer->pcc_rule.name);
-
-                memcpy(&bearer->qos, &pcc_rule->qos, sizeof(ogs_qos_t));
-
-                bearer_created = true;
-
-            } else {
-                ogs_assert(strcmp(bearer->pcc_rule.name, pcc_rule->name) == 0);
-
-                if ((pcc_rule->qos.mbr.downlink &&
-                    bearer->qos.mbr.downlink != pcc_rule->qos.mbr.downlink) ||
-                    (pcc_rule->qos.mbr.uplink &&
-                     bearer->qos.mbr.uplink != pcc_rule->qos.mbr.uplink) ||
-                    (pcc_rule->qos.gbr.downlink &&
-                    bearer->qos.gbr.downlink != pcc_rule->qos.gbr.downlink) ||
-                    (pcc_rule->qos.gbr.uplink &&
-                    bearer->qos.gbr.uplink != pcc_rule->qos.gbr.uplink)) {
-                    /* Update QoS parameter */
-                    memcpy(&bearer->qos, &pcc_rule->qos, sizeof(ogs_qos_t));
-
-                    /* Update Bearer Request encodes updated QoS parameter */
-                    qos_presence = true;
-                }
-            }
-
-        /*
-         * We only use the method of adding a flow to an existing tft.
-         *
-         * EPC: OGS_GTP2_TFT_CODE_ADD_PACKET_FILTERS_TO_EXISTING_TFT
-         * 5GC: OGS_NAS_QOS_CODE_MODIFY_EXISTING_QOS_RULE_AND_ADD_PACKET_FILTERS
-         */
-            ogs_list_init(&bearer->pf_to_add_list);
-
-            for (j = 0; j < pcc_rule->num_of_flow; j++) {
-                smf_pf_t *pf = NULL;
-                ogs_flow_t *flow = &pcc_rule->flow[j];
-
-                if (!flow) {
-                    ogs_error("No Flow");
-                    return;
-                }
-                if (!flow->description) {
-                    ogs_error("No Flow-Description");
-                    return;
-                }
-
-                /*
-                 * To add a flow to an existing tft.
-                 * duplicated flows are not added
-                 */
-                if (smf_pf_find_by_flow(
-                    bearer, flow->direction, flow->description) != NULL) {
-                    continue;
-                }
-
-                /*
-                 * To add a flow to an existing tft.
-                 *
-                 * Only new flows are added to the PF list.
-                 * Then, in the PF list, there are all flows
-                 * from the beginning to the present.
-                 */
-                pf = smf_pf_add(bearer);
-                if (!pf) {
-                    ogs_error("Overflow: PacketFilter in Bearer");
-                    break;
-                }
-
-                pf->direction = flow->direction;
-                pf->flow_description = ogs_strdup(flow->description);
-                ogs_assert(pf->flow_description);
-
-                rv = ogs_ipfw_compile_rule(
-                        &pf->ipfw_rule, pf->flow_description);
-/*
- * Refer to lib/ipfw/ogs-ipfw.h
- * Issue #338
- *
- * <DOWNLINK/BI-DIRECTIONAL>
- * GX : permit out from <P-CSCF_RTP_IP> <P-CSCF_RTP_PORT> to <UE_IP> <UE_PORT>
- * -->
- * RULE : Source <P-CSCF_RTP_IP> <P-CSCF_RTP_PORT> Destination <UE_IP> <UE_PORT>
- *
- * <UPLINK>
- * GX : permit out from <P-CSCF_RTP_IP> <P-CSCF_RTP_PORT> to <UE_IP> <UE_PORT>
- * -->
- * RULE : Source <UE_IP> <UE_PORT> Destination <P-CSCF_RTP_IP> <P-CSCF_RTP_PORT>
- */
-                if (flow->direction == OGS_FLOW_UPLINK_ONLY)
-                    ogs_ipfw_rule_swap(&pf->ipfw_rule);
-
-                if (rv != OGS_OK) {
-                    ogs_error("Invalid Flow-Description[%s]",
-                            pf->flow_description);
-                    smf_pf_remove(pf);
-                    break;
-                }
-
-                /*
-                 * To add a flow to an existing tft.
-                 *
-                 * 'pf_to_add_list' now has the added flow.
-                 */
-                ogs_list_add(&bearer->pf_to_add_list, &pf->to_add_node);
-            }
-
-            if (bearer_created == false &&
-                qos_presence == false &&
-                ogs_list_count(&bearer->pf_to_add_list) == 0) {
-                ogs_warn("No need to send 'Update Bearer Request'");
-                ogs_warn("bearer_created:%d, qos_presence:%d, rule_count:%d",
-                    bearer_created, qos_presence,
-                    ogs_list_count(&bearer->pf_to_add_list));
-                continue;
-            }
-
-            if (bearer_created == true) {
-
-                smf_bearer_tft_update(bearer);
-                smf_bearer_qos_update(bearer);
-
-                ogs_assert(OGS_OK ==
-                    smf_epc_pfcp_send_one_bearer_modification_request(
-                        bearer, OGS_INVALID_POOL_ID, OGS_PFCP_MODIFY_CREATE,
-                        OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
-                        OGS_GTP2_CAUSE_UNDEFINED_VALUE));
-            } else {
-                uint64_t pfcp_flags = OGS_PFCP_MODIFY_NETWORK_REQUESTED;
-
-                if (ogs_list_count(&bearer->pf_to_add_list) > 0) {
-                    pfcp_flags |= OGS_PFCP_MODIFY_EPC_TFT_UPDATE;
-                    smf_bearer_tft_update(bearer);
-                }
-                if (qos_presence == true) {
-                    pfcp_flags |= OGS_PFCP_MODIFY_EPC_QOS_UPDATE;
-                    smf_bearer_qos_update(bearer);
-                }
-                ogs_assert(OGS_OK ==
-                    smf_epc_pfcp_send_one_bearer_modification_request(
-                        bearer, OGS_INVALID_POOL_ID, pfcp_flags,
-                        OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
-                        OGS_GTP2_CAUSE_UNDEFINED_VALUE));
-            }
-
-        } else if (pcc_rule->type == OGS_PCC_RULE_TYPE_REMOVE) {
-            bearer = smf_bearer_find_by_pcc_rule_name(sess, pcc_rule->name);
-
-            if (!bearer) {
-                ogs_warn("No need to send 'Delete Bearer Request'");
-                ogs_warn("  - Bearer[Name:%s] has already been removed.",
-                        pcc_rule->name);
-                continue;
-            }
-
-            /*
-             * TS23.214
-             * 6.3.1.7 Procedures with modification of bearer
-             * p50
-             * 2.  ...
-             * For "PGW/MME initiated bearer deactivation procedure",
-             * PGW-C shall indicate PGW-U to stop counting and stop
-             * forwarding downlink packets for the affected bearer(s).
-             */
-            ogs_assert(OGS_OK ==
-                smf_epc_pfcp_send_one_bearer_modification_request(
-                    bearer, OGS_INVALID_POOL_ID,
-                    OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE,
-                    OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
-                    OGS_GTP2_CAUSE_UNDEFINED_VALUE));
-        } else {
-            ogs_error("Invalid Type[%d]", pcc_rule->type);
+           ogs_assert(OGS_OK ==
+               smf_epc_pfcp_send_one_bearer_modification_request(
+                   bearer, OGS_INVALID_POOL_ID,
+                   OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE,
+                   OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
+                   OGS_GTP2_CAUSE_UNDEFINED_VALUE));
+           return;
         }
+    }
+
+    if (!highest_priority_rule) {
+        ogs_warn("No valid PCC rules found - using default bearer only (session will continue)");
+        ogs_debug("This is normal for sessions without PCRF/PCF or during session termination");
+        return;
+    }
+
+    /* Check if bearer exists */
+    bearer = smf_bearer_find_by_pcc_rule_name(sess, highest_priority_rule->name);
+    bool bearer_created = false;
+    bool qos_presence = false;
+
+    if (!bearer) {
+        ogs_pfcp_pdr_t *dl_pdr = NULL, *ul_pdr = NULL;
+
+        /* Create new bearer */
+        bearer = smf_bearer_add(sess);
+        ogs_assert(bearer);
+
+        dl_pdr = bearer->dl_pdr;
+        ogs_assert(dl_pdr);
+        ul_pdr = bearer->ul_pdr;
+        ogs_assert(ul_pdr);
+
+        /* Set up PDRs and bearer configuration */
+        dl_pdr->precedence = dl_pdr->id;
+        ul_pdr->precedence = ul_pdr->id;
+
+        ogs_assert(sess->pfcp_node);
+        if (sess->pfcp_node->up_function_features.ftup) {
+            ul_pdr->f_teid.ipv4 = 1;
+            ul_pdr->f_teid.ipv6 = 1;
+            ul_pdr->f_teid.ch = 1;
+            ul_pdr->f_teid_len = 1;
+            /*ul_pdr->f_teid.chid = 1;
+              ul_pdr->f_teid.choose_id = OGS_PFCP_DEFAULT_CHOOSE_ID;
+              ul_pdr->f_teid_len = 2;
+	    */
+        } else {
+	    ogs_debug("PFCP information");
+            ogs_gtpu_resource_t *resource = NULL;
+            resource = ogs_pfcp_find_gtpu_resource(
+                    &sess->pfcp_node->gtpu_resource_list,
+                    sess->session.name, ul_pdr->src_if);
+            if (resource) {
+                ogs_user_plane_ip_resource_info_to_sockaddr(
+                        &resource->info,
+                        &bearer->pgw_s5u_addr, &bearer->pgw_s5u_addr6);
+                if (resource->info.teidri)
+                    bearer->pgw_s5u_teid = OGS_PFCP_GTPU_INDEX_TO_TEID(
+                            ul_pdr->teid, resource->info.teidri,
+                            resource->info.teid_range);
+                else
+                bearer->pgw_s5u_teid = ul_pdr->teid;
+		ogs_debug("Step1 PGW_S5U_TEID is %d", ul_pdr->teid);
+            } else {
+                if (sess->pfcp_node->addr.ogs_sa_family == AF_INET)
+                    ogs_assert(OGS_OK ==
+                        ogs_copyaddrinfo(&bearer->pgw_s5u_addr,
+                            &sess->pfcp_node->addr));
+                else if (sess->pfcp_node->addr.ogs_sa_family == AF_INET6)
+                    ogs_assert(OGS_OK ==
+                        ogs_copyaddrinfo(&bearer->pgw_s5u_addr6,
+                            &sess->pfcp_node->addr));
+                else
+                    ogs_assert_if_reached();
+
+                bearer->pgw_s5u_teid = ul_pdr->teid;
+		ogs_debug("Step2 PGW_S5U_TEID is %d", ul_pdr->teid);
+            }
+
+            ogs_assert(OGS_OK ==
+                ogs_pfcp_sockaddr_to_f_teid(
+                    bearer->pgw_s5u_addr, bearer->pgw_s5u_addr6,
+                    &ul_pdr->f_teid, &ul_pdr->f_teid_len));
+            ul_pdr->f_teid.teid = bearer->pgw_s5u_teid;
+    	    ogs_debug("Step3 PGW_S5U_TEID is %d", ul_pdr->teid);
+        }
+
+        bearer->pcc_rule.name = ogs_strdup(highest_priority_rule->name);
+        ogs_debug("Bearer to be created %s",bearer->pcc_rule.name);
+
+        memcpy(&bearer->qos, &highest_priority_rule->qos, sizeof(ogs_qos_t));
+        bearer_created = true;
+    } else {
+        /* Check if QoS needs update */
+        if ((highest_priority_rule->qos.mbr.downlink &&
+            bearer->qos.mbr.downlink != highest_priority_rule->qos.mbr.downlink) ||
+            (highest_priority_rule->qos.mbr.uplink &&
+             bearer->qos.mbr.uplink != highest_priority_rule->qos.mbr.uplink) ||
+            (highest_priority_rule->qos.gbr.downlink &&
+            bearer->qos.gbr.downlink != highest_priority_rule->qos.gbr.downlink) ||
+            (highest_priority_rule->qos.gbr.uplink &&
+            bearer->qos.gbr.uplink != highest_priority_rule->qos.gbr.uplink)) {
+            
+            memcpy(&bearer->qos, &highest_priority_rule->qos, sizeof(ogs_qos_t));
+            qos_presence = true;
+        }
+    }
+
+    /* Add flows from all PCC rules */
+    ogs_list_init(&bearer->pf_to_add_list);
+    for (i = 0; i < sess->policy.num_of_pcc_rule; i++) {
+        ogs_pcc_rule_t *pcc_rule = &sess->policy.pcc_rule[i];
+        if (pcc_rule->type != OGS_PCC_RULE_TYPE_INSTALL)
+            continue;
+
+        for (j = 0; j < pcc_rule->num_of_flow; j++) {
+            smf_pf_t *pf = NULL;
+            ogs_flow_t *flow = &pcc_rule->flow[j];
+
+            if (!flow || !flow->description) {
+                ogs_error("No Flow or Flow-Description");
+                continue;
+            }
+
+            if (smf_pf_find_by_flow(bearer, flow->direction, flow->description))
+                continue;
+
+            pf = smf_pf_add(bearer);
+            if (!pf) {
+                ogs_error("Overflow: PacketFilter in Bearer");
+                break;
+            }
+
+            pf->direction = flow->direction;
+            pf->flow_description = ogs_strdup(flow->description);
+            ogs_assert(pf->flow_description);
+
+            rv = ogs_ipfw_compile_rule(&pf->ipfw_rule, pf->flow_description);
+            if (flow->direction == OGS_FLOW_UPLINK_ONLY)
+                ogs_ipfw_rule_swap(&pf->ipfw_rule);
+
+            if (rv != OGS_OK) {
+                ogs_error("Invalid Flow-Description[%s]", pf->flow_description);
+                smf_pf_remove(pf);
+                continue;
+            }
+
+            ogs_list_add(&bearer->pf_to_add_list, &pf->to_add_node);
+        }
+    }
+
+    /* Send appropriate request based on bearer state */
+    if (bearer_created) {
+        smf_bearer_tft_update(bearer);
+        smf_bearer_qos_update(bearer);
+
+        ogs_assert(OGS_OK ==
+            smf_epc_pfcp_send_one_bearer_modification_request(
+                bearer, OGS_INVALID_POOL_ID, OGS_PFCP_MODIFY_CREATE,
+                OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
+                OGS_GTP2_CAUSE_UNDEFINED_VALUE));
+    } else if (qos_presence || ogs_list_count(&bearer->pf_to_add_list) > 0) {
+        uint64_t pfcp_flags = OGS_PFCP_MODIFY_NETWORK_REQUESTED;
+
+        if (ogs_list_count(&bearer->pf_to_add_list) > 0) {
+            pfcp_flags |= OGS_PFCP_MODIFY_EPC_TFT_UPDATE;
+            smf_bearer_tft_update(bearer);
+        }
+        if (qos_presence) {
+            pfcp_flags |= OGS_PFCP_MODIFY_EPC_QOS_UPDATE;
+            smf_bearer_qos_update(bearer);
+        }
+
+        ogs_assert(OGS_OK ==
+            smf_epc_pfcp_send_one_bearer_modification_request(
+                bearer, OGS_INVALID_POOL_ID, pfcp_flags,
+                OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
+                OGS_GTP2_CAUSE_UNDEFINED_VALUE));
     }
 }
 
@@ -426,7 +423,7 @@ int smf_gtp2_send_create_bearer_request(smf_bearer_t *bearer)
 
     memset(&tft, 0, sizeof tft);
     encode_traffic_flow_template(
-            &tft, bearer, OGS_GTP2_TFT_CODE_CREATE_NEW_TFT);
+            &tft, bearer, OGS_GTP2_TFT_CODE_CREATE_NEW_TFT, sess);
 
     pkbuf = smf_s5c_build_create_bearer_request(h.type, bearer, &tft);
     if (!pkbuf) {
@@ -442,6 +439,9 @@ int smf_gtp2_send_create_bearer_request(smf_bearer_t *bearer)
         return OGS_ERROR;
     }
     xact->local_teid = sess->smf_n4_teid;
+
+    /* Mark bearer as waiting for Create Bearer Response */
+    bearer->create_pending = true;
 
     rv = ogs_gtp_xact_commit(xact);
     ogs_expect(rv == OGS_OK);
@@ -471,7 +471,7 @@ int smf_gtp2_send_update_bearer_request(smf_bearer_t *bearer)
     memset(&tft, 0, sizeof tft);
     if (ogs_list_count(&bearer->pf_to_add_list) > 0) {
         encode_traffic_flow_template(&tft, bearer,
-            OGS_GTP2_TFT_CODE_ADD_PACKET_FILTERS_TO_EXISTING_TFT);
+            OGS_GTP2_TFT_CODE_ADD_PACKET_FILTERS_TO_EXISTING_TFT, sess);
     }
 
     pkbuf = smf_s5c_build_update_bearer_request(
@@ -601,37 +601,19 @@ void smf_qos_flow_binding(smf_sess_t *sess)
             } else {
                 ogs_assert(strcmp(qos_flow->pcc_rule.id, pcc_rule->id) == 0);
 
-                /*
-                 * Check if any MBR/GBR value is non-zero. This indicates that
-                 * the flow might require GBR/MBR-specific handling.
-                 */
-                if (pcc_rule->qos.mbr.downlink || pcc_rule->qos.mbr.uplink ||
-                    pcc_rule->qos.gbr.downlink || pcc_rule->qos.gbr.uplink) {
+                if ((pcc_rule->qos.mbr.downlink &&
+                    qos_flow->qos.mbr.downlink != pcc_rule->qos.mbr.downlink) ||
+                    (pcc_rule->qos.mbr.uplink &&
+                     qos_flow->qos.mbr.uplink != pcc_rule->qos.mbr.uplink) ||
+                    (pcc_rule->qos.gbr.downlink &&
+                    qos_flow->qos.gbr.downlink != pcc_rule->qos.gbr.downlink) ||
+                    (pcc_rule->qos.gbr.uplink &&
+                    qos_flow->qos.gbr.uplink != pcc_rule->qos.gbr.uplink)) {
+                    /* Update QoS parameter */
+                    memcpy(&qos_flow->qos, &pcc_rule->qos, sizeof(ogs_qos_t));
 
-                    /*
-                     * If new packet filters are being added, or if any MBR/GBR
-                     * field differs from what is currently set, then we must
-                     * update the QoS parameters.
-                     */
-                    if ((ogs_list_count(&qos_flow->pf_to_add_list) > 0) ||
-                        (qos_flow->qos.mbr.downlink != pcc_rule->qos.mbr.downlink) ||
-                        (qos_flow->qos.mbr.uplink != pcc_rule->qos.mbr.uplink) ||
-                        (qos_flow->qos.gbr.downlink != pcc_rule->qos.gbr.downlink) ||
-                        (qos_flow->qos.gbr.uplink != pcc_rule->qos.gbr.uplink)) {
-
-                        /*
-                         * Update the QoS parameters so that the GBR QoS Flow
-                         * Information IE is properly encoded in the upcoming
-                         * signaling (NGAP/PFCP) messages.
-                         */
-                        memcpy(&qos_flow->qos, &pcc_rule->qos, sizeof(ogs_qos_t));
-
-                        /*
-                         * Setting 'qos_presence' to true triggers encoding of
-                         * the QoS IE in the subsequent Bearer Request message.
-                         */
-                        qos_presence = true;
-                    }
+                    /* Update Bearer Request encodes updated QoS parameter */
+                    qos_presence = true;
                 }
             }
 

@@ -130,9 +130,14 @@ bool ogs_pfcp_cp_handle_association_setup_request(
         }
     }
 
-    if (node->up_function_features.ftup == 0)
-        ogs_warn("F-TEID allocation/release not supported with peer %s",
-                ogs_sockaddr_to_string_static(node->addr_list));
+    if (node->up_function_features.ftup == 0) {
+        char buf[OGS_ADDRSTRLEN];
+        ogs_sockaddr_t *addr = node->sa_list;
+        ogs_assert(addr);
+
+        ogs_warn("F-TEID allocation/release not supported with peer [%s]:%d",
+                OGS_ADDR(addr, buf), OGS_PORT(addr));
+    }
 
     return true;
 }
@@ -177,9 +182,14 @@ bool ogs_pfcp_cp_handle_association_setup_response(
         }
     }
 
-    if (node->up_function_features.ftup == 0)
-        ogs_warn("F-TEID allocation/release not supported with peer %s",
-                ogs_sockaddr_to_string_static(node->addr_list));
+    if (node->up_function_features.ftup == 0) {
+        char buf[OGS_ADDRSTRLEN];
+        ogs_sockaddr_t *addr = node->sa_list;
+        ogs_assert(addr);
+
+        ogs_warn("F-TEID allocation/release not supported with peer [%s]:%d",
+                OGS_ADDR(addr, buf), OGS_PORT(addr));
+    }
 
     return true;
 }
@@ -402,11 +412,6 @@ ogs_pfcp_pdr_t *ogs_pfcp_handle_create_pdr(ogs_pfcp_sess_t *sess,
     }
 
     pdr->src_if = message->pdi.source_interface.u8;
-
-    if (message->pdi.source_interface_type.presence) {
-        pdr->src_if_type_presence = true;
-        pdr->src_if_type = message->pdi.source_interface_type.u8;
-    }
 
     ogs_pfcp_rule_remove_all(pdr);
 
@@ -753,11 +758,6 @@ ogs_pfcp_pdr_t *ogs_pfcp_handle_update_pdr(ogs_pfcp_sess_t *sess,
 
         pdr->src_if = message->pdi.source_interface.u8;
 
-        if (message->pdi.source_interface_type.presence) {
-            pdr->src_if_type_presence = true;
-            pdr->src_if_type = message->pdi.source_interface_type.u8;
-        }
-
         ogs_pfcp_rule_remove_all(pdr);
 
         for (i = 0; i < OGS_MAX_NUM_OF_FLOW_IN_PDR; i++) {
@@ -971,13 +971,6 @@ ogs_pfcp_far_t *ogs_pfcp_handle_create_far(ogs_pfcp_sess_t *sess,
                 message->forwarding_parameters.destination_interface.u8;
         }
 
-        if (message->forwarding_parameters.destination_interface_type.
-                presence) {
-            far->dst_if_type_presence = true;
-            far->dst_if_type = message->forwarding_parameters.
-                destination_interface_type.u8;
-        }
-
         if (message->forwarding_parameters.network_instance.presence) {
             char dnn[OGS_MAX_DNN_LEN+1];
 
@@ -1085,13 +1078,6 @@ ogs_pfcp_far_t *ogs_pfcp_handle_update_far(ogs_pfcp_sess_t *sess,
                 message->update_forwarding_parameters.destination_interface.u8;
         }
 
-        if (message->update_forwarding_parameters.destination_interface_type.
-                presence) {
-            far->dst_if_type_presence = true;
-            far->dst_if_type = message->update_forwarding_parameters.
-                destination_interface_type.u8;
-        }
-
         if (message->update_forwarding_parameters.network_instance.presence) {
             char dnn[OGS_MAX_DNN_LEN+1];
 
@@ -1117,11 +1103,23 @@ ogs_pfcp_far_t *ogs_pfcp_handle_update_far(ogs_pfcp_sess_t *sess,
             ogs_assert(outer_header_creation->data);
             ogs_assert(outer_header_creation->len);
 
+            /* Store old TEID for logging */
+            uint32_t old_teid = far->outer_header_creation.teid;
+
             memcpy(&far->outer_header_creation, outer_header_creation->data,
                     ogs_min(sizeof(far->outer_header_creation),
                             outer_header_creation->len));
             far->outer_header_creation.teid =
                     be32toh(far->outer_header_creation.teid);
+
+            /* Update TEID hash tables with new TEID */
+            /* This function removes old TEID and adds new TEID to hash */
+            ogs_pfcp_far_teid_hash_set(far);
+            
+            if (old_teid != far->outer_header_creation.teid) {
+                ogs_info("Updated FAR TEID: old[0x%x] -> new[0x%x] during session modification", 
+                        old_teid, far->outer_header_creation.teid);
+            }
         }
     }
 

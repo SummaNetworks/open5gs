@@ -1,0 +1,315 @@
+From e286cf124a31c723b2b6e996d4586d581b95c829 Mon Sep 17 00:00:00 2001
+From: Eureka bot <engg.eurekawireless@gmail.com>
+Date: Thu, 11 Sep 2025 14:00:14 +0900
+Subject: [PATCH 1/2] Fix SMF bearer race condition in EPC mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When SMF is used as PGW-C in 4G EPC, a race condition occurs when:
+1. SMF sends Create Bearer Request to SGW-C and waits for response
+2. PCRF sends AAR to delete the dedicated bearer before response arrives
+3. Previously, SMF would incorrectly send Delete Bearer Request with EBI=0
+
+This fix implements deferred deletion by:
+- Adding state tracking flags (create_pending, delete_pending) to smf_bearer_t
+- Deferring Delete Bearer Request when Create Bearer Response is pending
+- Sending Delete Bearer Request with correct EBI after receiving response
+
+This ensures proper EBI handling in bearer deletion during race conditions.
+
+🤖 Generated with [Claude Code](https://claude.ai/code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ CLAUDE.md             | 142 ++++++++++++++++++++++++++++++++++++++++++
+ src/smf/binding.c     |   3 +
+ src/smf/context.c     |   6 ++
+ src/smf/context.h     |   6 ++
+ src/smf/gtp-path.c    |  11 ++++
+ src/smf/s5c-handler.c |  14 +++++
+ 6 files changed, 182 insertions(+)
+ create mode 100644 CLAUDE.md
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+new file mode 100644
+index 000000000..bc5086706
+--- /dev/null
++++ b/CLAUDE.md
+@@ -0,0 +1,142 @@
++# CLAUDE.md
++
++This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
++
++## Project Overview
++
++Open5GS is a C-based implementation of 5G Core and EPC (4G Core Network) based on 3GPP Release-17. It's a comprehensive mobile core network solution that includes all major network functions for both 4G and 5G networks.
++
++## Build System
++
++Open5GS uses Meson build system with Ninja backend.
++
++### Common Build Commands
++
++```bash
++# Initial setup (from project root)
++meson setup build
++
++# Build the project
++ninja -C build
++
++# Run all tests
++meson test -C build -v
++
++# Run specific test suites
++meson test -C build -v crypt unit  # Run only crypt and unit tests
++
++# Clean build
++ninja -C build clean
++
++# Install (requires sudo)
++sudo ninja -C build install
++```
++
++### Development Commands
++
++```bash
++# Run specific test by name
++meson test -C build <test-name> -v
++
++# Compile with debug symbols
++meson setup build --buildtype=debug
++
++# Static analysis (if available)
++ninja -C build clang-tidy
++ninja -C build cppcheck
++```
++
++## Architecture
++
++### Core Components Structure
++
++The codebase is organized into distinct network function components:
++
++**Source Code (`/src/`):**
++- Each directory represents a network function (AMF, SMF, UPF, MME, etc.)
++- `main.c` - Common entry point that dispatches to specific network functions
++- Network functions are built as separate executables
++
++**Libraries (`/lib/`):**
++- `core/` - Core utilities and data structures
++- `sbi/` - Service Based Interface (5G)
++- `nas/` - Non-Access Stratum protocol stack
++- `ngap/` - NG Application Protocol (5G)
++- `s1ap/` - S1 Application Protocol (4G)
++- `gtp/` - GPRS Tunneling Protocol
++- `pfcp/` - Packet Forwarding Control Protocol
++- `diameter/` - Diameter protocol implementation
++- `dbi/` - Database interface (MongoDB)
++- `metrics/` - Metrics and monitoring
++- `app/` - Application framework
++
++**Tests (`/tests/`):**
++- Unit tests for individual components
++- Integration tests for network scenarios
++- Protocol-specific test suites
++
++### Network Functions
++
++**5G Core (5GC):**
++- AMF - Access and Mobility Management Function
++- SMF - Session Management Function  
++- UPF - User Plane Function
++- NRF - Network Repository Function
++- AUSF - Authentication Server Function
++- UDM - Unified Data Management
++- UDR - Unified Data Repository
++- PCF - Policy Control Function
++- NSSF - Network Slice Selection Function
++- BSF - Binding Support Function
++- SCP - Service Communication Proxy
++- SEPP - Security Edge Protection Proxy
++
++**4G EPC:**
++- MME - Mobility Management Entity
++- HSS - Home Subscriber Server
++- SGWC/SGWU - Serving Gateway Control/User plane
++- PCRF - Policy and Charging Rules Function
++
++### Key Design Patterns
++
++1. **Event-Driven Architecture**: Uses event loops and state machines for protocol handling
++2. **Modular Design**: Each network function is independently deployable
++3. **Protocol Abstraction**: Clean separation between protocol layers
++4. **Configuration-Driven**: YAML-based configuration files in `/configs/`
++
++## Dependencies
++
++Key external dependencies:
++- MongoDB (for subscriber database)
++- GnuTLS/OpenSSL (for security)
++- SCTP libraries (for reliable transport)
++- YAML libraries (for configuration)
++- nghttp2 (for HTTP/2 support)
++- Various protocol libraries (ASN.1, etc.)
++
++## Testing Strategy
++
++- Unit tests: Test individual components and libraries
++- Integration tests: Test complete network scenarios
++- Protocol tests: Validate protocol compliance
++- Use `meson test -C build -v` to run all tests with verbose output
++
++## Known Issues and Fixes
++
++### SMF Bearer Management Race Condition Fix
++A race condition was fixed in the SMF when used as PGW-C in 4G EPC mode. The issue occurred when:
++1. SMF sends Create Bearer Request to SGW-C and waits for response
++2. PCRF sends AAR to delete the dedicated bearer before Create Bearer Response arrives
++3. Previously, SMF would send Delete Bearer Request with EBI=0 immediately
++
++The fix implements:
++- Bearer state tracking with `create_pending` and `delete_pending` flags in `smf_bearer_t`
++- Deferred deletion: When delete is requested during Create Bearer Response wait, the deletion is postponed
++- Upon receiving Create Bearer Response, if deletion is pending, Delete Bearer Request is sent with the correct EBI
++
++Key modified files:
++- `src/smf/context.h` - Added state management flags to bearer structure
++- `src/smf/context.c` - Initialize flags in bearer creation
++- `src/smf/binding.c` - Set create_pending flag when sending Create Bearer Request
++- `src/smf/gtp-path.c` - Check and defer deletion if create_pending
++- `src/smf/s5c-handler.c` - Handle deferred deletion after Create Bearer Response
+\ No newline at end of file
+diff --git a/src/smf/binding.c b/src/smf/binding.c
+index 20c3fe40a..6d127cc06 100644
+--- a/src/smf/binding.c
++++ b/src/smf/binding.c
+@@ -439,6 +439,9 @@ int smf_gtp2_send_create_bearer_request(smf_bearer_t *bearer)
+     }
+     xact->local_teid = sess->smf_n4_teid;
+ 
++    /* Mark bearer as waiting for Create Bearer Response */
++    bearer->create_pending = true;
++
+     rv = ogs_gtp_xact_commit(xact);
+     ogs_expect(rv == OGS_OK);
+ 
+diff --git a/src/smf/context.c b/src/smf/context.c
+index 8311c394b..adb949ddd 100644
+--- a/src/smf/context.c
++++ b/src/smf/context.c
+@@ -2377,6 +2377,12 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
+     ogs_pool_id_calloc(&smf_bearer_pool, &bearer);
+     ogs_assert(bearer);
+ 
++    /* Initialize race condition handling flags */
++    bearer->create_pending = false;
++    bearer->delete_pending = false;
++    bearer->delete_cause_value = OGS_GTP2_CAUSE_UNDEFINED_VALUE;
++    bearer->delete_pti = OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED;
++
+     smf_pf_identifier_pool_init(bearer);
+ 
+     ogs_list_init(&bearer->pf_list);
+diff --git a/src/smf/context.h b/src/smf/context.h
+index 9ca9cfe67..067ff61f1 100644
+--- a/src/smf/context.h
++++ b/src/smf/context.h
+@@ -216,6 +216,12 @@ typedef struct smf_bearer_s {
+     uint8_t num_of_pf_to_delete;
+     uint8_t pf_to_delete[OGS_MAX_NUM_OF_FLOW_IN_NAS];
+ 
++    /* Bearer state management for race condition handling */
++    bool create_pending;        /* Create Bearer Request sent, waiting for response */
++    bool delete_pending;        /* Delete requested while create_pending */
++    uint8_t delete_cause_value; /* Cause value for pending delete */
++    uint8_t delete_pti;         /* PTI for pending delete */
++
+     ogs_pool_id_t   sess_id;
+ } smf_bearer_t;
+ 
+diff --git a/src/smf/gtp-path.c b/src/smf/gtp-path.c
+index e082d6809..ce09a2c93 100644
+--- a/src/smf/gtp-path.c
++++ b/src/smf/gtp-path.c
+@@ -550,6 +550,17 @@ int smf_gtp2_send_delete_bearer_request(
+     sess = smf_sess_find_by_id(bearer->sess_id);
+     ogs_assert(sess);
+ 
++    /* Check if Create Bearer Response is pending */
++    if (bearer->create_pending) {
++        /* Mark for deletion after Create Bearer Response is received */
++        ogs_warn("Bearer[EBI:%d] Create Bearer Response pending, "
++                 "deferring Delete Bearer Request", bearer->ebi);
++        bearer->delete_pending = true;
++        bearer->delete_cause_value = cause_value;
++        bearer->delete_pti = pti;
++        return OGS_OK;
++    }
++
+     memset(&h, 0, sizeof(ogs_gtp2_header_t));
+     h.type = OGS_GTP2_DELETE_BEARER_REQUEST_TYPE;
+     h.teid = sess->sgw_s5c_teid;
+diff --git a/src/smf/s5c-handler.c b/src/smf/s5c-handler.c
+index 6cb4afdd9..a88fd5ef0 100644
+--- a/src/smf/s5c-handler.c
++++ b/src/smf/s5c-handler.c
+@@ -861,6 +861,20 @@ void smf_s5c_handle_create_bearer_response(
+     /* Set EBI */
+     bearer->ebi = rsp->bearer_contexts.eps_bearer_id.u8;
+ 
++    /* Clear create_pending flag */
++    bearer->create_pending = false;
++
++    /* Check if delete was pending during Create Bearer Response wait */
++    if (bearer->delete_pending) {
++        ogs_warn("Bearer[EBI:%d] has pending delete, sending Delete Bearer Request",
++                 bearer->ebi);
++        bearer->delete_pending = false;
++        ogs_assert(OGS_OK ==
++            smf_gtp2_send_delete_bearer_request(
++                bearer, bearer->delete_pti, bearer->delete_cause_value));
++        return;
++    }
++
+     /* Data Plane(DL) : SGW-S5U */
+     ogs_assert(sgw_s5u_teid);
+     bearer->sgw_s5u_teid = be32toh(sgw_s5u_teid->teid);
+-- 
+2.34.1
+
+
+From 25a8f473900278ab31b433baf17c075b3b4243df Mon Sep 17 00:00:00 2001
+From: Eureka bot <engg.eurekawireless@gmail.com>
+Date: Thu, 11 Sep 2025 14:55:37 +0900
+Subject: [PATCH 2/2] Fix UPF compilation error in gtp-path.c
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Remove incorrect 'continue' statement after warning log when PDR has no
+associated FAR. The continue statement was causing compilation error as
+it was not within a loop context.
+
+🤖 Generated with [Claude Code](https://claude.ai/code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/upf/gtp-path.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/src/upf/gtp-path.c b/src/upf/gtp-path.c
+index aace9d0b4..2772a64d2 100644
+--- a/src/upf/gtp-path.c
++++ b/src/upf/gtp-path.c
+@@ -519,7 +519,6 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
+         far = pdr->far;
+         if (!far) {
+             ogs_warn("PDR [ID:%d] has no associated FAR - skipping", pdr->id);
+-            continue;
+         }
+ 
+         if (ip_h->ip_v == 4 && sess->ipv4) {
+-- 
+2.34.1
+

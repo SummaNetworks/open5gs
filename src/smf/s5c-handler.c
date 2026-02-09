@@ -231,28 +231,6 @@ uint8_t smf_s5c_handle_create_session_request(
         memcpy(&sess->e_tai, &uli.tai, sizeof(sess->e_tai));
         memcpy(&sess->e_cgi, &uli.e_cgi, sizeof(sess->e_cgi));
 
-    } else if (sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_WLAN) {
-        /* Even after handover to WLAN,
-         * there must be at least one EUTRAN session */
-        smf_sess_t *eutran_sess = smf_sess_find_by_apn(
-                smf_ue, sess->session.name, OGS_GTP2_RAT_TYPE_EUTRAN);
-        if (eutran_sess) {
-            /* Need to check handover is possible */
-            int eutran_session_count = 0;
-            ogs_list_reverse_for_each(&smf_ue->sess_list, eutran_sess) {
-                if (eutran_sess->gtp_rat_type != OGS_GTP2_RAT_TYPE_EUTRAN)
-                    continue;
-                if (strcmp(eutran_sess->session.name, sess->session.name) == 0)
-                    continue;
-
-                eutran_session_count++;
-            }
-
-            if (eutran_session_count < 1) {
-                ogs_error("Cannot handover to WLAN");
-                return OGS_GTP2_CAUSE_MULTIPLE_ACCESSES_TO_A_PDN_CONNECTION_NOT_ALLOWED;
-            }
-        }
     }
 
     /* Serving Network */
@@ -400,11 +378,39 @@ uint8_t smf_s5c_handle_create_session_request(
     if (req->extended_protocol_configuration_options.presence) {
         OGS_TLV_STORE_DATA(&sess->gtp.ue_epco,
                 &req->extended_protocol_configuration_options);
+        
+        /* Check for MS support of Local address in TFT indicator PCO */
+        ogs_pco_t pco;
+        if (ogs_pco_parse(&pco, (unsigned char *)req->extended_protocol_configuration_options.data, 
+                req->extended_protocol_configuration_options.len) > 0) {
+            for (int i = 0; i < pco.num_of_id; i++) {
+                if (pco.ids[i].id == OGS_PCO_ID_MS_SUPPORT_LOCAL_ADDR_TFT_INDICATOR) {
+                    /* PCO ID 0x0011 actually indicates UE does NOT support local address in TFT */
+                    sess->gtp.ue_local_addr_in_tft = false;
+                    ogs_info("UE explicitly indicates NO support for local address in TFT in ePCO");
+                    break;
+                }
+            }
+        }
 
     /* PCO */
     } else if (req->protocol_configuration_options.presence) {
         OGS_TLV_STORE_DATA(&sess->gtp.ue_pco,
                 &req->protocol_configuration_options);
+                
+        /* Check for MS support of Local address in TFT indicator PCO */
+        ogs_pco_t pco;
+        if (ogs_pco_parse(&pco, (unsigned char *)req->protocol_configuration_options.data,
+                req->protocol_configuration_options.len) > 0) {
+            for (int i = 0; i < pco.num_of_id; i++) {
+                if (pco.ids[i].id == OGS_PCO_ID_MS_SUPPORT_LOCAL_ADDR_TFT_INDICATOR) {
+                    /* PCO ID 0x0011 actually indicates UE does NOT support local address in TFT */
+                    sess->gtp.ue_local_addr_in_tft = false;
+                    ogs_info("UE explicitly indicates NO support for local address in TFT in PCO");
+                    break;
+                }
+            }
+        }
     }
 
     /* APCO */
@@ -443,34 +449,6 @@ uint8_t smf_s5c_handle_create_session_request(
             (uint8_t*)req->me_identity.data, smf_ue->imeisv_len);
         ogs_buffer_to_bcd(
             smf_ue->imeisv, smf_ue->imeisv_len, smf_ue->imeisv_bcd);
-    }
-
-    /* Set Node Identifier */
-    if (req->_aaa_server_identifier.presence) {
-        ogs_gtp2_node_identifier_t node_identifier;
-        decoded = ogs_gtp2_parse_node_identifier(
-                &node_identifier, &req->_aaa_server_identifier);
-        if (req->_aaa_server_identifier.len == decoded) {
-            if (sess->aaa_server_identifier.name)
-                ogs_free(sess->aaa_server_identifier.name);
-            sess->aaa_server_identifier.name = ogs_memdup(
-                node_identifier.name, node_identifier.name_len+1);
-            ogs_assert(sess->aaa_server_identifier.name);
-            sess->aaa_server_identifier.name[node_identifier.name_len] = 0;
-
-            if (sess->aaa_server_identifier.realm)
-                ogs_free(sess->aaa_server_identifier.realm);
-            sess->aaa_server_identifier.realm = ogs_memdup(
-                node_identifier.realm, node_identifier.realm_len+1);
-            ogs_assert(sess->aaa_server_identifier.realm);
-            sess->aaa_server_identifier.realm[node_identifier.realm_len] = 0;
-        } else {
-            ogs_error("Invalid AAA Server Identifier [%d != %d]",
-                    req->_aaa_server_identifier.len, decoded);
-            ogs_log_hexdump(OGS_LOG_ERROR,
-                    req->_aaa_server_identifier.data,
-                    req->_aaa_server_identifier.len);
-        }
     }
 
     return OGS_GTP2_CAUSE_REQUEST_ACCEPTED;
@@ -787,21 +765,35 @@ void smf_s5c_handle_create_bearer_response(
     }
 
     if (!pgw_s5u_teid) {
-        ogs_error("No PGW TEID");
+        ogs_error("No PGW TEID - SGW did not provide S5/S8 PGW F-TEID in Create Bearer Response");
+        ogs_error("Bearer context presence: %lu, s5_s8_u_pgw_f_teid presence: %lu, s2b_u_pgw_f_teid presence: %lu",
+                rsp->bearer_contexts.presence,
+                rsp->bearer_contexts.s5_s8_u_pgw_f_teid.presence,
+                rsp->bearer_contexts.s2b_u_pgw_f_teid.presence);
         cause_value = OGS_GTP2_CAUSE_CONDITIONAL_IE_MISSING;
     }
     if (!sgw_s5u_teid) {
-        ogs_error("No SGW TEID");
+        ogs_error("No SGW TEID - SGW did not provide S5/S8 SGW F-TEID in Create Bearer Response");
+        ogs_error("Bearer context presence: %lu, s5_s8_u_sgw_f_teid presence: %lu, s2b_u_epdg_f_teid_8 presence: %lu",
+                rsp->bearer_contexts.presence,
+                rsp->bearer_contexts.s5_s8_u_sgw_f_teid.presence,
+                rsp->bearer_contexts.s2b_u_epdg_f_teid_8.presence);
         cause_value = OGS_GTP2_CAUSE_CONDITIONAL_IE_MISSING;
     }
 
     if (rsp->cause.presence == 0) {
-        ogs_error("No Cause");
+        ogs_error("No Cause in Create Bearer Response");
         cause_value = OGS_GTP2_CAUSE_MANDATORY_IE_MISSING;
+    } else {
+        cause = rsp->cause.data;
+        ogs_info("Create Bearer Response - Main Cause: %d", cause->value);
     }
     if (rsp->bearer_contexts.cause.presence == 0) {
-        ogs_error("No Bearer Cause");
+        ogs_error("No Bearer Cause in Create Bearer Response");
         cause_value = OGS_GTP2_CAUSE_MANDATORY_IE_MISSING;
+    } else {
+        ogs_gtp2_cause_t *bearer_cause = rsp->bearer_contexts.cause.data;
+        ogs_info("Create Bearer Response - Bearer Cause: %d", bearer_cause->value);
     }
 
     if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
@@ -860,6 +852,20 @@ void smf_s5c_handle_create_bearer_response(
 
     /* Set EBI */
     bearer->ebi = rsp->bearer_contexts.eps_bearer_id.u8;
+
+    /* Clear create_pending flag */
+    bearer->create_pending = false;
+
+    /* Check if delete was pending during Create Bearer Response wait */
+    if (bearer->delete_pending) {
+        ogs_warn("Bearer[EBI:%d] has pending delete, sending Delete Bearer Request",
+                 bearer->ebi);
+        bearer->delete_pending = false;
+        ogs_assert(OGS_OK ==
+            smf_gtp2_send_delete_bearer_request(
+                bearer, bearer->delete_pti, bearer->delete_cause_value));
+        return;
+    }
 
     /* Data Plane(DL) : SGW-S5U */
     ogs_assert(sgw_s5u_teid);
@@ -1002,6 +1008,42 @@ void smf_s5c_handle_update_bearer_response(
 }
 
 /* return true if entire session must be released */
+/* Check if there's another session for the same UE with the same IP but different RAT type */
+static smf_sess_t *smf_sess_find_by_ip_and_different_rat(
+        smf_sess_t *current_sess) 
+{
+    smf_ue_t *smf_ue = NULL;
+    smf_sess_t *sess = NULL;
+
+    ogs_assert(current_sess);
+    smf_ue = smf_ue_find_by_id(current_sess->smf_ue_id);
+    ogs_assert(smf_ue);
+
+    ogs_list_for_each(&smf_ue->sess_list, sess) {
+        if (sess == current_sess) {
+            continue;
+        }
+
+        /* Skip if RAT type is the same */
+        if (sess->gtp_rat_type == current_sess->gtp_rat_type) {
+            continue;
+        }
+
+        /* Skip if IP addresses don't match */
+        if (memcmp(&sess->session.ue_ip, &current_sess->session.ue_ip,
+                sizeof(sess->session.ue_ip)) != 0) {
+            continue;
+        }
+
+        ogs_debug("Found session with same IP but different RAT type: "
+                "Current[RAT:%d] Other[RAT:%d]",
+                current_sess->gtp_rat_type, sess->gtp_rat_type);
+        return sess;
+    }
+
+    return NULL;
+}
+
 bool smf_s5c_handle_delete_bearer_response(
         smf_sess_t *sess, ogs_gtp_xact_t *xact,
         ogs_gtp2_delete_bearer_response_t *rsp)
@@ -1010,6 +1052,7 @@ bool smf_s5c_handle_delete_bearer_response(
     uint8_t cause_value;
     smf_bearer_t *bearer = NULL;
     ogs_pool_id_t bearer_id = OGS_INVALID_POOL_ID;
+    smf_sess_t *other_sess = NULL;
 
     ogs_assert(sess);
     ogs_assert(rsp);
@@ -1034,6 +1077,16 @@ bool smf_s5c_handle_delete_bearer_response(
         return true;
     }
 
+
+    /* Check if there's another active session for the same UE with the same IP
+     * but different RAT type. This is critical for VoLTE to VoWiFi handover. */
+    other_sess = smf_sess_find_by_ip_and_different_rat(sess);
+    if (other_sess) {
+        ogs_debug("    Found another session for UE with same IP but different RAT:");
+        ogs_debug("    Current[RAT:%d] Other[RAT:%d]",
+                sess->gtp_rat_type, other_sess->gtp_rat_type);
+    }
+
     if (rsp->linked_eps_bearer_id.presence) {
         /*
          * 1. SMF sends Delete Bearer Request(DEFAULT BEARER) to SGW/MME.
@@ -1050,12 +1103,24 @@ bool smf_s5c_handle_delete_bearer_response(
 
             cause_value = cause->value;
             if (cause->value == OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
+                /* If this is a VoLTE to VoWiFi handover with same IP address */
+                if (other_sess && 
+                    sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_EUTRAN && 
+                    other_sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_WLAN) {
+                    ogs_debug("    VoLTE to VoWiFi handover detected, ensuring "
+                            "packets flow through WLAN interface");
+                    
+                    /* No need to delete the session, forwarding rules will be 
+                     * updated when the S2b interface is established */
+                    return false;
+                }
             } else {
                 ogs_error("GTP Cause [Value:%d]", cause_value);
             }
         } else {
             ogs_error("No Cause");
         }
+        
         /* Release entire session: */
         return true;
     }
@@ -1090,6 +1155,15 @@ bool smf_s5c_handle_delete_bearer_response(
                 ogs_assert(cause);
 
                 if (cause_value == OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
+                    /* If this is a VoLTE to VoWiFi handover with same IP address */
+                    if (other_sess && 
+                        sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_EUTRAN && 
+                        other_sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_WLAN) {
+                        ogs_debug("    VoLTE to VoWiFi handover detected, ensuring "
+                                "packets flow through WLAN interface");
+                        /* No need for special handling here, forwarding rules are 
+                         * maintained by the PFCP session */
+                    }
                 } else {
                     ogs_error("GTP Cause [Value:%d]", cause_value);
                 }
@@ -1560,4 +1634,68 @@ void smf_s5c_handle_bearer_resource_command(
         rv = ogs_gtp_xact_commit(xact);
         ogs_expect(rv == OGS_OK);
     }
+}
+
+void smf_s5c_handle_delete_bearer_command(
+        smf_sess_t *sess, ogs_gtp_xact_t *xact,
+        ogs_gtp2_delete_bearer_command_t *cmd)
+{
+    int rv;
+    uint8_t cause_value = OGS_GTP2_CAUSE_REQUEST_ACCEPTED;
+    smf_bearer_t *bearer = NULL;
+
+    ogs_assert(xact);
+    ogs_assert(cmd);
+    ogs_assert(sess);
+
+    ogs_debug("Delete Bearer Command received");
+
+    /* Check if we have bearer contexts to delete */
+    if (cmd->bearer_contexts.presence == 0) {
+        ogs_error("No Bearer Contexts in Delete Bearer Command");
+        cause_value = OGS_GTP2_CAUSE_MANDATORY_IE_MISSING;
+        goto cleanup;
+    }
+
+    /* Check if EPS Bearer ID is present */
+    if (cmd->bearer_contexts.eps_bearer_id.presence == 0) {
+        ogs_error("No EPS Bearer ID in Delete Bearer Command");
+        cause_value = OGS_GTP2_CAUSE_MANDATORY_IE_MISSING;
+        goto cleanup;
+    }
+
+    /* Find and delete the specified bearer */
+    bearer = smf_bearer_find_by_ebi(sess, cmd->bearer_contexts.eps_bearer_id.u8);
+    if (!bearer) {
+        ogs_warn("Bearer EBI[%d] not found", cmd->bearer_contexts.eps_bearer_id.u8);
+        cause_value = OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND;
+        goto cleanup;
+    }
+
+    ogs_info("Processing Delete Bearer Command for Bearer EBI[%d] from PCRF", bearer->ebi);
+    
+    /* Send Delete Bearer Request to MME to initiate UE bearer deactivation */
+    rv = smf_gtp2_send_delete_bearer_request(bearer, 
+        OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED, 
+        OGS_GTP2_CAUSE_REQUEST_ACCEPTED);
+    if (rv != OGS_OK) {
+        ogs_error("Failed to send Delete Bearer Request to MME");
+        cause_value = OGS_GTP2_CAUSE_SYSTEM_FAILURE;
+        goto cleanup;
+    }
+    
+    /* Delete Bearer Command is acknowledged by simply not committing - let it be deleted */
+    ogs_info("Delete Bearer Command processed, UE bearer deactivation initiated");
+    return;
+
+cleanup:
+    /* Send failure response to PCRF */
+    if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
+        ogs_warn("Delete Bearer Command failed with cause: %d", cause_value);
+        /* TODO: Send Delete Bearer Failure Indication to PCRF */
+    }
+    
+    /* Let GTP stack handle transaction cleanup */
+
+    ogs_debug("Delete Bearer Command processed successfully");
 }

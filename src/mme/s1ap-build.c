@@ -692,7 +692,7 @@ ogs_pkbuf_t *s1ap_build_initial_context_setup_request(
     ogs_log_hexdump(OGS_LOG_DEBUG, SecurityKey->buf, SecurityKey->size);
 
     if (mme_ue->nas_eps.type == MME_EPS_TYPE_EXTENDED_SERVICE_REQUEST &&
-        MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+        MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
 
         /* Set CS-Fallback */
         S1AP_CSFallbackIndicator_t *CSFallbackIndicator = NULL;
@@ -727,7 +727,7 @@ ogs_pkbuf_t *s1ap_build_initial_context_setup_request(
         ogs_s1ap_buffer_to_OCTET_STRING(
             &mme_ue->tai.plmn_id, sizeof(ogs_plmn_id_t), &LAI->pLMNidentity);
         ogs_assert(mme_ue->csmap);
-        ogs_assert(mme_ue->current.p_tmsi);
+        ogs_assert(mme_ue->p_tmsi);
         ogs_asn_uint16_to_OCTET_STRING(mme_ue->csmap->lai.lac, &LAI->lAC);
 
     }
@@ -891,7 +891,7 @@ ogs_pkbuf_t *s1ap_build_ue_context_modification_request(mme_ue_t *mme_ue)
             enb_ue->enb_ue_s1ap_id, enb_ue->mme_ue_s1ap_id);
 
     if (mme_ue->nas_eps.type == MME_EPS_TYPE_EXTENDED_SERVICE_REQUEST &&
-        MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+        MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
         ie = CALLOC(1, sizeof(S1AP_UEContextModificationRequestIEs_t));
         ASN_SEQUENCE_ADD(&UEContextModificationRequest->protocolIEs, ie);
 
@@ -919,7 +919,7 @@ ogs_pkbuf_t *s1ap_build_ue_context_modification_request(mme_ue_t *mme_ue)
         ogs_s1ap_buffer_to_OCTET_STRING(
             &mme_ue->tai.plmn_id, sizeof(ogs_plmn_id_t), &LAI->pLMNidentity);
         ogs_assert(mme_ue->csmap);
-        ogs_assert(mme_ue->current.p_tmsi);
+        ogs_assert(mme_ue->p_tmsi);
         ogs_asn_uint16_to_OCTET_STRING(mme_ue->csmap->lai.lac, &LAI->lAC);
 
     } else {
@@ -1053,6 +1053,8 @@ ogs_pkbuf_t *s1ap_build_e_rab_setup_request(
     S1AP_ENB_UE_S1AP_ID_t *ENB_UE_S1AP_ID = NULL;
     S1AP_E_RABToBeSetupListBearerSUReq_t *E_RABToBeSetupListBearerSUReq = NULL;
 
+    S1AP_UEAggregateMaximumBitrate_t *UEAggregateMaximumBitrate = NULL; // ktsubouc - added
+
     S1AP_E_RABToBeSetupItemBearerSUReqIEs_t *item = NULL;
     S1AP_E_RABToBeSetupItemBearerSUReq_t *e_rab = NULL;
     S1AP_GBR_QosInformation_t *gbrQosInformation = NULL;
@@ -1100,6 +1102,32 @@ ogs_pkbuf_t *s1ap_build_e_rab_setup_request(
     ie->value.present = S1AP_E_RABSetupRequestIEs__value_PR_ENB_UE_S1AP_ID;
 
     ENB_UE_S1AP_ID = &ie->value.choice.ENB_UE_S1AP_ID;
+
+    //------------------------------------
+    // ktsubouc - begin adding ue ambr
+    //
+    ie = CALLOC(1, sizeof(S1AP_E_RABSetupRequestIEs_t));
+    ASN_SEQUENCE_ADD(&E_RABSetupRequest->protocolIEs, ie);
+
+    ie->id = S1AP_ProtocolIE_ID_id_uEaggregateMaximumBitrate;
+    ie->criticality = S1AP_Criticality_reject;
+    ie->value.present =
+        S1AP_E_RABSetupRequestIEs__value_PR_UEAggregateMaximumBitrate;
+
+    UEAggregateMaximumBitrate = &ie->value.choice.UEAggregateMaximumBitrate;
+
+    ogs_debug("    AMBR[DL:%lld,UL:%lld]",
+        (long long)mme_ue->ambr.downlink, (long long)mme_ue->ambr.uplink);
+
+    asn_uint642INTEGER(
+            &UEAggregateMaximumBitrate->uEaggregateMaximumBitRateUL,
+            mme_ue->ambr.uplink);
+    asn_uint642INTEGER(
+            &UEAggregateMaximumBitrate->uEaggregateMaximumBitRateDL,
+            mme_ue->ambr.downlink);
+    //
+    // ktsubouc - end
+    //------------------------------------
 
     ie = CALLOC(1, sizeof(S1AP_E_RABSetupRequestIEs_t));
     ASN_SEQUENCE_ADD(&E_RABSetupRequest->protocolIEs, ie);

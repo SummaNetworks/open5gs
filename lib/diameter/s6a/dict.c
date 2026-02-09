@@ -34,7 +34,30 @@
 /* The content of this file follows the same structure as dict_base_proto.c */
 
 #define CHECK_dict_new( _type, _data, _parent, _ref )    \
-    CHECK_FCT(  fd_dict_new( fd_g_config->cnf_dict, (_type), (_data), (_parent), (_ref))  );
+    do { \
+        struct dict_object *_existing = NULL; \
+        int _search_result = 0; \
+        if ((_type) == DICT_AVP) { \
+            struct dict_avp_data *_avp_data = (struct dict_avp_data *)(_data); \
+            struct { \
+                vendor_id_t vendor_id; \
+                avp_code_t avp_code; \
+            } _search_criteria = { _avp_data->avp_vendor, _avp_data->avp_code }; \
+            _search_result = fd_dict_search(fd_g_config->cnf_dict, DICT_AVP, AVP_BY_CODE_AND_VENDOR, \
+                                          &_search_criteria, &_existing, ENOENT); \
+        } else if ((_type) == DICT_COMMAND) { \
+            struct dict_cmd_data *_cmd_data = (struct dict_cmd_data *)(_data); \
+            _search_result = fd_dict_search(fd_g_config->cnf_dict, DICT_COMMAND, CMD_BY_NAME, \
+                                          (_cmd_data->cmd_name), &_existing, ENOENT); \
+        } \
+        if (_search_result != 0) { \
+            CHECK_FCT(fd_dict_new(fd_g_config->cnf_dict, (_type), (_data), (_parent), (_ref))); \
+        } else { \
+            if ((_ref) != NULL) { \
+                *((struct dict_object **)(_ref)) = _existing; \
+            } \
+        } \
+    } while(0)
 
 #define CHECK_dict_search( _type, _criteria, _what, _result )    \
     CHECK_FCT(  fd_dict_search( fd_g_config->cnf_dict, (_type), (_criteria), (_what), (_result), ENOENT) );
@@ -93,7 +116,12 @@ int ogs_dict_s6a_entry(char *conffile)
         struct dict_object * vendor;
         CHECK_FCT(fd_dict_search(fd_g_config->cnf_dict, DICT_VENDOR, VENDOR_BY_NAME, "3GPP", &vendor, ENOENT));
         struct dict_application_data app_data = { 16777251, "S6A" };
-        CHECK_FCT(fd_dict_new(fd_g_config->cnf_dict, DICT_APPLICATION, &app_data, vendor, &s6a));
+        
+        /* Check if S6a application already exists */
+        if (fd_dict_search(fd_g_config->cnf_dict, DICT_APPLICATION, APPLICATION_BY_ID, &app_data.application_id, &s6a, ENOENT) != 0) {
+            /* S6a application doesn't exist, create it */
+            CHECK_FCT(fd_dict_new(fd_g_config->cnf_dict, DICT_APPLICATION, &app_data, vendor, &s6a));
+        }
     }
 
     /* AVP section */

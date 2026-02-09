@@ -122,7 +122,7 @@ typedef struct upf_sess_s {
     ogs_pfcp_node_t *pfcp_node;
 
     /* Accounting: */
-    upf_sess_urr_acc_t urr_acc[OGS_MAX_NUM_OF_URR]; /* FIXME: This probably needs to be mved to a hashtable or alike */
+    upf_sess_urr_acc_t urr_acc[OGS_MAX_NUM_OF_URR + 1]; /* FIXME: This probably needs to be mved to a hashtable or alike */
     char            *apn_dnn;            /* APN/DNN Item */
 } upf_sess_t;
 

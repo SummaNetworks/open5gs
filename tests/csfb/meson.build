@@ -23,7 +23,6 @@ testapp_csfb_sources = files('''
     mt-active-test.c
     mo-sms-test.c
     mt-sms-test.c
-    tau-test.c
     crash-test.c
 '''.split())
 

@@ -179,7 +179,12 @@ void sgwc_sxa_handle_session_establishment_response(
     ogs_assert(create_session_request);
 
     s11_xact = ogs_gtp_xact_find_by_id(pfcp_xact->assoc_xact_id);
-    ogs_assert(s11_xact);
+    if (!s11_xact) {
+        ogs_warn("S11 transaction not found for assoc_xact_id=%d", pfcp_xact->assoc_xact_id);
+        /* S11 transaction might have timed out or been cleared already */
+        ogs_pfcp_xact_commit(pfcp_xact);
+        return;
+    }
 
     ogs_pfcp_xact_commit(pfcp_xact);
 
@@ -632,30 +637,39 @@ void sgwc_sxa_handle_session_modification_response(
         } else if (flags & OGS_PFCP_MODIFY_ACTIVATE) {
             if (flags & OGS_PFCP_MODIFY_UL_ONLY) {
                 s11_xact = ogs_gtp_xact_find_by_id(pfcp_xact->assoc_xact_id);
-                ogs_assert(s11_xact);
-
-                ogs_gtp_send_error_message(
-                        s11_xact, sgwc_ue ? sgwc_ue->mme_s11_teid : 0,
-                        OGS_GTP2_CREATE_SESSION_RESPONSE_TYPE, cause_value);
+                if (!s11_xact) {
+                    ogs_warn("S11 transaction not found for assoc_xact_id=%d", pfcp_xact->assoc_xact_id);
+                    /* S11 transaction might have timed out or been cleared already */
+                } else {
+                    ogs_gtp_send_error_message(
+                            s11_xact, sgwc_ue ? sgwc_ue->mme_s11_teid : 0,
+                            OGS_GTP2_CREATE_SESSION_RESPONSE_TYPE, cause_value);
+                }
 
             } else if (flags & OGS_PFCP_MODIFY_DL_ONLY) {
                 s11_xact = ogs_gtp_xact_find_by_id(pfcp_xact->assoc_xact_id);
-                ogs_assert(s11_xact);
-
-                ogs_gtp_send_error_message(
-                        s11_xact, sgwc_ue ? sgwc_ue->mme_s11_teid : 0,
-                        OGS_GTP2_MODIFY_BEARER_RESPONSE_TYPE, cause_value);
+                if (!s11_xact) {
+                    ogs_warn("S11 transaction not found for assoc_xact_id=%d", pfcp_xact->assoc_xact_id);
+                    /* S11 transaction might have timed out or been cleared already */
+                } else {
+                    ogs_gtp_send_error_message(
+                            s11_xact, sgwc_ue ? sgwc_ue->mme_s11_teid : 0,
+                            OGS_GTP2_MODIFY_BEARER_RESPONSE_TYPE, cause_value);
+                }
             } else {
                 ogs_fatal("Invalid modify_flags[0x%llx]", (long long)flags);
                 ogs_assert_if_reached();
             }
         } else if (flags & OGS_PFCP_MODIFY_DEACTIVATE) {
             s11_xact = ogs_gtp_xact_find_by_id(pfcp_xact->assoc_xact_id);
-            ogs_assert(s11_xact);
-
-            ogs_gtp_send_error_message(
-                    s11_xact, sgwc_ue ? sgwc_ue->mme_s11_teid : 0,
-                    OGS_GTP2_RELEASE_ACCESS_BEARERS_RESPONSE_TYPE, cause_value);
+            if (!s11_xact) {
+                ogs_warn("S11 transaction not found for assoc_xact_id=%d", pfcp_xact->assoc_xact_id);
+                /* S11 transaction might have timed out or been cleared already */
+            } else {
+                ogs_gtp_send_error_message(
+                        s11_xact, sgwc_ue ? sgwc_ue->mme_s11_teid : 0,
+                        OGS_GTP2_RELEASE_ACCESS_BEARERS_RESPONSE_TYPE, cause_value);
+            }
         }
 
         ogs_pfcp_xact_commit(pfcp_xact);
@@ -686,7 +700,12 @@ void sgwc_sxa_handle_session_modification_response(
     if (flags & OGS_PFCP_MODIFY_REMOVE) {
         if (flags & OGS_PFCP_MODIFY_INDIRECT) {
             s11_xact = ogs_gtp_xact_find_by_id(pfcp_xact->assoc_xact_id);
-            ogs_assert(s11_xact);
+            if (!s11_xact) {
+                ogs_warn("S11 transaction not found for assoc_xact_id=%d", pfcp_xact->assoc_xact_id);
+                /* S11 transaction might have timed out or been cleared already */
+                ogs_pfcp_xact_commit(pfcp_xact);
+                return;
+            }
 
             ogs_pfcp_xact_commit(pfcp_xact);
 
@@ -891,13 +910,18 @@ void sgwc_sxa_handle_session_modification_response(
 
         } else if (flags & OGS_PFCP_MODIFY_INDIRECT) {
             s11_xact = ogs_gtp_xact_find_by_id(pfcp_xact->assoc_xact_id);
-            ogs_assert(s11_xact);
+            if (!s11_xact) {
+                ogs_warn("S11 transaction not found for assoc_xact_id=%d", pfcp_xact->assoc_xact_id);
+                /* S11 transaction might have timed out or been cleared already */
+                ogs_pfcp_xact_commit(pfcp_xact);
+                return;
+            }
 
             ogs_pfcp_xact_commit(pfcp_xact);
 
             ogs_assert(flags & OGS_PFCP_MODIFY_SESSION);
             if (SGWC_SESSION_SYNC_DONE(sgwc_ue,
-                OGS_PFCP_SESSION_MODIFICATION_REQUEST_TYPE, flags)) {
+                    OGS_PFCP_SESSION_MODIFICATION_REQUEST_TYPE, flags)) {
 
                 sgwc_tunnel_t *tunnel = NULL;
 
@@ -991,8 +1015,10 @@ void sgwc_sxa_handle_session_modification_response(
                             bearer->ebi;
 
                         gtp_rsp->bearer_contexts[i].cause.presence = 1;
-                        gtp_rsp->bearer_contexts[i].cause.data = &cause;
-                        gtp_rsp->bearer_contexts[i].cause.len = sizeof(cause);
+                        gtp_rsp->bearer_contexts[i].cause.len =
+                            sizeof(cause);
+                        gtp_rsp->bearer_contexts[i].cause.data =
+                            &cause;
                     }
                 }
 
@@ -1024,7 +1050,12 @@ void sgwc_sxa_handle_session_modification_response(
         OGS_LIST(bearer_to_modify_list);
 
         s11_xact = ogs_gtp_xact_find_by_id(pfcp_xact->assoc_xact_id);
-        ogs_assert(s11_xact);
+        if (!s11_xact) {
+            ogs_warn("S11 transaction not found for assoc_xact_id=%d", pfcp_xact->assoc_xact_id);
+            /* S11 transaction might have timed out or been cleared already */
+            ogs_pfcp_xact_commit(pfcp_xact);
+            return;
+        }
 
         ogs_list_copy(&bearer_to_modify_list,
                 &pfcp_xact->bearer_to_modify_list);
@@ -1238,6 +1269,7 @@ void sgwc_sxa_handle_session_modification_response(
             ogs_assert(flags & OGS_PFCP_MODIFY_SESSION);
             if (SGWC_SESSION_SYNC_DONE(sgwc_ue,
                     OGS_PFCP_SESSION_MODIFICATION_REQUEST_TYPE, flags)) {
+
                 ogs_assert(OGS_OK ==
                     sgwc_gtp_send_downlink_data_notification(
                         OGS_GTP2_CAUSE_ERROR_INDICATION_RECEIVED, bearer));
@@ -1245,7 +1277,12 @@ void sgwc_sxa_handle_session_modification_response(
 
         } else {
             s11_xact = ogs_gtp_xact_find_by_id(pfcp_xact->assoc_xact_id);
-            ogs_assert(s11_xact);
+            if (!s11_xact) {
+                ogs_warn("S11 transaction not found for assoc_xact_id=%d", pfcp_xact->assoc_xact_id);
+                /* S11 transaction might have timed out or been cleared already */
+                ogs_pfcp_xact_commit(pfcp_xact);
+                return;
+            }
 
             ogs_pfcp_xact_commit(pfcp_xact);
 
@@ -1370,8 +1407,10 @@ void sgwc_sxa_handle_session_deletion_response(
         teid = sess ? sess->pgw_s5c_teid : 0;
         break;
     default:
-        ogs_fatal("Unknown GTP message type [%d]", gtp_message->h.type);
-        ogs_assert_if_reached();
+        ogs_warn("Unknown GTP message type [%d], ignoring message", gtp_message->h.type);
+        if (gtp_xact)
+            ogs_gtp_send_error_message(gtp_xact, 0, gtp_message->h.type, OGS_GTP2_CAUSE_SERVICE_NOT_SUPPORTED);
+        return;
     }
 
     if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {

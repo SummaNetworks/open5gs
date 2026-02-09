@@ -362,7 +362,7 @@ int mme_gtp_send_delete_session_request(
     ogs_gtp_xact_t *xact = NULL;
     mme_ue_t *mme_ue = NULL;
 
-    ogs_assert(enb_ue);
+    /* enb_ue can be NULL in case of paging failure where S1 context is already released */
     ogs_assert(action);
     ogs_assert(sess);
     mme_ue = mme_ue_find_by_id(sess->mme_ue_id);
@@ -388,8 +388,12 @@ int mme_gtp_send_delete_session_request(
     }
     xact->delete_action = action;
     xact->local_teid = mme_ue->gn.mme_gn_teid;
-    xact->enb_ue_id = enb_ue->id;
-    ogs_debug("delete_session_request - xact:%p, sess:%p", xact, sess);
+    if (enb_ue) {
+        xact->enb_ue_id = enb_ue->id;
+    } else {
+        xact->enb_ue_id = 0; /* No S1 context available */
+    }
+    ogs_debug("delete_session_request - xact:%p, sess:%p, enb_ue:%p", xact, sess, enb_ue);
 
     rv = ogs_gtp_xact_commit(xact);
     ogs_expect(rv == OGS_OK);
@@ -403,7 +407,6 @@ void mme_gtp_send_delete_all_sessions(
     mme_sess_t *sess = NULL, *next_sess = NULL;
     sgw_ue_t *sgw_ue = NULL;
 
-    ogs_assert(enb_ue);
     ogs_assert(mme_ue);
     sgw_ue = sgw_ue_find_by_id(mme_ue->sgw_ue_id);
     ogs_assert(sgw_ue);
@@ -411,6 +414,11 @@ void mme_gtp_send_delete_all_sessions(
 
     ogs_list_for_each_safe(&mme_ue->sess_list, next_sess, sess) {
         if (MME_HAVE_SGW_S1U_PATH(sess)) {
+            /* enb_ue can be NULL in case of paging failure where S1 context is already released */
+            if (!enb_ue) {
+                ogs_warn("[%s] Sending Delete Session Request without S1 context",
+                        mme_ue->imsi_bcd);
+            }
             mme_gtp_send_delete_session_request(enb_ue, sgw_ue, sess, action);
         } else {
             MME_SESS_CLEAR(sess);

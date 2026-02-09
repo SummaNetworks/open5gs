@@ -1,0 +1,112 @@
+diff --git a/src/mme/mme-context.c b/src/mme/mme-context.c
+index 5708f5016..d07444039 100644
+--- a/src/mme/mme-context.c
++++ b/src/mme/mme-context.c
+@@ -3897,6 +3897,83 @@ mme_ue_t *mme_ue_find_by_message(const ogs_nas_eps_message_t *message)
+     return mme_ue;
+ }
+ 
++/**
++ * Check if MME-UE has incomplete sessions that should not be migrated
++ *
++ * A session is considered "incomplete" if any of the following applies:
++ * 1. MME-UE is not in EMM-REGISTERED state
++ * 2. Session has no PDN context (session->session == NULL)
++ * 3. Session has no Bearers
++ * 4. Any Bearer has no TEIDs (sgw_s1u_teid or enb_s1u_teid == 0)
++ * 5. Any Bearer is not in esm_state_active
++ * 6. Session deletion is in progress
++ */
++static bool has_incomplete_sessions(mme_ue_t *mme_ue)
++{
++    mme_sess_t *sess = NULL;
++    mme_bearer_t *bearer = NULL;
++
++    ogs_assert(mme_ue);
++
++    /* No sessions = not incomplete */
++    if (!SESSION_CONTEXT_IS_AVAILABLE(mme_ue)) {
++        return false;
++    }
++
++    /* EMM state check: if not fully registered, sessions are incomplete */
++    if (!OGS_FSM_CHECK(&mme_ue->sm, emm_state_registered)) {
++        ogs_debug("[%s] MME-UE not in EMM-REGISTERED state",
++                  mme_ue->imsi_bcd);
++        return true;
++    }
++
++    /* Check each session */
++    ogs_list_for_each(&mme_ue->sess_list, sess) {
++        /* No PDN context = incomplete */
++        if (!sess->session) {
++            ogs_debug("[%s] Session without PDN context",
++                      mme_ue->imsi_bcd);
++            return true;
++        }
++
++        /* Deletion in progress = incomplete */
++        if (sess->deletion_in_progress) {
++            ogs_debug("[%s] Session deletion in progress",
++                      mme_ue->imsi_bcd);
++            return true;
++        }
++
++        /* No Bearers = incomplete */
++        if (ogs_list_count(&sess->bearer_list) == 0) {
++            ogs_debug("[%s] Session without bearers",
++                      mme_ue->imsi_bcd);
++            return true;
++        }
++
++        /* Check each Bearer */
++        ogs_list_for_each(&sess->bearer_list, bearer) {
++            /* No TEIDs = incomplete (not established) */
++            if (bearer->sgw_s1u_teid == 0 || bearer->enb_s1u_teid == 0) {
++                ogs_debug("[%s] Bearer[EBI:%d] without complete TEIDs "
++                          "(SGW:%u, eNB:%u)",
++                          mme_ue->imsi_bcd, bearer->ebi,
++                          bearer->sgw_s1u_teid, bearer->enb_s1u_teid);
++                return true;
++            }
++
++            /* Bearer not active = incomplete */
++            if (!OGS_FSM_CHECK(&bearer->sm, esm_state_active)) {
++                ogs_debug("[%s] Bearer[EBI:%d] not in esm_state_active",
++                          mme_ue->imsi_bcd, bearer->ebi);
++                return true;
++            }
++        }
++    }
++
++    /* All checks passed = all sessions are complete */
++    return false;
++}
++
+ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
+ {
+     mme_ue_t *old_mme_ue = NULL;
+@@ -3915,6 +3992,23 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
+         if (ogs_pool_index(&mme_ue_pool, mme_ue) !=
+             ogs_pool_index(&mme_ue_pool, old_mme_ue)) {
+             ogs_warn("[%s] OLD UE Context Release", mme_ue->imsi_bcd);
++
++            /* Check for incomplete sessions in ECM-IDLE state */
++            if (ECM_IDLE(old_mme_ue) && has_incomplete_sessions(old_mme_ue)) {
++                ogs_warn("[%s] OLD MME-UE in ECM-IDLE with incomplete sessions",
++                         mme_ue->imsi_bcd);
++                ogs_warn("[%s] Cleaning up old context instead of migration",
++                         mme_ue->imsi_bcd);
++
++                /* Remove old context - UE starts fresh */
++                mme_ue_remove(old_mme_ue);
++
++                /* Set IMSI hash for new UE */
++                ogs_hash_set(self.imsi_ue_hash,
++                            mme_ue->imsi, mme_ue->imsi_len, mme_ue);
++                return OGS_OK;
++            }
++
+             if (ECM_CONNECTED(old_mme_ue)) {
+                 enb_ue_t *enb_ue = enb_ue_find_by_id(old_mme_ue->enb_ue_id);
+                 /* Implcit S1 release */

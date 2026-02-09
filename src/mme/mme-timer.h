@@ -60,6 +60,7 @@ typedef struct mme_timer_cfg_s {
 } mme_timer_cfg_t;
 
 mme_timer_cfg_t *mme_timer_cfg(mme_timer_e id);
+void mme_timer_cfg_init(void);
 
 const char *mme_timer_get_name(mme_timer_e id);
 

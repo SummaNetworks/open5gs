@@ -120,6 +120,23 @@ typedef struct mme_context_s {
         ogs_plmn_id_t plmn_id;
     } access_control[OGS_MAX_NUM_OF_PLMN_PER_MME];
 
+    /* TAC-IMSI Tenant Control */
+    int num_of_tenant_control;
+    struct {
+        char tenant_id[64];
+        uint16_t tac;
+        int num_of_imsi_range;
+        struct {
+            char start_imsi[OGS_MAX_IMSI_BCD_LEN+1];
+            char end_imsi[OGS_MAX_IMSI_BCD_LEN+1];
+            bool is_single;  /* Single IMSI or range */
+        } imsi_range[32];
+        /* TAC-specific Network Name */
+        ogs_nas_network_name_t short_name;  /* Network short name for this TAC */
+        ogs_nas_network_name_t full_name;   /* Network Full Name for this TAC */
+    } tenant_control[16];
+    ogs_thread_mutex_t tenant_control_mutex;  /* Mutex for thread-safe tenant control access */
+
     /* defined in 'nas_ies.h'
      * #define NAS_SECURITY_ALGORITHMS_EIA0        0
      * #define NAS_SECURITY_ALGORITHMS_128_EEA1    1
@@ -162,7 +179,16 @@ typedef struct mme_context_s {
         struct {
             ogs_time_t value;       /* Timer Value(Seconds) */
         } t3402, t3412, t3423;
+        struct {
+            ogs_time_t value;       /* Timer Value(Seconds) */
+            int max_count;          /* Max retry count */
+        } t3413;
     } time;
+
+    /* Paging Failure Policy */
+#define MME_PAGING_FAILURE_POLICY_NO_ACTION         0
+#define MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS   1
+    uint8_t paging_failure_policy;
 } mme_context_t;
 
 typedef struct mme_sgsn_route_s {
@@ -204,6 +230,8 @@ typedef struct mme_pgw_s {
 #define MME_SGSAP_IS_CONNECTED(__mME) \
     ((__mME) && ((__mME)->csmap) && ((__mME)->csmap->vlr) && \
      (OGS_FSM_CHECK(&(__mME)->csmap->vlr->sm, sgsap_state_connected)))
+#define MME_P_TMSI_IS_AVAILABLE(__mME) \
+    (MME_SGSAP_IS_CONNECTED(__mME) && (__mME)->p_tmsi)
 
 typedef struct mme_vlr_s {
     ogs_lnode_t     lnode;
@@ -216,9 +244,9 @@ typedef struct mme_vlr_s {
     uint16_t        ostream_id;     /* vlr_ostream_id generator */
 
     ogs_sockaddr_t  *sa_list;   /* VLR SGsAP Socket Address List */
-    ogs_sockaddr_t  *local_sa_list;   /* VLR SGsAP Socket Local Address List */
 
     ogs_sock_t      *sock;      /* VLR SGsAP Socket */
+    ogs_sockaddr_t  *addr;      /* VLR SGsAP Connected Socket Address */
     ogs_sockopt_t   *option;    /* VLR SGsAP Socket Option */
     ogs_poll_t      *poll;      /* VLR SGsAP Poll */
 } mme_vlr_t;
@@ -246,7 +274,6 @@ typedef struct mme_enb_s {
 
     ogs_fsm_t       sm;         /* A state machine */
 
-    bool            enb_id_presence;
     uint32_t        enb_id;     /* eNB_ID received from eNB */
     ogs_plmn_id_t   plmn_id;    /* eNB PLMN-ID received from eNB */
     ogs_sctp_sock_t sctp;       /* SCTP socket */
@@ -362,11 +389,6 @@ struct mme_ue_s {
         ogs_nas_detach_type_t detach;
     } nas_eps;
 
-#define MME_TAU_TYPE_INITIAL_UE_MESSAGE    1
-#define MME_TAU_TYPE_UPLINK_NAS_TRANPORT   2
-#define MME_TAU_TYPE_UNPROTECTED_INGERITY  3
-    uint8_t tracking_area_update_request_type;
-
     /* 1. MME initiated detach request to the UE.
      *    (nas_eps.type = MME_EPS_TYPE_DETACH_REQUEST_TO_UE)
      * 2. If UE is IDLE, Paging sent to the UE
@@ -383,6 +405,9 @@ struct mme_ue_s {
 #define MME_DETACH_TYPE_MME_IMPLICIT                4
 #define MME_DETACH_TYPE_HSS_IMPLICIT                5
     uint8_t     detach_type;
+
+    /* Purge UE state management */
+    bool        purge_ue_in_progress;
 
     /* UE identity */
 #define MME_UE_HAVE_IMSI(__mME) \
@@ -407,6 +432,7 @@ struct mme_ue_s {
     int             a_msisdn_len;
     char            a_msisdn_bcd[OGS_MAX_MSISDN_BCD_LEN+1];
 
+    mme_p_tmsi_t    p_tmsi;
     struct {
         ogs_pool_id_t   *mme_gn_teid_node; /* A node of MME-Gn-TEID */
         uint32_t        mme_gn_teid;   /* MME-Gn-TEID is derived from NODE */
@@ -419,15 +445,8 @@ struct mme_ue_s {
     } gn;
 
     struct {
-#define MME_NEXT_GUTI_IS_AVAILABLE(__mME) ((__mME)->next.m_tmsi)
-#define MME_CURRENT_GUTI_IS_AVAILABLE(__mME) ((__mME)->current.m_tmsi)
         mme_m_tmsi_t *m_tmsi;
         ogs_nas_eps_guti_t guti;
-#define MME_NEXT_P_TMSI_IS_AVAILABLE(__mME) \
-    (MME_SGSAP_IS_CONNECTED(__mME) && (__mME)->next.p_tmsi)
-#define MME_CURRENT_P_TMSI_IS_AVAILABLE(__mME) \
-    (MME_SGSAP_IS_CONNECTED(__mME) && (__mME)->current.p_tmsi)
-        mme_p_tmsi_t    p_tmsi;
     } current, next;
 
     ogs_pool_id_t   *mme_s11_teid_node; /* A node of MME-S11-TEID */
@@ -669,10 +688,10 @@ struct mme_ue_s {
     } while(0);
 
 #define CS_CALL_SERVICE_INDICATOR(__mME) \
-    (MME_CURRENT_P_TMSI_IS_AVAILABLE(__mME) && \
+    (MME_P_TMSI_IS_AVAILABLE(__mME) && \
      ((__mME)->service_indicator) == SGSAP_CS_CALL_SERVICE_INDICATOR)
 #define SMS_SERVICE_INDICATOR(__mME) \
-    (MME_CURRENT_P_TMSI_IS_AVAILABLE(__mME) && \
+    (MME_P_TMSI_IS_AVAILABLE(__mME) && \
      ((__mME)->service_indicator) == SGSAP_SMS_SERVICE_INDICATOR)
     uint8_t         service_indicator;
 
@@ -796,6 +815,12 @@ typedef struct mme_sess_s {
 
     /* Save Extended Protocol Configuration Options from PGW */
     ogs_tlv_octet_t pgw_epco;
+
+    /* TAU: UE/MME bearer status mismatch flag */
+    bool ue_pdn_status_mismatch;
+
+    /* TAU: PDN deletion in progress flag (DSReq sent, DSResp not yet received) */
+    bool deletion_in_progress;
 } mme_sess_t;
 
 #define MME_HAVE_ENB_S1U_PATH(__bEARER) \
@@ -938,14 +963,11 @@ void mme_pgw_remove_all(void);
 ogs_sockaddr_t *mme_pgw_addr_find_by_apn_enb(
         ogs_list_t *list, int family, const mme_sess_t *sess);
 
-mme_vlr_t *mme_vlr_add(
-        ogs_sockaddr_t *sa_list,
-        ogs_sockaddr_t *local_sa_list,
-        ogs_sockopt_t *option);
+mme_vlr_t *mme_vlr_add(ogs_sockaddr_t *sa_list, ogs_sockopt_t *option);
 void mme_vlr_remove(mme_vlr_t *vlr);
 void mme_vlr_remove_all(void);
 void mme_vlr_close(mme_vlr_t *vlr);
-mme_vlr_t *mme_vlr_find_by_sock(const ogs_sock_t *sock);
+mme_vlr_t *mme_vlr_find_by_addr(const ogs_sockaddr_t *addr);
 
 mme_csmap_t *mme_csmap_add(mme_vlr_t *vlr);
 void mme_csmap_remove(mme_csmap_t *csmap);
@@ -993,12 +1015,6 @@ sgw_relocation_e sgw_ue_check_if_relocated(mme_ue_t *mme_ue);
 
 void mme_ue_new_guti(mme_ue_t *mme_ue);
 void mme_ue_confirm_guti(mme_ue_t *mme_ue);
-
-#define INVALID_P_TMSI 0
-void mme_ue_set_p_tmsi(
-        mme_ue_t *mme_ue,
-        ogs_nas_mobile_identity_tmsi_t *nas_mobile_identity_tmsi);
-void mme_ue_confirm_p_tmsi(mme_ue_t *mme_ue);
 
 mme_ue_t *mme_ue_add(enb_ue_t *enb_ue);
 void mme_ue_remove(mme_ue_t *mme_ue);
@@ -1127,6 +1143,16 @@ void mme_ebi_pool_clear(mme_ue_t *mme_ue);
 
 uint8_t mme_selected_int_algorithm(mme_ue_t *mme_ue);
 uint8_t mme_selected_enc_algorithm(mme_ue_t *mme_ue);
+
+bool mme_check_tenant_access(mme_ue_t *mme_ue, uint16_t tac);
+bool mme_get_network_name_for_tac(uint16_t tac,
+                                   ogs_nas_network_name_t **full_name,
+                                   ogs_nas_network_name_t **short_name);
+
+/* Forward declaration for json_t */
+struct json_t;
+struct json_t *mme_tenant_control_to_json(void);
+struct json_t *mme_reload_tenant_control_with_diff(void);
 
 #ifdef __cplusplus
 }

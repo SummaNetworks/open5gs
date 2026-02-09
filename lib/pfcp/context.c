@@ -26,6 +26,7 @@ static int context_initialized = 0;
 
 static OGS_POOL(ogs_pfcp_node_pool, ogs_pfcp_node_t);
 
+static OGS_POOL(ogs_pfcp_sess_pool, ogs_pfcp_sess_t);
 static OGS_POOL(ogs_pfcp_far_pool, ogs_pfcp_far_t);
 static OGS_POOL(ogs_pfcp_urr_pool, ogs_pfcp_urr_t);
 static OGS_POOL(ogs_pfcp_qer_pool, ogs_pfcp_qer_t);
@@ -53,6 +54,8 @@ void ogs_pfcp_context_init(void)
     ogs_log_install_domain(&__ogs_pfcp_domain, "pfcp", ogs_core()->log.level);
 
     ogs_pool_init(&ogs_pfcp_node_pool, ogs_app()->pool.nf);
+
+    ogs_pool_init(&ogs_pfcp_sess_pool, ogs_app()->pool.sess);
 
     ogs_pool_init(&ogs_pfcp_far_pool,
             ogs_app()->pool.sess * OGS_MAX_NUM_OF_FAR);
@@ -113,6 +116,7 @@ void ogs_pfcp_context_final(void)
     ogs_pool_final(&ogs_pfcp_pdr_teid_pool);
     ogs_free(pdr_random_to_index);
 
+    ogs_pool_final(&ogs_pfcp_sess_pool);
     ogs_pool_final(&ogs_pfcp_far_pool);
     ogs_pool_final(&ogs_pfcp_urr_pool);
     ogs_pool_final(&ogs_pfcp_qer_pool);
@@ -367,7 +371,6 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
                                                 server_key);
                                 }
 
-                                /* Add address information */
                                 addr = NULL;
                                 for (i = 0; i < num; i++) {
                                     rv = ogs_addaddrinfo(&addr,
@@ -375,34 +378,20 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
                                     ogs_assert(rv == OGS_OK);
                                 }
 
-                                /* Add each address as a separate socknode */
                                 if (addr) {
-                                    ogs_sockaddr_t *current = addr;
-                                    while (current) {
-                                        if (current->ogs_sa_family ==
-                                                AF_INET &&
-                                            ogs_global_conf()->
-                                                parameter.no_ipv4 == 0) {
-                                            ogs_socknode_add(&self.pfcp_list,
-                                                             AF_INET, current,
-                                                             is_option ?
-                                                             &option : NULL);
-                                        }
-                                        if (current->ogs_sa_family ==
-                                                AF_INET6 &&
-                                            ogs_global_conf()->
-                                                parameter.no_ipv6 == 0) {
-                                            ogs_socknode_add(&self.pfcp_list6,
-                                                             AF_INET6, current,
-                                                             is_option ?
-                                                             &option : NULL);
-                                        }
-                                        current = current->next;
-                                    }
+                                    if (ogs_global_conf()->
+                                            parameter.no_ipv4 == 0)
+                                        ogs_socknode_add(
+                                            &self.pfcp_list, AF_INET, addr,
+                                            is_option ? &option : NULL);
+                                    if (ogs_global_conf()->
+                                            parameter.no_ipv6 == 0)
+                                        ogs_socknode_add(
+                                            &self.pfcp_list6, AF_INET6, addr,
+                                            is_option ? &option : NULL);
                                     ogs_freeaddrinfo(addr);
                                 }
 
-                                /* Process advertise addresses if needed */
                                 addr = NULL;
                                 for (i = 0; i < num_of_advertise; i++) {
                                     rv = ogs_addaddrinfo(&addr,
@@ -431,7 +420,6 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
                                     ogs_freeaddrinfo(addr);
                                 }
 
-                                /* Bind to device if specified */
                                 if (dev) {
                                     rv = ogs_socknode_probe(
                                             ogs_global_conf()->
@@ -864,67 +852,20 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
     return OGS_OK;
 }
 
-/*--------------------------------------------------------------------------
- * check_any_match():
- * If any node in "list" or the single "single" matches base, return 1
- *--------------------------------------------------------------------------
- */
-static bool check_any_match(ogs_sockaddr_t *base,
-                           ogs_sockaddr_t *list,
-                           const ogs_sockaddr_t *single)
+ogs_pfcp_node_t *ogs_pfcp_node_new(ogs_sockaddr_t *sa_list)
 {
-    ogs_sockaddr_t *p = NULL;
-
-    while (list) {
-        p = base;
-        while (p) {
-            if (ogs_sockaddr_is_equal_addr(p, list))
-                return true;
-            p = p->next;
-        }
-        list = list->next;
-    }
-    if (single) {
-        p = base;
-        while (p) {
-            if (ogs_sockaddr_is_equal_addr(p, single))
-                return true;
-            p = p->next;
-        }
-    }
-    return false;
-}
-
-/*--------------------------------------------------------------------------
- * ogs_pfcp_node_new():
- * Create node with config_addr, copy config_addr into node->addr_list
- *--------------------------------------------------------------------------
- */
-ogs_pfcp_node_t *ogs_pfcp_node_new(ogs_sockaddr_t *config_addr)
-{
-    int rv;
     ogs_pfcp_node_t *node = NULL;
+
+    ogs_assert(sa_list);
 
     ogs_pool_alloc(&ogs_pfcp_node_pool, &node);
     if (!node) {
-        ogs_error("No memory: ogs_pool_alloc() failed [%s]",
-                ogs_sockaddr_to_string_static(config_addr));
+        ogs_error("No memory: ogs_pool_alloc() failed");
         return NULL;
     }
     memset(node, 0, sizeof(ogs_pfcp_node_t));
 
-    /* Store config_addr, if any */
-    node->config_addr = config_addr;
-
-    /* If config_addr is given, copy it immediately into addr_list */
-    if (config_addr) {
-        rv = ogs_copyaddrinfo(&node->addr_list, config_addr);
-        if (rv != OGS_OK) {
-            ogs_error("ogs_copyaddrinfo() failed");
-            ogs_pool_free(&ogs_pfcp_node_pool, node);
-            return NULL;
-        }
-    }
+    node->sa_list = sa_list;
 
     ogs_list_init(&node->local_list);
     ogs_list_init(&node->remote_list);
@@ -942,125 +883,49 @@ void ogs_pfcp_node_free(ogs_pfcp_node_t *node)
 
     ogs_pfcp_xact_delete_all(node);
 
-    ogs_freeaddrinfo(node->config_addr);
-    ogs_freeaddrinfo(node->addr_list);
-
+    ogs_freeaddrinfo(node->sa_list);
     ogs_pool_free(&ogs_pfcp_node_pool, node);
 }
 
-/*--------------------------------------------------------------------------
- * ogs_pfcp_node_add():
- * Create a new node (with config_addr=NULL), set node_id/from,
- * then merge => finally add to list
- *--------------------------------------------------------------------------
- */
-ogs_pfcp_node_t *ogs_pfcp_node_add(ogs_list_t *list,
-    ogs_pfcp_node_id_t *node_id, ogs_sockaddr_t *from)
+ogs_pfcp_node_t *ogs_pfcp_node_add(
+        ogs_list_t *list, ogs_sockaddr_t *addr)
 {
     ogs_pfcp_node_t *node = NULL;
+    ogs_sockaddr_t *new = NULL;
 
     ogs_assert(list);
-    ogs_assert(node_id && from);
+    ogs_assert(addr);
 
-    /* Create node with no config_addr initially */
-    node = ogs_pfcp_node_new(NULL);
+    ogs_assert(OGS_OK == ogs_copyaddrinfo(&new, addr));
+    node = ogs_pfcp_node_new(new);
     if (!node) {
-        ogs_error("No memory: ogs_pfcp_node_add() failed node_id:%s from:%s",
-                ogs_pfcp_node_id_to_string_static(node_id),
-                ogs_sockaddr_to_string_static(from));
+        ogs_error("No memory : ogs_pfcp_node_new() failed");
+        ogs_freeaddrinfo(new);
         return NULL;
     }
 
-    /* Store node_id and from_addr */
-    memcpy(&node->node_id, node_id, sizeof(node->node_id));
-
-    /* Merge them => fill node->addr_list if conditions are met */
-    if (ogs_pfcp_node_merge(node, node_id, from) != OGS_OK) {
-        ogs_error("ogs_pfcp_node_merge() failed node_id [%s] from [%s]",
-                ogs_pfcp_node_id_to_string_static(node_id),
-                ogs_sockaddr_to_string_static(from));
-        ogs_pool_free(&ogs_pfcp_node_pool, node);
-        return NULL;
-    }
+    ogs_assert(node);
+    memcpy(&node->addr, new, sizeof node->addr);
 
     ogs_list_add(list, node);
 
     return node;
 }
 
-/*--------------------------------------------------------------------------
- * ogs_pfcp_node_find():
- * Find a node in the list whose "addr_list" matches node_id or from_addr
- *--------------------------------------------------------------------------
- */
-ogs_pfcp_node_t *ogs_pfcp_node_find(ogs_list_t *list,
-    ogs_pfcp_node_id_t *node_id, ogs_sockaddr_t *from)
+ogs_pfcp_node_t *ogs_pfcp_node_find(
+        ogs_list_t *list, ogs_sockaddr_t *addr)
 {
-    ogs_pfcp_node_t *cur;
-    ogs_sockaddr_t *nid_list = NULL;
-    int found = 0;
+    ogs_pfcp_node_t *node = NULL;
 
     ogs_assert(list);
-    ogs_assert(node_id || from);
+    ogs_assert(addr);
 
-    if (node_id)
-        nid_list = ogs_pfcp_node_id_to_addrinfo(node_id);
-
-    ogs_list_for_each(list, cur) {
-        if (check_any_match(cur->addr_list, nid_list, from)) {
-            found = 1;
+    ogs_list_for_each(list, node) {
+        if (ogs_sockaddr_is_equal(&node->addr, addr) == true)
             break;
-        }
-    }
-    if (nid_list)
-        ogs_freeaddrinfo(nid_list);
-
-    if (found)
-        return cur;
-
-    return NULL;
-}
-
-/*--------------------------------------------------------------------------
- * ogs_pfcp_node_merge():
- * Merge logic: addr_list + node_id + from_addr
- *--------------------------------------------------------------------------
- * - If node->addr_list is empty, copy node->config_addr into addr_list first
- * - Convert node_id to addresses, then check from_addr
- * - If addr_list is empty => merge everything
- * - If addr_list not empty => merge only if there's a matching IP
- */
-int ogs_pfcp_node_merge(ogs_pfcp_node_t *node,
-    ogs_pfcp_node_id_t *node_id, ogs_sockaddr_t *from)
-{
-    ogs_sockaddr_t *nid_list = NULL;
-    ogs_sockaddr_t single;
-
-    ogs_assert(node);
-    ogs_assert(node_id || from);
-
-    /* Convert node_id to a list of addresses */
-    if (node_id) {
-        nid_list = ogs_pfcp_node_id_to_addrinfo(node_id);
-        if (!nid_list) {
-            ogs_error("ogs_pfcp_node_id_to_addrinfo() failed [%d]",
-                    node_id->type);
-            return OGS_ERROR;
-        }
-
-        ogs_merge_addrinfo(&node->addr_list, nid_list);
-        ogs_freeaddrinfo(nid_list);
     }
 
-    /* "from" as single item */
-    if (from) {
-        memcpy(&single, from, sizeof(single));
-        single.next = NULL;
-
-        ogs_merge_addrinfo(&node->addr_list, &single);
-    }
-
-    return OGS_OK;
+    return node;
 }
 
 void ogs_pfcp_node_remove(ogs_list_t *list, ogs_pfcp_node_t *node)
@@ -1080,26 +945,6 @@ void ogs_pfcp_node_remove_all(ogs_list_t *list)
 
     ogs_list_for_each_safe(list, next_node, node)
         ogs_pfcp_node_remove(list, node);
-}
-
-/* Function to compare two node IDs */
-int ogs_pfcp_node_id_compare(
-        const ogs_pfcp_node_id_t *id1, const ogs_pfcp_node_id_t *id2)
-{
-    if (id1->type != id2->type) {
-        return false; /* Types do not match */
-    }
-
-    switch (id1->type) {
-        case OGS_PFCP_NODE_ID_IPV4:
-            return (id1->addr == id2->addr);
-        case OGS_PFCP_NODE_ID_IPV6:
-            return (memcmp(id1->addr6, id2->addr6, OGS_IPV6_LEN) == 0);
-        case OGS_PFCP_NODE_ID_FQDN:
-            return (strcmp(id1->fqdn, id2->fqdn) == 0);
-        default:
-            return false; /* Unknown types do not match */
-    }
 }
 
 ogs_gtpu_resource_t *ogs_pfcp_find_gtpu_resource(ogs_list_t *list,
@@ -1299,7 +1144,6 @@ void ogs_pfcp_pdr_swap_teid(ogs_pfcp_pdr_t *pdr)
     int i = 0;
 
     ogs_assert(pdr);
-    ogs_assert(!pdr->f_teid.ch);
     ogs_assert(pdr->f_teid.teid > 0 &&
             pdr->f_teid.teid <= ogs_pfcp_pdr_teid_pool.size);
 
@@ -1395,8 +1239,9 @@ void ogs_pfcp_object_teid_hash_set(
                 &pdr->hash.teid.key, pdr->hash.teid.len, pdr->sess);
         break;
     default:
-        ogs_fatal("Unknown type [%d]", type);
-        ogs_assert_if_reached();
+        ogs_warn("Unknown type [%d], no matching object found", type);
+        /* Cannot return a value from void function */
+        return;
     }
 }
 
@@ -1482,6 +1327,7 @@ void ogs_pfcp_pdr_associate_qer(ogs_pfcp_pdr_t *pdr, ogs_pfcp_qer_t *qer)
 void ogs_pfcp_pdr_remove(ogs_pfcp_pdr_t *pdr)
 {
     int i;
+    ogs_pfcp_qer_t *qer = NULL;
 
     ogs_assert(pdr);
     ogs_assert(pdr->sess);
@@ -1504,6 +1350,34 @@ void ogs_pfcp_pdr_remove(ogs_pfcp_pdr_t *pdr)
         if (ogs_pfcp_object_count_by_teid(pdr->sess, pdr->f_teid.teid) == 0)
             ogs_hash_set(self.object_teid_hash,
                     &pdr->hash.teid.key, pdr->hash.teid.len, NULL);
+    }
+
+    /*
+     * QER Resource Leak Fix
+     *
+     * QERs are often shared between multiple PDRs (e.g., DL and UL PDRs).
+     * Before removing a QER, check if any other PDRs in the session are still
+     * using it. Only remove the QER if no other PDRs reference it.
+     *
+     * This prevents QER ID pool exhaustion when PDRs are dynamically created
+     * and removed during session modifications.
+     */
+    if (pdr->qer) {
+        ogs_pfcp_pdr_t *other_pdr = NULL;
+        bool qer_in_use = false;
+
+        qer = pdr->qer;
+
+        ogs_list_for_each(&pdr->sess->pdr_list, other_pdr) {
+            if (other_pdr->qer && other_pdr->qer->id == qer->id) {
+                qer_in_use = true;
+                break;
+            }
+        }
+
+        if (!qer_in_use) {
+            ogs_pfcp_qer_remove(qer);
+        }
     }
 
     if (pdr->dnn)
@@ -1786,10 +1660,20 @@ void ogs_pfcp_far_remove(ogs_pfcp_far_t *far)
 {
     int i;
     ogs_pfcp_sess_t *sess = NULL;
+    ogs_pfcp_pdr_t *pdr = NULL;
 
     ogs_assert(far);
     sess = far->sess;
     ogs_assert(sess);
+
+    /* Clear any PDR references to this FAR before removing it */
+    ogs_list_for_each(&sess->pdr_list, pdr) {
+        if (pdr->far == far) {
+            /* Remove reference to the FAR that's being deleted */
+            ogs_debug("Clearing PDR reference to FAR[%d] being removed", far->id);
+            pdr->far = NULL;
+        }
+    }
 
     ogs_list_remove(&sess->far_list, far);
 
@@ -2027,10 +1911,10 @@ void ogs_pfcp_bar_delete(ogs_pfcp_bar_t *bar)
     if (bar->id_node)
         ogs_pool_free(&bar->sess->bar_id_pool, bar->id_node);
 
+    ogs_pool_free(&ogs_pfcp_bar_pool, bar);
+
     bar->sess = NULL;
     sess->bar = NULL;
-
-    ogs_pool_free(&ogs_pfcp_bar_pool, bar);
 }
 
 ogs_pfcp_rule_t *ogs_pfcp_rule_add(ogs_pfcp_pdr_t *pdr)

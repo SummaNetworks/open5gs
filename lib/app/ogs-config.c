@@ -105,7 +105,7 @@ ogs_app_local_conf_t *ogs_local_conf(void)
     return &local_conf;
 }
 
-int ogs_app_global_conf_prepare(void)
+static int global_conf_prepare(void)
 {
     global_conf.sockopt.no_delay = true;
 
@@ -164,6 +164,9 @@ int ogs_app_parse_global_conf(ogs_yaml_iter_t *parent)
     ogs_yaml_iter_t global_iter;
 
     ogs_assert(parent);
+
+    rv = global_conf_prepare();
+    if (rv != OGS_OK) return rv;
 
     ogs_yaml_iter_recurse(parent, &global_iter);
     while (ogs_yaml_iter_next(&global_iter)) {
@@ -246,12 +249,6 @@ int ogs_app_parse_global_conf(ogs_yaml_iter_t *parent)
                         ogs_yaml_iter_bool(&parameter_iter);
                 } else if (!strcmp(parameter_key, "use_openair")) {
                     global_conf.parameter.use_openair =
-                        ogs_yaml_iter_bool(&parameter_iter);
-                } else if (!strcmp(parameter_key, "use_upg_vpp")) {
-                    global_conf.parameter.use_upg_vpp =
-                        ogs_yaml_iter_bool(&parameter_iter);
-                } else if (!strcmp(parameter_key, "fake_csfb")) {
-                    global_conf.parameter.fake_csfb =
                         ogs_yaml_iter_bool(&parameter_iter);
                 } else if (!strcmp(parameter_key,
                             "no_ipv4v6_local_addr_in_packet_filter")) {
@@ -1258,6 +1255,7 @@ ogs_app_slice_conf_t *ogs_app_slice_conf_add(
 
     ogs_assert(policy_conf);
     ogs_assert(s_nssai);
+    ogs_assert(s_nssai->sst);
 
     ogs_pool_alloc(&slice_conf_pool, &slice_conf);
     if (!slice_conf) {
@@ -1288,6 +1286,7 @@ ogs_app_slice_conf_t *ogs_app_slice_conf_find_by_s_nssai(
 
     ogs_assert(policy_conf);
     ogs_assert(s_nssai);
+    ogs_assert(s_nssai->sst);
 
     ogs_list_for_each(&policy_conf->slice_list, slice_conf) {
         if (slice_conf->data.s_nssai.sst == s_nssai->sst &&

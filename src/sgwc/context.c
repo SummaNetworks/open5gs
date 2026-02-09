@@ -408,6 +408,8 @@ static ogs_pfcp_node_t *selected_sgwu_node(
 
 void sgwc_sess_select_sgwu(sgwc_sess_t *sess)
 {
+    char buf[OGS_ADDRSTRLEN];
+
     ogs_assert(sess);
 
     /*
@@ -423,9 +425,8 @@ void sgwc_sess_select_sgwu(sgwc_sess_t *sess)
         selected_sgwu_node(ogs_pfcp_self()->pfcp_node, sess);
     ogs_assert(ogs_pfcp_self()->pfcp_node);
     OGS_SETUP_PFCP_NODE(sess, ogs_pfcp_self()->pfcp_node);
-    ogs_debug("UE using SGW-U on IP %s",
-            ogs_sockaddr_to_string_static(
-                ogs_pfcp_self()->pfcp_node->addr_list));
+    ogs_debug("UE using SGW-U on IP[%s]",
+            OGS_ADDR(&ogs_pfcp_self()->pfcp_node->addr, buf));
 }
 
 int sgwc_sess_remove(sgwc_sess_t *sess)
@@ -647,12 +648,8 @@ sgwc_tunnel_t *sgwc_tunnel_add(
     ogs_pfcp_pdr_t *pdr = NULL;
     ogs_pfcp_far_t *far = NULL;
 
-    ogs_pfcp_interface_t src_if = OGS_PFCP_INTERFACE_UNKNOWN;
-    ogs_pfcp_interface_t dst_if = OGS_PFCP_INTERFACE_UNKNOWN;
-    ogs_pfcp_3gpp_interface_type_t src_if_type =
-        OGS_PFCP_3GPP_INTERFACE_TYPE_UNKNOWN;
-    ogs_pfcp_3gpp_interface_type_t dst_if_type =
-        OGS_PFCP_3GPP_INTERFACE_TYPE_UNKNOWN;
+    uint8_t src_if = OGS_PFCP_INTERFACE_UNKNOWN;
+    uint8_t dst_if = OGS_PFCP_INTERFACE_UNKNOWN;
 
     ogs_assert(bearer);
     sess = sgwc_sess_find_by_id(bearer->sess_id);
@@ -662,28 +659,20 @@ sgwc_tunnel_t *sgwc_tunnel_add(
     /* Downlink */
     case OGS_GTP2_F_TEID_S5_S8_SGW_GTP_U:
         src_if = OGS_PFCP_INTERFACE_CORE;
-        src_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_S5_S8_U;
         dst_if = OGS_PFCP_INTERFACE_ACCESS;
-        dst_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_S1_U;
         break;
 
     /* Uplink */
     case OGS_GTP2_F_TEID_S1_U_SGW_GTP_U:
         src_if = OGS_PFCP_INTERFACE_ACCESS;
-        src_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_S1_U;
         dst_if = OGS_PFCP_INTERFACE_CORE;
-        dst_if_type = OGS_PFCP_3GPP_INTERFACE_TYPE_S5_S8_U;
         break;
 
     /* Indirect */
     case OGS_GTP2_F_TEID_SGW_GTP_U_FOR_DL_DATA_FORWARDING:
     case OGS_GTP2_F_TEID_SGW_GTP_U_FOR_UL_DATA_FORWARDING:
         src_if = OGS_PFCP_INTERFACE_ACCESS;
-        src_if_type =
-            OGS_PFCP_3GPP_INTERFACE_TYPE_SGW_UPF_GTP_U_FOR_UL_DATA_FORWARDING;
         dst_if = OGS_PFCP_INTERFACE_ACCESS;
-        dst_if_type =
-            OGS_PFCP_3GPP_INTERFACE_TYPE_SGW_UPF_GTP_U_FOR_DL_DATA_FORWARDING;
         break;
     default:
         ogs_fatal("Invalid interface type = %d", interface_type);
@@ -704,9 +693,6 @@ sgwc_tunnel_t *sgwc_tunnel_add(
 
     pdr->src_if = src_if;
 
-    pdr->src_if_type_presence = true;
-    pdr->src_if_type = src_if_type;
-
     far = ogs_pfcp_far_add(&sess->pfcp);
     ogs_assert(far);
 
@@ -715,10 +701,6 @@ sgwc_tunnel_t *sgwc_tunnel_add(
     ogs_assert(far->apn);
 
     far->dst_if = dst_if;
-
-    far->dst_if_type_presence = true;
-    far->dst_if_type = dst_if_type;
-
     ogs_pfcp_pdr_associate_far(pdr, far);
 
     far->apply_action =
@@ -760,15 +742,14 @@ sgwc_tunnel_t *sgwc_tunnel_add(
             else
                 tunnel->local_teid = pdr->teid;
         } else {
-            ogs_assert(sess->pfcp_node->addr_list);
-            if (sess->pfcp_node->addr_list->ogs_sa_family == AF_INET)
+            if (sess->pfcp_node->addr.ogs_sa_family == AF_INET)
                 ogs_assert(OGS_OK ==
                     ogs_copyaddrinfo(
-                        &tunnel->local_addr, sess->pfcp_node->addr_list));
-            else if (sess->pfcp_node->addr_list->ogs_sa_family == AF_INET6)
+                        &tunnel->local_addr, &sess->pfcp_node->addr));
+            else if (sess->pfcp_node->addr.ogs_sa_family == AF_INET6)
                 ogs_assert(OGS_OK ==
                     ogs_copyaddrinfo(
-                        &tunnel->local_addr6, sess->pfcp_node->addr_list));
+                        &tunnel->local_addr6, &sess->pfcp_node->addr));
             else
                 ogs_assert_if_reached();
 

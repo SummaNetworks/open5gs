@@ -44,6 +44,8 @@ const char *smf_timer_get_name(int timer_id)
         return "SMF_TIMER_PFCP_NO_ESTABLISHMENT_RESPONSE";
     case SMF_TIMER_PFCP_NO_DELETION_RESPONSE:
         return "SMF_TIMER_PFCP_NO_DELETION_RESPONSE";
+    case SMF_TIMER_GTP_NODE_CLEANUP:
+        return "SMF_TIMER_GTP_NODE_CLEANUP";
     default: 
        break;
     }
@@ -88,4 +90,64 @@ void smf_timer_pfcp_association(void *data)
 void smf_timer_pfcp_no_heartbeat(void *data)
 {
     timer_send_event(SMF_TIMER_PFCP_NO_HEARTBEAT, data);
+}
+
+void smf_timer_gtp_node_cleanup(void *data)
+{
+    ogs_gtp_node_t *gnode = NULL, *next_gnode = NULL;
+    char buf[OGS_ADDRSTRLEN];
+    int removed_count = 0;
+    int total_count = 0;
+
+    /* Check if cleanup is enabled */
+    if (!smf_self()->gtp_node_cleanup_enabled) {
+        ogs_debug("GTP node cleanup is disabled - timer stopped");
+        return;
+    }
+
+    ogs_info("GTP node cleanup cycle starting...");
+
+    /* SMF-specific cleanup: free wrapper nodes first */
+    ogs_time_t now = ogs_get_monotonic_time();
+    ogs_time_t idle_threshold = 2 * 60 * 1000000; /* 2 minutes in microseconds (reduced from 5 min) */
+    
+    ogs_list_for_each_safe(&smf_self()->sgw_s5c_list, next_gnode, gnode) {
+        total_count++;
+        
+        int local_count = ogs_list_count(&gnode->local_list);
+        int remote_count = ogs_list_count(&gnode->remote_list);
+        ogs_time_t idle_time = now - gnode->last_activity;
+        
+        /* Remove nodes with no active transactions AND idle for more than 2 minutes */
+        if (local_count == 0 && remote_count == 0 && idle_time > idle_threshold) {
+            smf_gtp_node_t *smf_gnode = gnode->data_ptr;
+            
+            ogs_info("Removing idle SMF GTP node [%s]:%d (idle for %ld seconds, no transactions)", 
+                    OGS_ADDR(&gnode->addr, buf), OGS_PORT(&gnode->addr),
+                    (long)(idle_time / 1000000));
+            
+            /* Free SMF wrapper first */
+            if (smf_gnode) {
+                smf_gtp_node_free(smf_gnode);
+            }
+            
+            /* Then remove the underlying GTP node */
+            ogs_gtp_node_remove(&smf_self()->sgw_s5c_list, gnode);
+            removed_count++;
+        } else {
+            ogs_debug("Keeping GTP node [%s]:%d (idle:%ld sec, local:%d, remote:%d transactions)", 
+                    OGS_ADDR(&gnode->addr, buf), OGS_PORT(&gnode->addr),
+                    (long)(idle_time / 1000000), local_count, remote_count);
+        }
+    }
+
+    if (removed_count > 0) {
+        ogs_info("SMF GTP node cleanup: removed %d idle nodes, %d nodes remaining", 
+                removed_count, total_count - removed_count);
+    } else if (total_count > 0) {
+        ogs_debug("SMF GTP node cleanup: no idle nodes found, %d nodes active", total_count);
+    }
+    
+    /* Restart the timer for next cleanup cycle (reduced from 60s to 30s) */
+    ogs_timer_start(smf_self()->t_gtp_node_cleanup, ogs_time_from_sec(30));
 }

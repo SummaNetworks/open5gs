@@ -149,6 +149,17 @@ void emm_state_registered(ogs_fsm_t *s, mme_event_t *e)
 
                 if (MME_PAGING_ONGOING(mme_ue))
                     mme_send_after_paging(mme_ue, true);
+
+                /* If paging failure policy triggered session deletion and no sessions remain,
+                 * transition to exception state for cleanup */
+                if (mme_self()->paging_failure_policy ==
+                        MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS) {
+                    if (!MME_SESSION_RELEASE_PENDING(mme_ue)) {
+                        ogs_warn("[%s] No sessions pending after paging failure, "
+                                "transitioning to exception state", mme_ue->imsi_bcd);
+                        OGS_FSM_TRAN(&mme_ue->sm, &emm_state_exception);
+                    }
+                }
             } else {
                 mme_ue->t3413.retry_count++;
                 /*
@@ -245,10 +256,10 @@ void emm_state_registered(ogs_fsm_t *s, mme_event_t *e)
          * detach timer such that the sum of the timer values is greater than
          * timer T3346.
          */
-            ogs_debug("[%s] Starting Implicit Detach timer",
+            ogs_debug("[%s] Starting Implicit Detach timer (120s)",
                 mme_ue->imsi_bcd);
             ogs_timer_start(mme_ue->t_implicit_detach.timer,
-                ogs_time_from_sec(mme_self()->time.t3412.value + 240));
+                ogs_time_from_sec(120));
             break;
 
         case MME_TIMER_IMPLICIT_DETACH:
@@ -258,16 +269,33 @@ void emm_state_registered(ogs_fsm_t *s, mme_event_t *e)
             /* TS 24.301 5.3.5
              * If the implicit detach timer expires before the UE contacts
              * the network, the network shall implicitly detach the UE.
+             *
+             * TS 29.272 7.2.14
+             * The MME should send Purge-UE-Request to HSS before removing
+             * the UE context.
              */
             mme_ue->detach_type = MME_DETACH_TYPE_MME_IMPLICIT;
-            if (MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+            if (MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
                 ogs_assert(OGS_OK == sgsap_send_detach_indication(mme_ue));
             } else {
                 enb_ue_t *enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
-                if (enb_ue)
+
+                /* Send Purge-UE-Request to HSS (3GPP TS 29.272 7.2.14)
+                 * This is sent even if enb_ue is already removed, as the PUR
+                 * message only requires mme_ue data (IMSI). */
+                mme_ue->purge_ue_in_progress = true;
+                mme_s6a_send_pur(enb_ue, mme_ue);
+                ogs_debug("[%s] Purge-UE-Request sent to HSS",
+                    mme_ue->imsi_bcd);
+
+                /* Perform normal implicit detach procedure */
+                if (enb_ue) {
                     mme_send_delete_session_or_detach(enb_ue, mme_ue);
-                else
-                    ogs_error("ENB-S1 Context has already been removed");
+                } else {
+                    ogs_warn("[%s] ENB-S1 Context has already been removed, "
+                        "cannot send Delete Session Request without S1 context",
+                        mme_ue->imsi_bcd);
+                }
             }
 
             OGS_FSM_TRAN(s, &emm_state_de_registered);
@@ -519,8 +547,6 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                              rai.lai.lac, rai.rac);
                     r = nas_eps_send_tau_reject(enb_ue, mme_ue,
                     OGS_NAS_EMM_CAUSE_UE_IDENTITY_CANNOT_BE_DERIVED_BY_THE_NETWORK);
-                    ogs_expect(r == OGS_OK);
-                    ogs_assert(r != OGS_ERROR);
                     OGS_FSM_TRAN(s, &emm_state_exception);
                     break;
                 }
@@ -639,36 +665,63 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
              * 10. UplinkNASTransport + Tracking area update complete (Target)
              */
 
-            /* Update CSMAP from Tracking area update request */
-            mme_ue->csmap = mme_csmap_find_by_tai(&mme_ue->tai);
-            if (mme_ue->csmap &&
-                mme_ue->network_access_mode ==
-                    OGS_NETWORK_ACCESS_MODE_PACKET_AND_CIRCUIT &&
-                (mme_ue->nas_eps.update.value ==
-                 OGS_NAS_EPS_UPDATE_TYPE_COMBINED_TA_LA_UPDATING ||
-                 mme_ue->nas_eps.update.value ==
-                 OGS_NAS_EPS_UPDATE_TYPE_COMBINED_TA_LA_UPDATING_WITH_IMSI_ATTACH)) {
+            if (e->s1ap_code == S1AP_ProcedureCode_id_initialUEMessage) {
+                ogs_debug("    Iniital UE Message");
 
-                if (e->s1ap_code == S1AP_ProcedureCode_id_initialUEMessage)
-                    mme_ue->tracking_area_update_request_type =
-                        MME_TAU_TYPE_INITIAL_UE_MESSAGE;
-                else if (e->s1ap_code ==
-                        S1AP_ProcedureCode_id_uplinkNASTransport)
-                    mme_ue->tracking_area_update_request_type =
-                        MME_TAU_TYPE_UPLINK_NAS_TRANPORT;
-                else {
-                    ogs_error("Invalid Procedure Code[%d]", (int)e->s1ap_code);
-                    break;
+                /* Local deactivation of PDN sessions with bearer status mismatch
+                 * (3GPP TS 24.301: MME shall deactivate EPS bearer contexts locally
+                 * without peer-to-peer ESM signalling to the UE) */
+                {
+                    mme_sess_t *sess = NULL, *next_sess = NULL;
+                    sgw_ue_t *sgw_ue = sgw_ue_find_by_id(mme_ue->sgw_ue_id);
+                    ogs_assert(sgw_ue);
+
+                    ogs_list_for_each_safe(&mme_ue->sess_list, next_sess, sess) {
+                        if (sess->ue_pdn_status_mismatch) {
+                            mme_bearer_t *default_bearer =
+                                mme_default_bearer_in_sess(sess);
+
+                            ogs_info("[%s] Locally deactivating PDN[APN:%s,EBI:%d] "
+                                    "due to UE bearer status mismatch",
+                                    mme_ue->imsi_bcd,
+                                    sess->session ? sess->session->name : "unknown",
+                                    default_bearer ? default_bearer->ebi : 0);
+
+                            /* Send Delete Session Request to SGW/PGW
+                             * with OGS_GTP_DELETE_NO_ACTION to prevent
+                             * sending Deactivate Bearer Context Request to UE
+                             * and E-RAB Release to eNB */
+                            if (MME_HAVE_SGW_S1U_PATH(sess)) {
+                                mme_gtp_send_delete_session_request(
+                                    enb_ue, sgw_ue, sess,
+                                    OGS_GTP_DELETE_NO_ACTION);
+
+                                /* Mark session deletion in progress to exclude from TAU Accept */
+                                sess->deletion_in_progress = true;
+                            } else {
+                                /* No SGW S1U path, directly remove session */
+                                MME_SESS_CLEAR(sess);
+                            }
+
+                            /* Clear mismatch flag */
+                            sess->ue_pdn_status_mismatch = false;
+                        }
+                    }
+
+                    /* Check if any PDN/bearer remains after local deactivation */
+                    if (!SESSION_CONTEXT_IS_AVAILABLE(mme_ue)) {
+                        ogs_warn("[%s] No PDN Connection after bearer sync",
+                                mme_ue->imsi_bcd);
+                        r = nas_eps_send_tau_reject(enb_ue, mme_ue,
+                            OGS_NAS_EMM_CAUSE_NO_EPS_BEARER_CONTEXT_ACTIVATED);
+                        ogs_expect(r == OGS_OK);
+                        ogs_assert(r != OGS_ERROR);
+                        OGS_FSM_TRAN(s, emm_state_exception);
+                        break;
+                    }
                 }
 
-                ogs_assert(OGS_OK ==
-                    sgsap_send_location_update_request(mme_ue));
-
-            } else {
-
-                if (e->s1ap_code == S1AP_ProcedureCode_id_initialUEMessage) {
-                    ogs_debug("    Initial UE Message");
-                    if (mme_ue->nas_eps.update.active_flag) {
+                if (mme_ue->nas_eps.update.active_flag) {
 
     /*
      * TS33.401
@@ -681,52 +734,39 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
      * UP data or pending downlink signalling, radio bearers will be established
      * as part of the TAU procedure and a KeNB derivation is necessary.
      */
-                        ogs_kdf_kenb(mme_ue->kasme, mme_ue->ul_count.i32,
-                                mme_ue->kenb);
-                        ogs_kdf_nh_enb(mme_ue->kasme, mme_ue->kenb, mme_ue->nh);
-                        mme_ue->nhcc = 1;
+                    ogs_kdf_kenb(mme_ue->kasme, mme_ue->ul_count.i32,
+                            mme_ue->kenb);
+                    ogs_kdf_nh_enb(mme_ue->kasme, mme_ue->kenb, mme_ue->nh);
+                    mme_ue->nhcc = 1;
 
-                        r = nas_eps_send_tau_accept(mme_ue,
-                                S1AP_ProcedureCode_id_InitialContextSetup);
-                        ogs_expect(r == OGS_OK);
-                        ogs_assert(r != OGS_ERROR);
-                    } else {
-                        r = nas_eps_send_tau_accept(mme_ue,
-                                S1AP_ProcedureCode_id_downlinkNASTransport);
-                        ogs_expect(r == OGS_OK);
-                        ogs_assert(r != OGS_ERROR);
-                    }
-                } else if (e->s1ap_code ==
-                        S1AP_ProcedureCode_id_uplinkNASTransport) {
-                    ogs_debug("    Uplink NAS Transport");
+                    r = nas_eps_send_tau_accept(mme_ue,
+                            S1AP_ProcedureCode_id_InitialContextSetup);
+                    ogs_expect(r == OGS_OK);
+                    ogs_assert(r != OGS_ERROR);
+                } else {
                     r = nas_eps_send_tau_accept(mme_ue,
                             S1AP_ProcedureCode_id_downlinkNASTransport);
                     ogs_expect(r == OGS_OK);
                     ogs_assert(r != OGS_ERROR);
-                } else {
-                    ogs_error("Invalid Procedure Code[%d]", (int)e->s1ap_code);
-                    break;
                 }
-
-        /*
-         * When active_flag is 0, check if the P-TMSI has been updated.
-         * If the P-TMSI has changed, wait to receive the TAU Complete message
-         * from the UE before sending the UEContextReleaseCommand.
-         *
-         * This ensures that the UE has acknowledged the new P-TMSI,
-         * allowing the TAU procedure to complete successfully
-         * and maintaining synchronization between the UE and the network.
-         */
-                if (!mme_ue->nas_eps.update.active_flag &&
-                    !MME_NEXT_P_TMSI_IS_AVAILABLE(mme_ue)) {
-                    enb_ue->relcause.group = S1AP_Cause_PR_nas;
-                    enb_ue->relcause.cause = S1AP_CauseNas_normal_release;
-                    mme_send_release_access_bearer_or_ue_context_release(
-                            enb_ue);
-                }
+            } else if (e->s1ap_code ==
+                    S1AP_ProcedureCode_id_uplinkNASTransport) {
+                ogs_debug("    Uplink NAS Transport");
+                r = nas_eps_send_tau_accept(mme_ue,
+                        S1AP_ProcedureCode_id_downlinkNASTransport);
+                ogs_expect(r == OGS_OK);
+                ogs_assert(r != OGS_ERROR);
+            } else {
+                ogs_fatal("Invalid Procedure Code[%d]", (int)e->s1ap_code);
             }
 
-            if (MME_NEXT_GUTI_IS_AVAILABLE(mme_ue)) {
+            if (!mme_ue->nas_eps.update.active_flag) {
+                enb_ue->relcause.group = S1AP_Cause_PR_nas;
+                enb_ue->relcause.cause = S1AP_CauseNas_normal_release;
+                mme_send_release_access_bearer_or_ue_context_release(enb_ue);
+            }
+
+            if (mme_ue->next.m_tmsi) {
                 ogs_fatal("MME does not create new GUTI");
                 ogs_assert_if_reached();
                 OGS_FSM_TRAN(s, &emm_state_initial_context_setup);
@@ -786,17 +826,12 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
             if (e->s1ap_code == S1AP_ProcedureCode_id_initialUEMessage) {
                 ogs_debug("    Initial UE Message");
 
-                if (!MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
-                    ogs_warn("No P-TMSI : UE[%s]", mme_ue->imsi_bcd);
-                    r = nas_eps_send_service_reject(enb_ue, mme_ue,
-                        OGS_NAS_EMM_CAUSE_UE_IDENTITY_CANNOT_BE_DERIVED_BY_THE_NETWORK);
-                    ogs_expect(r == OGS_OK);
-                    ogs_assert(r != OGS_ERROR);
-                    enb_ue->relcause.group = S1AP_Cause_PR_nas;
-                    enb_ue->relcause.cause = S1AP_CauseNas_normal_release;
-                    mme_send_release_access_bearer_or_ue_context_release(
-                            enb_ue);
-                    break;
+                if (!MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
+                    /* Generate P-TMSI if not available */
+                    ogs_warn("P-TMSI not available for UE[%s] - Generating new one", mme_ue->imsi_bcd);
+                    uint32_t tmsi = ogs_random32();
+                    mme_ue->p_tmsi = tmsi;
+                    mme_ue->current.guti.m_tmsi = tmsi;
                 }
 
                 if (mme_ue->nas_eps.service.value ==
@@ -805,8 +840,16 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                     OGS_NAS_SERVICE_TYPE_CS_FALLBACK_EMERGENCY_CALL_FROM_UE) {
                     ogs_debug("    MO-CSFB-INDICATION[%d]",
                             mme_ue->nas_eps.service.value);
-                    ogs_assert(OGS_OK ==
-                        sgsap_send_mo_csfb_indication(mme_ue));
+                    int rv = sgsap_send_mo_csfb_indication(mme_ue);
+                    if (rv != OGS_OK) {
+                        ogs_error("Failed to send MO-CSFB-INDICATION for UE[%s]", mme_ue->imsi_bcd);
+                        r = nas_eps_send_service_reject(enb_ue, mme_ue,
+                            OGS_NAS_EMM_CAUSE_CS_DOMAIN_NOT_AVAILABLE);
+                        ogs_expect(r == OGS_OK);
+                        ogs_assert(r != OGS_ERROR);
+                        OGS_FSM_TRAN(s, &emm_state_exception);
+                        break;
+                    }
                 } else if (mme_ue->nas_eps.service.value ==
                         OGS_NAS_SERVICE_TYPE_CS_FALLBACK_TO_UE) {
                     ogs_debug("    SERVICE_REQUEST[%d]",
@@ -833,7 +876,7 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                     S1AP_ProcedureCode_id_uplinkNASTransport) {
                 ogs_debug("    Uplink NAS Transport");
 
-                if (!MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+                if (!MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
                     ogs_warn("No P-TMSI : UE[%s]", mme_ue->imsi_bcd);
                     r = nas_eps_send_service_reject(enb_ue, mme_ue,
                         OGS_NAS_EMM_CAUSE_UE_IDENTITY_CANNOT_BE_DERIVED_BY_THE_NETWORK);
@@ -848,8 +891,16 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                     OGS_NAS_SERVICE_TYPE_CS_FALLBACK_EMERGENCY_CALL_FROM_UE) {
                     ogs_debug("    MO-CSFB-INDICATION[%d]",
                             mme_ue->nas_eps.service.value);
-                    ogs_assert(OGS_OK ==
-                        sgsap_send_mo_csfb_indication(mme_ue));
+                    int rv = sgsap_send_mo_csfb_indication(mme_ue);
+                    if (rv != OGS_OK) {
+                        ogs_error("Failed to send MO-CSFB-INDICATION for UE[%s]", mme_ue->imsi_bcd);
+                        r = nas_eps_send_service_reject(enb_ue, mme_ue,
+                            OGS_NAS_EMM_CAUSE_CS_DOMAIN_NOT_AVAILABLE);
+                        ogs_expect(r == OGS_OK);
+                        ogs_assert(r != OGS_ERROR);
+                        OGS_FSM_TRAN(s, &emm_state_exception);
+                        break;
+                    }
                 } else if (mme_ue->nas_eps.service.value ==
                         OGS_NAS_SERVICE_TYPE_CS_FALLBACK_TO_UE) {
                     ogs_debug("    SERVICE_REQUEST[%d]",
@@ -916,7 +967,7 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
              */
             CLEAR_S1_CONTEXT(mme_ue);
 
-            if (MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+            if (MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
                 ogs_assert(OGS_OK == sgsap_send_detach_indication(mme_ue));
             } else {
                 mme_send_delete_session_or_detach(enb_ue, mme_ue);
@@ -974,62 +1025,8 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
             break;
 
         case OGS_NAS_EPS_TRACKING_AREA_UPDATE_COMPLETE:
-            ogs_info("[%s] Tracking area update complete", mme_ue->imsi_bcd);
-
-        /*
-         * TS24.301
-         * Section 4.4.4.3
-         * Integrity checking of NAS signalling messages in the MME:
-         *
-         * Once the secure exchange of NAS messages has been established
-         * for the NAS signalling connection, the receiving EMM or ESM entity
-         * in the MME shall not process any NAS signalling messages
-         * unless they have been successfully integrity checked by the NAS.
-         * If any NAS signalling message, having not successfully passed
-         * the integrity check, is received, then the NAS in the MME shall
-         * discard that message. If any NAS signalling message is received,
-         * as not integrity protected even though the secure exchange
-         * of NAS messages has been established, then the NAS shall discard
-         * this message.
-         */
-            h.type = e->nas_type;
-            if (h.integrity_protected == 0) {
-                ogs_error("[%s] No Integrity Protected", mme_ue->imsi_bcd);
-                break;
-            }
-
-            if (!SECURITY_CONTEXT_IS_VALID(mme_ue)) {
-                ogs_error("[%s] No Security Context", mme_ue->imsi_bcd);
-                break;
-            }
-
-            /*
-             * If the OLD ENB_UE is being maintained in MME-UE Context,
-             * it deletes the S1 Context after exchanging
-             * the UEContextReleaseCommand/Complete with the eNB
-             */
-            CLEAR_S1_CONTEXT(mme_ue);
-
-            CLEAR_MME_UE_TIMER(mme_ue->t3450);
-
-            /* Confirm GUTI */
-            if (MME_NEXT_GUTI_IS_AVAILABLE(mme_ue))
-                mme_ue_confirm_guti(mme_ue);
-
-            /* Confirm P-TMSI */
-            if (MME_NEXT_P_TMSI_IS_AVAILABLE(mme_ue)) {
-                mme_ue_confirm_p_tmsi(mme_ue);
-
-                ogs_assert(OGS_OK ==
-                    sgsap_send_tmsi_reallocation_complete(mme_ue));
-
-                if (!mme_ue->nas_eps.update.active_flag) {
-                    enb_ue->relcause.group = S1AP_Cause_PR_nas;
-                    enb_ue->relcause.cause = S1AP_CauseNas_normal_release;
-                    mme_send_release_access_bearer_or_ue_context_release(
-                            enb_ue);
-                }
-            }
+            ogs_error("[%s] Tracking area update complete in INVALID-STATE",
+                        mme_ue->imsi_bcd);
             break;
 
         default:
@@ -1213,7 +1210,7 @@ void emm_state_authentication(ogs_fsm_t *s, mme_event_t *e)
              */
             CLEAR_S1_CONTEXT(mme_ue);
 
-            if (MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+            if (MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
                 ogs_assert(OGS_OK == sgsap_send_detach_indication(mme_ue));
             } else {
                 mme_send_delete_session_or_detach(enb_ue, mme_ue);
@@ -1379,7 +1376,7 @@ void emm_state_security_mode(ogs_fsm_t *s, mme_event_t *e)
 
             mme_s6a_send_ulr(enb_ue, mme_ue);
 
-            if (MME_NEXT_GUTI_IS_AVAILABLE(mme_ue)) {
+            if (mme_ue->next.m_tmsi) {
                 OGS_FSM_TRAN(s, &emm_state_initial_context_setup);
             } else {
                 ogs_fatal("MME always creates new GUTI");
@@ -1454,7 +1451,7 @@ void emm_state_security_mode(ogs_fsm_t *s, mme_event_t *e)
              */
             CLEAR_S1_CONTEXT(mme_ue);
 
-            if (MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+            if (MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
                 ogs_assert(OGS_OK == sgsap_send_detach_indication(mme_ue));
             } else {
                 mme_send_delete_session_or_detach(enb_ue, mme_ue);
@@ -1592,21 +1589,18 @@ void emm_state_initial_context_setup(ogs_fsm_t *s, mme_event_t *e)
             }
 
             /* Confirm GUTI */
-            if (MME_NEXT_GUTI_IS_AVAILABLE(mme_ue))
+            if (mme_ue->next.m_tmsi)
                 mme_ue_confirm_guti(mme_ue);
 
-            /* Confirm P-TMSI */
-            if (MME_NEXT_P_TMSI_IS_AVAILABLE(mme_ue)) {
-                mme_ue_confirm_p_tmsi(mme_ue);
+            if (MME_P_TMSI_IS_AVAILABLE(mme_ue))
                 ogs_assert(OGS_OK ==
                     sgsap_send_tmsi_reallocation_complete(mme_ue));
-            }
 
             OGS_FSM_TRAN(s, &emm_state_registered);
             break;
 
         case OGS_NAS_EPS_TRACKING_AREA_UPDATE_COMPLETE:
-            ogs_info("[%s] Tracking area update complete", mme_ue->imsi_bcd);
+            ogs_debug("[%s] Tracking area update complete", mme_ue->imsi_bcd);
 
         /*
          * TS24.301
@@ -1645,23 +1639,8 @@ void emm_state_initial_context_setup(ogs_fsm_t *s, mme_event_t *e)
             CLEAR_MME_UE_TIMER(mme_ue->t3450);
 
             /* Confirm GUTI */
-            if (MME_NEXT_GUTI_IS_AVAILABLE(mme_ue))
+            if (mme_ue->next.m_tmsi)
                 mme_ue_confirm_guti(mme_ue);
-
-            /* Confirm P-TMSI */
-            if (MME_NEXT_P_TMSI_IS_AVAILABLE(mme_ue)) {
-                mme_ue_confirm_p_tmsi(mme_ue);
-
-                ogs_assert(OGS_OK ==
-                    sgsap_send_tmsi_reallocation_complete(mme_ue));
-
-                if (!mme_ue->nas_eps.update.active_flag) {
-                    enb_ue->relcause.group = S1AP_Cause_PR_nas;
-                    enb_ue->relcause.cause = S1AP_CauseNas_normal_release;
-                    mme_send_release_access_bearer_or_ue_context_release(
-                            enb_ue);
-                }
-            }
 
             OGS_FSM_TRAN(s, &emm_state_registered);
             break;
@@ -1727,7 +1706,7 @@ void emm_state_initial_context_setup(ogs_fsm_t *s, mme_event_t *e)
              */
             CLEAR_S1_CONTEXT(mme_ue);
 
-            if (MME_CURRENT_P_TMSI_IS_AVAILABLE(mme_ue)) {
+            if (MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
                 ogs_assert(OGS_OK == sgsap_send_detach_indication(mme_ue));
             } else {
                 mme_send_delete_session_or_detach(enb_ue, mme_ue);

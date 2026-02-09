@@ -730,8 +730,17 @@ void mme_s11_handle_delete_session_response(
     }
 
     if (!enb_ue) {
-        ogs_error("ENB-S1 Context has already been removed");
-        return;
+        /* For OGS_GTP_DELETE_NO_ACTION (local deactivation during TAU),
+         * enb_ue might already be NULL because UE Context Release
+         * can happen before Delete Session Response arrives.
+         * We still need to clean up the session to prevent zombie sessions.
+         * For other actions, enb_ue is required for signaling. */
+        if (action != OGS_GTP_DELETE_NO_ACTION) {
+            ogs_error("ENB-S1 Context has already been removed");
+            return;
+        }
+        ogs_warn("ENB-S1 Context not available, proceeding with session cleanup "
+                 "for local deactivation (action=%d)", action);
     }
 
     if (!mme_ue) {
@@ -1374,12 +1383,45 @@ void mme_s11_handle_delete_bearer_request(
     ogs_assert(xact->id >= OGS_MIN_POOL_ID && xact->id <= OGS_MAX_POOL_ID);
     bearer->delete.xact_id = xact->id;
 
+    /* 
+     * According to 3GPP TS 23.401 section 5.4.4.1, MME must NOT initiate
+     * Network-Initiated Service Request procedure if all three conditions are true:
+     * 1) The UE is in ECM-IDLE
+     * 2) The last PDN connection of the UE is not being deleted
+     * 3) The Delete Bearer Request received from the Serving GW does not
+     *    contain the cause 'reactivation requested'
+     */
     if (ECM_IDLE(mme_ue)) {
-        MME_STORE_PAGING_INFO(mme_ue,
-            MME_PAGING_TYPE_DELETE_BEARER, bearer->id);
-        r = s1ap_send_paging(mme_ue, S1AP_CNDomain_ps);
-        ogs_expect(r == OGS_OK);
-        ogs_assert(r != OGS_ERROR);
+        bool skip_paging = true;
+
+        /* Check if this is the last PDN connection */
+        if (req->linked_eps_bearer_id.presence == 1) {
+            /* This is a default bearer deletion = PDN deletion, so don't skip paging */
+            skip_paging = false;
+            ogs_debug("    Delete Bearer Request for Default Bearer - PDN disconnect");
+        }
+
+        /* Check if 'reactivation requested' cause is present */
+        if (req->cause.presence && 
+            req->cause.data && 
+            ((ogs_gtp2_cause_t *)req->cause.data)->value == OGS_GTP2_CAUSE_REACTIVATION_REQUESTED) {
+            skip_paging = false;
+            ogs_debug("    Reactivation requested - initiate paging");
+        }
+
+        if (skip_paging) {
+            /* Skip paging and locally delete the bearer */
+            ogs_debug("    UE in ECM-IDLE - locally deleting bearer without paging");
+            mme_gtp_send_delete_bearer_response(bearer, OGS_GTP2_CAUSE_REQUEST_ACCEPTED);
+            /* Bearer is implicitly deleted after sending the response */
+        } else {
+            /* Proceed with normal paging procedure */
+            MME_STORE_PAGING_INFO(mme_ue,
+                MME_PAGING_TYPE_DELETE_BEARER, bearer->id);
+            r = s1ap_send_paging(mme_ue, S1AP_CNDomain_ps);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+        }
     } else {
         MME_CLEAR_PAGING_INFO(mme_ue);
         r = nas_eps_send_deactivate_bearer_context_request(bearer);
@@ -1645,11 +1687,34 @@ void mme_s11_handle_downlink_data_notification(
  * before step 9, the MME shall not send S1 interface paging messages
  */
     if (ECM_IDLE(mme_ue)) {
-        MME_STORE_PAGING_INFO(mme_ue,
-            MME_PAGING_TYPE_DOWNLINK_DATA_NOTIFICATION, bearer->id);
-        r = s1ap_send_paging(mme_ue, S1AP_CNDomain_ps);
-        ogs_expect(r == OGS_OK);
-        ogs_assert(r != OGS_ERROR);
+        mme_sess_t *sess = mme_sess_find_by_id(bearer->sess_id);
+        ogs_assert(sess);
+        
+        /* 
+         * Check if the PDN connection is being deleted or has been marked for release
+         * using the proper session release pending check function
+         */
+        if (mme_sess_have_session_release_pending(sess) == true) {
+            /* This PDN is pending release, don't send paging */
+            ogs_debug("    UE in ECM-IDLE but PDN connection is pending release - skip paging");
+            MME_CLEAR_PAGING_INFO(mme_ue);
+            ogs_assert(OGS_OK == mme_gtp_send_downlink_data_notification_ack(
+                bearer, OGS_GTP2_CAUSE_UE_ALREADY_RE_ATTACHED));
+        } else if (mme_ue_have_session_release_pending(mme_ue) == true) {
+            /* UE has some session pending release, don't send paging */
+            ogs_debug("    UE in ECM-IDLE but has sessions pending release - skip paging");
+            MME_CLEAR_PAGING_INFO(mme_ue);
+            ogs_assert(OGS_OK == mme_gtp_send_downlink_data_notification_ack(
+                bearer, OGS_GTP2_CAUSE_UE_ALREADY_RE_ATTACHED));
+        } else {
+            /* Normal case - no sessions are being released, send paging */
+            ogs_debug("    UE in ECM-IDLE with active PDN connection - sending paging");
+            MME_STORE_PAGING_INFO(mme_ue,
+                MME_PAGING_TYPE_DOWNLINK_DATA_NOTIFICATION, bearer->id);
+            r = s1ap_send_paging(mme_ue, S1AP_CNDomain_ps);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+        }
     } else if (ECM_CONNECTED(mme_ue)) {
         MME_CLEAR_PAGING_INFO(mme_ue);
         ogs_assert(OGS_OK ==
@@ -1838,7 +1903,12 @@ void mme_s11_handle_create_indirect_data_forwarding_tunnel_response(
     }
 
     source_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
-    ogs_assert(source_ue);
+    if (!source_ue) {
+        ogs_error("[%s] Source ENB-S1 context has already been removed",
+                mme_ue->imsi_bcd);
+        mme_ue_clear_indirect_tunnel(mme_ue);
+        return;
+    }
 
     r = s1ap_send_handover_command(source_ue);
     ogs_expect(r == OGS_OK);

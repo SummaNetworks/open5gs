@@ -148,8 +148,8 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
             ogs_assert(pdr);
             break;
         default:
-            ogs_fatal("Unknown type [%d]", pfcp_object->type);
-            ogs_assert_if_reached();
+            ogs_warn("Unknown PFCP object type [%d], skipping packet", pfcp_object->type);
+            goto cleanup;
         }
 
         ogs_assert(pdr);
@@ -236,7 +236,8 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
                     continue;
 
                 /* Check if QFI */
-                if (pdr->qfi && pdr->qfi != header_desc.qos_flow_identifier)
+                if (header_desc.qos_flow_identifier &&
+                        pdr->qfi != header_desc.qos_flow_identifier)
                     continue;
 
                 /* Check if Rule List in PDR */
@@ -254,8 +255,8 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
 
             break;
         default:
-            ogs_fatal("Unknown type [%d]", pfcp_object->type);
-            ogs_assert_if_reached();
+            ogs_warn("Unknown PFCP object type [%d], skipping packet", pfcp_object->type);
+            goto cleanup;
         }
 
         ogs_assert(pdr);

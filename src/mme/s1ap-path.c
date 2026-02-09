@@ -173,12 +173,6 @@ int s1ap_send_to_nas(enb_ue_t *enb_ue,
     ogs_assert(enb_ue);
     ogs_assert(nasPdu);
 
-    if (nasPdu->size == 0) {
-        ogs_error("Empty NAS PDU");
-        enb_ue_remove(enb_ue);
-        return OGS_ERROR;
-    }
-
     mme_ue = mme_ue_find_by_id(enb_ue->mme_ue_id);
 
     /* The Packet Buffer(pkbuf_t) for NAS message MUST make a HEADROOM.
@@ -502,6 +496,17 @@ int s1ap_send_paging(mme_ue_t *mme_ue, S1AP_CNDomain_t cn_domain)
     if (!mme_ue) {
         ogs_error("UE(mme-ue) context has already been removed");
         return OGS_NOTFOUND;
+    }
+    
+    /*
+     * Global check for all paging attempts:
+     * 1. Check if the UE has any sessions pending release
+     * 2. If so, we should not send paging
+     */
+    if (mme_ue_have_session_release_pending(mme_ue) == true) {
+        ogs_debug("    Skipping paging for IMSI:[%s] - UE has sessions pending release",
+                  mme_ue->imsi_bcd);
+        return OGS_OK; /* Return success but don't actually page */
     }
 
     /* Find enB with matched TAI */

@@ -76,6 +76,8 @@ typedef struct ogs_gtp_node_s {
 
     ogs_list_t      local_list;
     ogs_list_t      remote_list;
+    
+    ogs_time_t      last_activity;  /* Last activity timestamp for cleanup */
 } ogs_gtp_node_t;
 
 typedef struct ogs_gtpu_resource_s {
@@ -98,6 +100,7 @@ ogs_gtp_node_t *ogs_gtp_node_add_by_addr(
         ogs_list_t *list, ogs_sockaddr_t *addr);
 void ogs_gtp_node_remove(ogs_list_t *list, ogs_gtp_node_t *node);
 void ogs_gtp_node_remove_all(ogs_list_t *list);
+void ogs_gtp_node_remove_idle(ogs_list_t *list);
 
 ogs_gtp_node_t *ogs_gtp_node_find_by_addr(
         ogs_list_t *list, ogs_sockaddr_t *addr);

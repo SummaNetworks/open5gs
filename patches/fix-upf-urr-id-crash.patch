@@ -1,0 +1,138 @@
+From f9403baaf4d6818ecf8440bd9c82925fc4baad65 Mon Sep 17 00:00:00 2001
+From: Eureka bot <engg.eurekawireless@gmail.com>
+Date: Thu, 9 Oct 2025 15:45:39 +0900
+Subject: [PATCH] Fix UPF crash when using URR ID=16
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+UPF was crashing due to array out-of-bounds access when URR ID=16
+was used. The issue occurred because:
+- SMF sends URR IDs in range 1-16
+- UPF array urr_acc[16] only had indices 0-15
+- Direct access via sess->urr_acc[urr->id] caused buffer overflow
+
+This fix:
+1. Extends array size to 17 elements (index 0 unused, 1-16 used)
+2. Adds defensive assertions to validate URR ID before array access
+3. Prevents memory corruption and segmentation faults
+
+The memory corruption was overwriting the apn_dnn pointer, leading
+to crashes during session deletion and abnormal Usage Reports.
+
+🤖 Generated with [Claude Code](https://claude.ai/code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/upf/context.c | 37 +++++++++++++++++++++++++++++--------
+ src/upf/context.h |  2 +-
+ 2 files changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/src/upf/context.c b/src/upf/context.c
+index 7c286fa82..d897d5499 100644
+--- a/src/upf/context.c
++++ b/src/upf/context.c
+@@ -682,7 +682,10 @@ uint8_t upf_sess_set_ue_ipv6_framed_routes(upf_sess_t *sess,
+ 
+ void upf_sess_urr_acc_add(upf_sess_t *sess, ogs_pfcp_urr_t *urr, size_t size, bool is_uplink)
+ {
+-    upf_sess_urr_acc_t *urr_acc = &sess->urr_acc[urr->id];
++    upf_sess_urr_acc_t *urr_acc;
++
++    ogs_assert(urr->id < OGS_ARRAY_SIZE(sess->urr_acc));
++    urr_acc = &sess->urr_acc[urr->id];
+     uint64_t vol;
+ 
+     /* Increment total & ul octets + pkts */
+@@ -720,10 +723,13 @@ void upf_sess_urr_acc_add(upf_sess_t *sess, ogs_pfcp_urr_t *urr, size_t size, bo
+ /* report struct must be memzeroed before first use of this function.
+  * report->num_of_usage_report must be set by the caller */
+ void upf_sess_urr_acc_fill_usage_report(upf_sess_t *sess, const ogs_pfcp_urr_t *urr,
+-                                  ogs_pfcp_user_plane_report_t *report, unsigned int idx)
++                                        ogs_pfcp_user_plane_report_t *report, unsigned int idx)
+ {
+-    upf_sess_urr_acc_t *urr_acc = &sess->urr_acc[urr->id];
++    upf_sess_urr_acc_t *urr_acc;
+     ogs_time_t last_report_timestamp;
++
++    ogs_assert(urr->id < OGS_ARRAY_SIZE(sess->urr_acc));
++    urr_acc = &sess->urr_acc[urr->id];
+     ogs_time_t now;
+ 
+     now = ogs_time_now(); /* we need UTC for start_time and end_time */
+@@ -780,7 +786,10 @@ void upf_sess_urr_acc_fill_usage_report(upf_sess_t *sess, const ogs_pfcp_urr_t *
+ 
+ void upf_sess_urr_acc_snapshot(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+ {
+-    upf_sess_urr_acc_t *urr_acc = &sess->urr_acc[urr->id];
++    upf_sess_urr_acc_t *urr_acc;
++
++    ogs_assert(urr->id < OGS_ARRAY_SIZE(sess->urr_acc));
++    urr_acc = &sess->urr_acc[urr->id];
+     urr_acc->last_report.total_octets = urr_acc->total_octets;
+     urr_acc->last_report.dl_octets = urr_acc->dl_octets;
+     urr_acc->last_report.ul_octets = urr_acc->ul_octets;
+@@ -816,7 +825,10 @@ static void upf_sess_urr_acc_timers_cb(void *data)
+ 
+ static void upf_sess_urr_acc_validity_time_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+ {
+-    upf_sess_urr_acc_t *urr_acc = &sess->urr_acc[urr->id];
++    upf_sess_urr_acc_t *urr_acc;
++
++    ogs_assert(urr->id < OGS_ARRAY_SIZE(sess->urr_acc));
++    urr_acc = &sess->urr_acc[urr->id];
+ 
+     ogs_debug("Installing URR Quota Validity Time timer");
+     urr_acc->reporting_enabled = true;
+@@ -829,7 +841,10 @@ static void upf_sess_urr_acc_validity_time_setup(upf_sess_t *sess, ogs_pfcp_urr_
+ 
+ static void upf_sess_urr_acc_time_quota_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+ {
+-    upf_sess_urr_acc_t *urr_acc = &sess->urr_acc[urr->id];
++    upf_sess_urr_acc_t *urr_acc;
++
++    ogs_assert(urr->id < OGS_ARRAY_SIZE(sess->urr_acc));
++    urr_acc = &sess->urr_acc[urr->id];
+ 
+     ogs_debug("Installing URR Time Quota timer");
+     urr_acc->reporting_enabled = true;
+@@ -841,7 +856,10 @@ static void upf_sess_urr_acc_time_quota_setup(upf_sess_t *sess, ogs_pfcp_urr_t *
+ 
+ static void upf_sess_urr_acc_time_threshold_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+ {
+-    upf_sess_urr_acc_t *urr_acc = &sess->urr_acc[urr->id];
++    upf_sess_urr_acc_t *urr_acc;
++
++    ogs_assert(urr->id < OGS_ARRAY_SIZE(sess->urr_acc));
++    urr_acc = &sess->urr_acc[urr->id];
+ 
+     ogs_debug("Installing URR Time Threshold timer");
+     urr_acc->reporting_enabled = true;
+@@ -854,7 +872,10 @@ static void upf_sess_urr_acc_time_threshold_setup(upf_sess_t *sess, ogs_pfcp_urr
+ 
+ void upf_sess_urr_acc_timers_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+ {
+-    upf_sess_urr_acc_t *urr_acc = &sess->urr_acc[urr->id];
++    upf_sess_urr_acc_t *urr_acc;
++
++    ogs_assert(urr->id < OGS_ARRAY_SIZE(sess->urr_acc));
++    urr_acc = &sess->urr_acc[urr->id];
+     urr_acc->time_start = ogs_time_ntp32_now();
+     if (urr->rep_triggers.quota_validity_time && urr->quota_validity_time > 0)
+         upf_sess_urr_acc_validity_time_setup(sess, urr);
+diff --git a/src/upf/context.h b/src/upf/context.h
+index ee44a52f2..563c907bd 100644
+--- a/src/upf/context.h
++++ b/src/upf/context.h
+@@ -122,7 +122,7 @@ typedef struct upf_sess_s {
+     ogs_pfcp_node_t *pfcp_node;
+ 
+     /* Accounting: */
+-    upf_sess_urr_acc_t urr_acc[OGS_MAX_NUM_OF_URR]; /* FIXME: This probably needs to be mved to a hashtable or alike */
++    upf_sess_urr_acc_t urr_acc[OGS_MAX_NUM_OF_URR + 1]; /* FIXME: This probably needs to be mved to a hashtable or alike */
+     char            *apn_dnn;            /* APN/DNN Item */
+ } upf_sess_t;
+ 
+-- 
+2.34.1
+
