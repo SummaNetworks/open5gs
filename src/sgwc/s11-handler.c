@@ -1470,11 +1470,14 @@ void sgwc_s11_handle_create_indirect_data_forwarding_tunnel_request(
     }
 
     ogs_list_for_each(&sgwc_ue->sess_list, sess) {
-
-        ogs_assert(OGS_OK ==
-            sgwc_pfcp_send_session_modification_request(
+        int rv = sgwc_pfcp_send_session_modification_request(
                 sess, s11_xact->id, gtpbuf,
-                OGS_PFCP_MODIFY_INDIRECT|OGS_PFCP_MODIFY_CREATE));
+                OGS_PFCP_MODIFY_INDIRECT|OGS_PFCP_MODIFY_CREATE);
+        if (rv != OGS_OK) {
+            ogs_error("Failed to send PFCP session modification request "
+                    "for Create Indirect Data Forwarding Tunnel");
+            continue;
+        }
     }
 }
 
