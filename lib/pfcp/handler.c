@@ -1265,9 +1265,9 @@ bool ogs_pfcp_handle_remove_qer(ogs_pfcp_sess_t *sess,
 
     qer = ogs_pfcp_qer_find(sess, message->qer_id.u32);
     if (!qer) {
-        ogs_error("Unknown QER-ID[%d]", message->qer_id.u32);
-        *cause_value = OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND;
-        return false;
+        ogs_warn("QER-ID[%d] already removed (possibly by PDR cleanup)", 
+                message->qer_id.u32);
+        return true;
     }
 
     ogs_pfcp_qer_remove(qer);

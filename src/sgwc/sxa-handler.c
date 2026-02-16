@@ -1556,29 +1556,50 @@ void sgwc_sxa_handle_session_report_request(
             if (far->dst_if == OGS_PFCP_INTERFACE_ACCESS) {
                 ogs_warn("[%s] Error Indication from eNB", sgwc_ue->imsi_bcd);
                 ogs_list_for_each(&sgwc_ue->sess_list, sess) {
-                    ogs_assert(OGS_OK ==
+                    ogs_assert(sess->pfcp_node);
+                    if (!OGS_FSM_CHECK(
+                            &sess->pfcp_node->sm, sgwc_pfcp_state_associated)) {
+                        ogs_warn("[%s] PFCP node not associated, skipping "
+                                "session modification", sgwc_ue->imsi_bcd);
+                        continue;
+                    }
+                    if (OGS_OK !=
                         sgwc_pfcp_send_session_modification_request(sess,
                     /* We only use the `assoc_xact` parameter temporarily here
                      * to pass the `bearer` context. */
                             bearer->id,
                             NULL,
                             OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE|
-                            OGS_PFCP_MODIFY_ERROR_INDICATION));
+                            OGS_PFCP_MODIFY_ERROR_INDICATION)) {
+                        ogs_error("[%s] Failed to send PFCP session "
+                                "modification request", sgwc_ue->imsi_bcd);
+                    }
                 }
             } else if (far->dst_if == OGS_PFCP_INTERFACE_CORE) {
-                if (sgwc_default_bearer_in_sess(sess) == bearer) {
+                ogs_assert(sess->pfcp_node);
+                if (!OGS_FSM_CHECK(
+                        &sess->pfcp_node->sm, sgwc_pfcp_state_associated)) {
+                    ogs_error("[%s] PFCP node not associated, cannot handle "
+                            "Error Indication from SMF", sgwc_ue->imsi_bcd);
+                } else if (sgwc_default_bearer_in_sess(sess) == bearer) {
                     ogs_error("[%s] Error Indication(Default Bearer) from SMF",
                                 sgwc_ue->imsi_bcd);
-                    ogs_assert(OGS_OK ==
+                    if (OGS_OK !=
                         sgwc_pfcp_send_session_deletion_request(
-                            sess, OGS_INVALID_POOL_ID, NULL));
+                            sess, OGS_INVALID_POOL_ID, NULL)) {
+                        ogs_error("[%s] Failed to send PFCP session "
+                                "deletion request", sgwc_ue->imsi_bcd);
+                    }
                 } else {
                     ogs_error("[%s] Error Indication(Dedicated Bearer) "
                             "from SMF", sgwc_ue->imsi_bcd);
-                    ogs_assert(OGS_OK ==
+                    if (OGS_OK !=
                         sgwc_pfcp_send_bearer_modification_request(
                             bearer, OGS_INVALID_POOL_ID, NULL,
-                            OGS_PFCP_MODIFY_REMOVE));
+                            OGS_PFCP_MODIFY_REMOVE)) {
+                        ogs_error("[%s] Failed to send PFCP bearer "
+                                "modification request", sgwc_ue->imsi_bcd);
+                    }
                 }
             } else {
                 ogs_error("Error Indication Ignored for Indirect Tunnel");

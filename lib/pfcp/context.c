@@ -1347,9 +1347,12 @@ void ogs_pfcp_pdr_remove(ogs_pfcp_pdr_t *pdr)
          * Since this PDR has already been deleted with ogs_list_remove() above,
          * if the current list has a TEID count of 0, there are no other PDRs.
          */
-        if (ogs_pfcp_object_count_by_teid(pdr->sess, pdr->f_teid.teid) == 0)
+        if (ogs_pfcp_object_count_by_teid(pdr->sess, pdr->f_teid.teid) == 0) {
+            ogs_debug("Removing TEID:0x%x from object_teid_hash (PDR-ID:%d cleanup)",
+                    pdr->f_teid.teid, pdr->id);
             ogs_hash_set(self.object_teid_hash,
                     &pdr->hash.teid.key, pdr->hash.teid.len, NULL);
+        }
     }
 
     /*
@@ -1677,9 +1680,12 @@ void ogs_pfcp_far_remove(ogs_pfcp_far_t *far)
 
     ogs_list_remove(&sess->far_list, far);
 
-    if (far->hash.teid.len)
+    if (far->hash.teid.len) {
+        ogs_debug("Removing FAR TEID:0x%x from far_teid_hash (FAR-ID:%d cleanup)",
+                far->outer_header_creation.teid, far->id);
         ogs_hash_set(self.far_teid_hash,
                 &far->hash.teid.key, far->hash.teid.len, NULL);
+    }
 
     if (far->hash.f_teid.len)
         ogs_hash_set(self.far_f_teid_hash,

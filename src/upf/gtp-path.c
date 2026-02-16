@@ -436,13 +436,17 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
                    (ogs_pfcp_self()->local_recovery +
                     ogs_time_sec(ogs_local_conf()->time.message.pfcp.
                         association_interval))) {
-                ogs_error("[%s] Send Error Indication [TEID:0x%x] to [%s]",
+                ogs_error("[%s] Send Error Indication [TEID:0x%x] to [%s] - "
+                        "No PDR/session found (ghost TEID or stale forwarding rule)",
                         OGS_ADDR(&sock->local_addr, buf1),
                         header_desc.teid,
                         OGS_ADDR(&from, buf2));
                 ogs_gtp1_send_error_indication(
                         sock, header_desc.teid,
                         header_desc.qos_flow_identifier, &from);
+            } else {
+                ogs_debug("Ignoring TEID:0x%x during recovery period", 
+                        header_desc.teid);
             }
             goto cleanup;
         }
@@ -497,13 +501,17 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
                         ogs_time_sec(ogs_local_conf()->time.message.pfcp.
                             association_interval))) {
                     ogs_error(
-                            "[%s] Send Error Indication [TEID:0x%x] to [%s]",
+                            "[%s] Send Error Indication [TEID:0x%x] to [%s] - "
+                            "Session exists but no matching PDR found",
                             OGS_ADDR(&sock->local_addr, buf1),
                             header_desc.teid,
                             OGS_ADDR(&from, buf2));
                     ogs_gtp1_send_error_indication(
                             sock, header_desc.teid,
                             header_desc.qos_flow_identifier, &from);
+                } else {
+                    ogs_debug("Ignoring TEID:0x%x during recovery period", 
+                            header_desc.teid);
                 }
                 goto cleanup;
             }
