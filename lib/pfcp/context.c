@@ -1327,7 +1327,6 @@ void ogs_pfcp_pdr_associate_qer(ogs_pfcp_pdr_t *pdr, ogs_pfcp_qer_t *qer)
 void ogs_pfcp_pdr_remove(ogs_pfcp_pdr_t *pdr)
 {
     int i;
-    ogs_pfcp_qer_t *qer = NULL;
 
     ogs_assert(pdr);
     ogs_assert(pdr->sess);
@@ -1352,34 +1351,6 @@ void ogs_pfcp_pdr_remove(ogs_pfcp_pdr_t *pdr)
                     pdr->f_teid.teid, pdr->id);
             ogs_hash_set(self.object_teid_hash,
                     &pdr->hash.teid.key, pdr->hash.teid.len, NULL);
-        }
-    }
-
-    /*
-     * QER Resource Leak Fix
-     *
-     * QERs are often shared between multiple PDRs (e.g., DL and UL PDRs).
-     * Before removing a QER, check if any other PDRs in the session are still
-     * using it. Only remove the QER if no other PDRs reference it.
-     *
-     * This prevents QER ID pool exhaustion when PDRs are dynamically created
-     * and removed during session modifications.
-     */
-    if (pdr->qer) {
-        ogs_pfcp_pdr_t *other_pdr = NULL;
-        bool qer_in_use = false;
-
-        qer = pdr->qer;
-
-        ogs_list_for_each(&pdr->sess->pdr_list, other_pdr) {
-            if (other_pdr->qer && other_pdr->qer->id == qer->id) {
-                qer_in_use = true;
-                break;
-            }
-        }
-
-        if (!qer_in_use) {
-            ogs_pfcp_qer_remove(qer);
         }
     }
 
