@@ -955,7 +955,12 @@ void sgwc_sxa_handle_session_modification_response(
                             bearer_contexts[i].eps_bearer_id.presence);
                     bearer = sgwc_bearer_find_by_ue_ebi(sgwc_ue,
                                 gtp_req->bearer_contexts[i].eps_bearer_id.u8);
-                    ogs_assert(bearer);
+                    if (!bearer) {
+                        ogs_error("No bearer found for EBI[%d] in "
+                                "Create Indirect Data Forwarding Tunnel Response",
+                                gtp_req->bearer_contexts[i].eps_bearer_id.u8);
+                        continue;
+                    }
 
                     ogs_list_for_each(&bearer->tunnel_list, tunnel) {
                         if (tunnel->interface_type ==
