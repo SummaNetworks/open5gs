@@ -895,6 +895,7 @@ typedef struct mme_bearer_s {
 #define CLEAR_BEARER_ALL_TIMERS(__bEARER) \
     do { \
         CLEAR_BEARER_TIMER((__bEARER)->t3489); \
+        CLEAR_BEARER_TIMER((__bEARER)->t3495); \
     } while(0);
 #define CLEAR_BEARER_TIMER(__bEARER_TIMER) \
     do { \
@@ -911,6 +912,11 @@ typedef struct mme_bearer_s {
         ogs_timer_t     *timer;
         uint32_t        retry_count;;
     } t3489;
+    struct {
+        ogs_pkbuf_t     *pkbuf;
+        ogs_timer_t     *timer;
+        uint32_t        retry_count;
+    } t3495;
 
     /* Related Context */
     ogs_pool_id_t   mme_ue_id;

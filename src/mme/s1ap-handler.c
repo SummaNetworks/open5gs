@@ -2067,6 +2067,161 @@ void s1ap_handle_ue_context_release_action(enb_ue_t *enb_ue)
     }
 }
 
+void s1ap_handle_e_rab_release_response(
+        mme_enb_t *enb, ogs_s1ap_message_t *message)
+{
+    int i, r;
+    char buf[OGS_ADDRSTRLEN];
+
+    S1AP_SuccessfulOutcome_t *successfulOutcome = NULL;
+    S1AP_E_RABReleaseResponse_t *E_RABReleaseResponse = NULL;
+
+    S1AP_E_RABReleaseResponseIEs_t *ie = NULL;
+    S1AP_MME_UE_S1AP_ID_t *MME_UE_S1AP_ID = NULL;
+    S1AP_ENB_UE_S1AP_ID_t *ENB_UE_S1AP_ID = NULL;
+    S1AP_E_RABReleaseListBearerRelComp_t
+            *E_RABReleaseListBearerRelComp = NULL;
+    S1AP_E_RABList_t *E_RABFailedToReleaseList = NULL;
+
+    enb_ue_t *enb_ue = NULL;
+    mme_ue_t *mme_ue = NULL;
+
+    ogs_assert(enb);
+    ogs_assert(enb->sctp.sock);
+
+    ogs_assert(message);
+    successfulOutcome = message->choice.successfulOutcome;
+    ogs_assert(successfulOutcome);
+    E_RABReleaseResponse =
+            &successfulOutcome->value.choice.E_RABReleaseResponse;
+    ogs_assert(E_RABReleaseResponse);
+
+    ogs_debug("E-RABReleaseResponse");
+
+    for (i = 0; i < E_RABReleaseResponse->protocolIEs.list.count; i++) {
+        ie = E_RABReleaseResponse->protocolIEs.list.array[i];
+        switch (ie->id) {
+        case S1AP_ProtocolIE_ID_id_MME_UE_S1AP_ID:
+            MME_UE_S1AP_ID = &ie->value.choice.MME_UE_S1AP_ID;
+            break;
+        case S1AP_ProtocolIE_ID_id_eNB_UE_S1AP_ID:
+            ENB_UE_S1AP_ID = &ie->value.choice.ENB_UE_S1AP_ID;
+            break;
+        case S1AP_ProtocolIE_ID_id_E_RABReleaseListBearerRelComp:
+            E_RABReleaseListBearerRelComp =
+                &ie->value.choice.E_RABReleaseListBearerRelComp;
+            break;
+        case S1AP_ProtocolIE_ID_id_E_RABFailedToReleaseList:
+            E_RABFailedToReleaseList = &ie->value.choice.E_RABList;
+            break;
+        default:
+            break;
+        }
+    }
+
+    ogs_debug("    IP[%s] ENB_ID[%d]",
+            OGS_ADDR(enb->sctp.addr, buf), enb->enb_id);
+
+    if (!ENB_UE_S1AP_ID) {
+        ogs_error("No ENB_UE_S1AP_ID");
+        r = s1ap_send_error_indication(enb, NULL, NULL,
+                S1AP_Cause_PR_protocol, S1AP_CauseProtocol_semantic_error);
+        ogs_expect(r == OGS_OK);
+        ogs_assert(r != OGS_ERROR);
+        return;
+    }
+
+    if (*ENB_UE_S1AP_ID > 0x00ffffff) {
+        ogs_error("Invalid ENB_UE_S1AP_ID [%lx]", *ENB_UE_S1AP_ID);
+        r = s1ap_send_error_indication(enb, NULL, NULL,
+                S1AP_Cause_PR_protocol, S1AP_CauseProtocol_semantic_error);
+        ogs_expect(r == OGS_OK);
+        ogs_assert(r != OGS_ERROR);
+        return;
+    }
+
+    if (!MME_UE_S1AP_ID) {
+        ogs_error("No MME_UE_S1AP_ID");
+        r = s1ap_send_error_indication(enb, NULL, ENB_UE_S1AP_ID,
+                S1AP_Cause_PR_protocol, S1AP_CauseProtocol_semantic_error);
+        ogs_expect(r == OGS_OK);
+        ogs_assert(r != OGS_ERROR);
+        return;
+    }
+
+    enb_ue = enb_ue_find_by_mme_ue_s1ap_id(*MME_UE_S1AP_ID);
+    if (!enb_ue) {
+        ogs_error("No eNB UE Context : MME_UE_S1AP_ID[%lld]",
+                (long long)*MME_UE_S1AP_ID);
+        r = s1ap_send_error_indication(enb, MME_UE_S1AP_ID, NULL,
+                S1AP_Cause_PR_radioNetwork,
+                S1AP_CauseRadioNetwork_unknown_mme_ue_s1ap_id);
+        ogs_expect(r == OGS_OK);
+        ogs_assert(r != OGS_ERROR);
+        return;
+    }
+
+    ogs_debug("    ENB_UE_S1AP_ID[%d] MME_UE_S1AP_ID[%d]",
+            enb_ue->enb_ue_s1ap_id, enb_ue->mme_ue_s1ap_id);
+
+    mme_ue = mme_ue_find_by_id(enb_ue->mme_ue_id);
+    if (!mme_ue) {
+        ogs_error("No UE(mme-ue) context");
+        return;
+    }
+
+    if (E_RABReleaseListBearerRelComp) {
+        for (i = 0;
+                i < E_RABReleaseListBearerRelComp->list.count; i++) {
+            S1AP_E_RABReleaseItemBearerRelCompIEs_t *item = NULL;
+            S1AP_E_RABReleaseItemBearerRelComp_t *e_rab = NULL;
+
+            item = (S1AP_E_RABReleaseItemBearerRelCompIEs_t *)
+                    E_RABReleaseListBearerRelComp->list.array[i];
+            if (!item) {
+                ogs_error("No E_RABReleaseItemBearerRelCompIEs_t");
+                continue;
+            }
+
+            e_rab = &item->value.choice.E_RABReleaseItemBearerRelComp;
+            if (!e_rab) {
+                ogs_error("No E_RABReleaseItemBearerRelComp");
+                continue;
+            }
+
+            ogs_debug("    E-RAB[%d] released successfully",
+                    (int)e_rab->e_RAB_ID);
+        }
+    }
+
+    if (E_RABFailedToReleaseList) {
+        for (i = 0; i < E_RABFailedToReleaseList->list.count; i++) {
+            S1AP_E_RABItemIEs_t *item = NULL;
+            S1AP_E_RABItem_t *e_rab_item = NULL;
+
+            item = (S1AP_E_RABItemIEs_t *)
+                    E_RABFailedToReleaseList->list.array[i];
+            if (!item) {
+                ogs_error("No E_RABItemIEs_t");
+                continue;
+            }
+
+            e_rab_item = &item->value.choice.E_RABItem;
+            if (!e_rab_item) {
+                ogs_error("No E_RABItem");
+                continue;
+            }
+
+            ogs_warn("    IMSI[%s] E-RAB[%d] release failed "
+                    "[Cause Group:%d, Cause:%d]",
+                    mme_ue->imsi_bcd,
+                    (int)e_rab_item->e_RAB_ID,
+                    (int)e_rab_item->cause.present,
+                    (int)e_rab_item->cause.choice.radioNetwork);
+        }
+    }
+}
+
 void s1ap_handle_e_rab_modification_indication(
         mme_enb_t *enb, ogs_s1ap_message_t *message)
 {

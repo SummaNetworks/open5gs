@@ -762,6 +762,9 @@ int nas_eps_send_deactivate_bearer_context_request(mme_bearer_t *bearer)
     rv = nas_eps_send_to_enb(mme_ue, s1apbuf);
     ogs_expect(rv == OGS_OK);
 
+    ogs_timer_start(bearer->t3495.timer,
+            mme_timer_cfg(MME_TIMER_T3495)->duration);
+
     return rv;
 }
 

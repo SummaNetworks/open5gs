@@ -364,6 +364,7 @@ void esm_state_active(ogs_fsm_t *s, mme_event_t *e)
                     "context accept");
             ogs_debug("    IMSI[%s] PTI[%d] EBI[%d]",
                     mme_ue->imsi_bcd, sess->pti, bearer->ebi);
+            CLEAR_BEARER_TIMER(bearer->t3495);
             ogs_assert(OGS_OK ==
                 mme_gtp_send_delete_bearer_response(
                     bearer, OGS_GTP2_CAUSE_REQUEST_ACCEPTED));
@@ -388,6 +389,38 @@ void esm_state_active(ogs_fsm_t *s, mme_event_t *e)
         default:
             ogs_error("Unknown message(type:%d)", 
                     message->esm.h.message_type);
+            break;
+        }
+        break;
+    case MME_EVENT_ESM_TIMER:
+        switch (e->timer_id) {
+        case MME_TIMER_T3495:
+            if (bearer->t3495.retry_count >=
+                    mme_timer_cfg(MME_TIMER_T3495)->max_count) {
+                ogs_warn("[%s] Retransmission of Deactivate EPS Bearer "
+                        "Context Request for EBI[%d] failed. "
+                        "Stop retransmission",
+                        mme_ue->imsi_bcd, bearer->ebi);
+                ogs_assert(OGS_OK ==
+                    mme_gtp_send_delete_bearer_response(
+                        bearer, OGS_GTP2_CAUSE_UE_NOT_RESPONDING));
+                OGS_FSM_TRAN(s, esm_state_bearer_deactivated);
+            } else {
+                bearer->t3495.retry_count++;
+                if (ECM_CONNECTED(mme_ue)) {
+                    r = nas_eps_send_deactivate_bearer_context_request(
+                            bearer);
+                    ogs_expect(r == OGS_OK);
+                    ogs_assert(r != OGS_ERROR);
+                } else {
+                    ogs_timer_start(bearer->t3495.timer,
+                            mme_timer_cfg(MME_TIMER_T3495)->duration);
+                }
+            }
+            break;
+        default:
+            ogs_error("Unknown timer[%s:%d]",
+                    mme_timer_get_name(e->timer_id), e->timer_id);
             break;
         }
         break;

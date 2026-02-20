@@ -165,6 +165,7 @@ void s1ap_state_operational(ogs_fsm_t *s, mme_event_t *e)
             case S1AP_ProcedureCode_id_E_RABModify:
                 break;
             case S1AP_ProcedureCode_id_E_RABRelease:
+                s1ap_handle_e_rab_release_response(enb, pdu);
                 break;
             case S1AP_ProcedureCode_id_HandoverResourceAllocation:
                 s1ap_handle_handover_request_ack(enb, pdu);
