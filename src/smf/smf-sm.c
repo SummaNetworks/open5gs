@@ -288,7 +288,8 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
                 break;
             }
             smf_s5c_handle_delete_bearer_command(
-                sess, gtp_xact, &gtp2_message.delete_bearer_command);
+                sess, gtp_xact, &gtp2_message.delete_bearer_command,
+                &gtp2_sender_f_teid);
             break;
         case OGS_GTP2_CHANGE_NOTIFICATION_REQUEST_TYPE:
             ogs_info("Received Change Notification Request in session-dependent section");

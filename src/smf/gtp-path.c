@@ -100,11 +100,19 @@ static void _gtpv1v2_c_recv_cb(short when, ogs_socket_t fd, void *data)
         uint16_t old_port = OGS_PORT(&gnode->addr);
         uint16_t new_port = OGS_PORT(&from);
         if (old_port != new_port) {
-            ogs_info("Updating SGW port: %s:%u -> %s:%u", 
-                     OGS_ADDR(&gnode->addr, frombuf), old_port,
-                     OGS_ADDR(&from, frombuf), new_port);
-            /* Update the port in the stored address */
-            memcpy(&gnode->addr, &from, sizeof(ogs_sockaddr_t));
+            int local_count = ogs_list_count(&gnode->local_list);
+            int remote_count = ogs_list_count(&gnode->remote_list);
+            if (local_count == 0 && remote_count == 0) {
+                ogs_debug("Updating SGW port: %s:%u -> %s:%u",
+                         OGS_ADDR(&gnode->addr, frombuf), old_port,
+                         OGS_ADDR(&from, frombuf), new_port);
+                memcpy(&gnode->addr, &from, sizeof(ogs_sockaddr_t));
+            } else {
+                ogs_debug("SGW port changed %u->%u but %d transactions "
+                        "in-flight, keeping old port",
+                        old_port, new_port,
+                        local_count + remote_count);
+            }
         } else {
             ogs_debug("Reusing existing GTP node for SGW %s:%u (same port)", 
                       OGS_ADDR(&from, frombuf), OGS_PORT(&from));

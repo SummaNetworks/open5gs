@@ -559,8 +559,6 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
                  */
                 if (pdr->dnn && strcmp(pdr->dnn, "ims") == 0) {
                     /* Skip source IP validation for IMS APN */
-                    ogs_debug("Exempting IMS APN from source IP validation: SRC:%08X, UE:%08X",
-                        be32toh(src_addr[0]), be32toh(sess->ipv4->addr[0]));
                 } else if (src_addr[0] == sess->ipv4->addr[0]) {
                     /* Source IP address should be matched in uplink */
                 } else if (check_framed_routes(sess, AF_INET, src_addr)) {

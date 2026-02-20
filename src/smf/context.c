@@ -1960,25 +1960,6 @@ smf_sess_t *smf_sess_find_by_paging_n1n2message_location(
             n1n2message_location, strlen(n1n2message_location));
 }
 
-smf_sess_t *smf_sess_find_by_gx_sid(char *gx_sid)
-{
-    smf_ue_t *smf_ue = NULL;
-    smf_sess_t *sess = NULL;
-
-    ogs_assert(gx_sid);
-
-    /* Iterate through all UEs and sessions to find matching gx_sid */
-    ogs_list_for_each(&self.smf_ue_list, smf_ue) {
-        ogs_list_for_each(&smf_ue->sess_list, sess) {
-            if (sess->gx_sid && strcmp(sess->gx_sid, gx_sid) == 0) {
-                return sess;
-            }
-        }
-    }
-
-    return NULL;
-}
-
 ogs_pcc_rule_t *smf_pcc_rule_find_by_id(smf_sess_t *sess, char *pcc_rule_id)
 {
     int i;

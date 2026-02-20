@@ -113,26 +113,41 @@ void smf_timer_gtp_node_cleanup(void *data)
     
     ogs_list_for_each_safe(&smf_self()->sgw_s5c_list, next_gnode, gnode) {
         total_count++;
-        
+
         int local_count = ogs_list_count(&gnode->local_list);
         int remote_count = ogs_list_count(&gnode->remote_list);
         ogs_time_t idle_time = now - gnode->last_activity;
-        
+
         /* Remove nodes with no active transactions AND idle for more than 2 minutes */
         if (local_count == 0 && remote_count == 0 && idle_time > idle_threshold) {
             smf_gtp_node_t *smf_gnode = gnode->data_ptr;
-            
-            ogs_info("Removing idle SMF GTP node [%s]:%d (idle for %ld seconds, no transactions)", 
+            smf_ue_t *smf_ue = NULL;
+            smf_sess_t *sess = NULL;
+
+            ogs_info("Removing idle SMF GTP node [%s]:%d (idle for %ld seconds, no transactions)",
                     OGS_ADDR(&gnode->addr, buf), OGS_PORT(&gnode->addr),
                     (long)(idle_time / 1000000));
-            
+
+            /* Invalidate session references before removing gnode */
+            ogs_list_for_each(&smf_self()->smf_ue_list, smf_ue) {
+                ogs_list_for_each(&smf_ue->sess_list, sess) {
+                    if (sess->gnode == gnode) {
+                        ogs_warn("Detaching session from idle GTP node [%s]:%d",
+                                OGS_ADDR(&gnode->addr, buf),
+                                OGS_PORT(&gnode->addr));
+                        sess->gnode = NULL;
+                    }
+                }
+            }
+
             /* Free SMF wrapper first */
             if (smf_gnode) {
                 smf_gtp_node_free(smf_gnode);
             }
-            
+
             /* Then remove the underlying GTP node */
             ogs_gtp_node_remove(&smf_self()->sgw_s5c_list, gnode);
+            smf_metrics_inst_global_dec(SMF_METR_GLOB_GAUGE_GTP_PEERS_ACTIVE);
             removed_count++;
         } else {
             ogs_debug("Keeping GTP node [%s]:%d (idle:%ld sec, local:%d, remote:%d transactions)", 

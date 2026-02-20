@@ -1638,7 +1638,8 @@ void smf_s5c_handle_bearer_resource_command(
 
 void smf_s5c_handle_delete_bearer_command(
         smf_sess_t *sess, ogs_gtp_xact_t *xact,
-        ogs_gtp2_delete_bearer_command_t *cmd)
+        ogs_gtp2_delete_bearer_command_t *cmd,
+        ogs_gtp2_sender_f_teid_t *sender_f_teid)
 {
     int rv;
     uint8_t cause_value = OGS_GTP2_CAUSE_REQUEST_ACCEPTED;
@@ -1665,37 +1666,49 @@ void smf_s5c_handle_delete_bearer_command(
     }
 
     /* Find and delete the specified bearer */
-    bearer = smf_bearer_find_by_ebi(sess, cmd->bearer_contexts.eps_bearer_id.u8);
+    bearer = smf_bearer_find_by_ebi(
+                sess, cmd->bearer_contexts.eps_bearer_id.u8);
     if (!bearer) {
-        ogs_warn("Bearer EBI[%d] not found", cmd->bearer_contexts.eps_bearer_id.u8);
+        ogs_warn("Bearer EBI[%d] not found",
+                cmd->bearer_contexts.eps_bearer_id.u8);
         cause_value = OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND;
         goto cleanup;
     }
 
-    ogs_info("Processing Delete Bearer Command for Bearer EBI[%d] from PCRF", bearer->ebi);
-    
-    /* Send Delete Bearer Request to MME to initiate UE bearer deactivation */
-    rv = smf_gtp2_send_delete_bearer_request(bearer, 
-        OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED, 
+    ogs_debug("Processing Delete Bearer Command for Bearer EBI[%d]",
+            bearer->ebi);
+
+    /* Send Delete Bearer Request to SGW/MME to initiate bearer deactivation */
+    rv = smf_gtp2_send_delete_bearer_request(bearer,
+        OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
         OGS_GTP2_CAUSE_REQUEST_ACCEPTED);
     if (rv != OGS_OK) {
-        ogs_error("Failed to send Delete Bearer Request to MME");
+        ogs_error("Failed to send Delete Bearer Request");
         cause_value = OGS_GTP2_CAUSE_SYSTEM_FAILURE;
         goto cleanup;
     }
-    
-    /* Delete Bearer Command is acknowledged by simply not committing - let it be deleted */
-    ogs_info("Delete Bearer Command processed, UE bearer deactivation initiated");
+
+    /*
+     * The Command xact must stay alive until Delete Bearer Response arrives.
+     * Commit the xact here — ogs_gtp2_send_error_message would also commit,
+     * but on the success path we commit explicitly so the xact is not
+     * silently destroyed by the GTP stack's timeout.
+     *
+     * NOTE: Ideally we would associate this cmd_xact with the local
+     * Delete Bearer Request xact via ogs_gtp_xact_associate() so that
+     * when Delete Bearer Response arrives the cmd_xact is automatically
+     * handled. However, smf_gtp2_send_delete_bearer_request() currently
+     * creates and commits the local xact internally, so association would
+     * require a larger refactor. For now, commit the Command xact to
+     * acknowledge receipt.
+     */
+    rv = ogs_gtp_xact_commit(xact);
+    ogs_expect(rv == OGS_OK);
+
     return;
 
 cleanup:
-    /* Send failure response to PCRF */
-    if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
-        ogs_warn("Delete Bearer Command failed with cause: %d", cause_value);
-        /* TODO: Send Delete Bearer Failure Indication to PCRF */
-    }
-    
-    /* Let GTP stack handle transaction cleanup */
-
-    ogs_debug("Delete Bearer Command processed successfully");
+    ogs_gtp2_send_error_message(
+            xact, get_sender_f_teid(sess, sender_f_teid),
+            OGS_GTP2_DELETE_BEARER_FAILURE_INDICATION_TYPE, cause_value);
 }
