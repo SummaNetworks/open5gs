@@ -984,7 +984,6 @@ void sgwc_s11_handle_update_bearer_response(
                 bearer_id <= OGS_MAX_POOL_ID);
 
         bearer = sgwc_bearer_find_by_id(bearer_id);
-        ogs_assert(bearer);
     } else {
         ogs_assert(s11_xact->data);
         bearer_id = OGS_POINTER_TO_UINT(s11_xact->data);
@@ -992,14 +991,29 @@ void sgwc_s11_handle_update_bearer_response(
                 bearer_id <= OGS_MAX_POOL_ID);
 
         bearer = sgwc_bearer_find_by_id(bearer_id);
-        ogs_assert(bearer);
     }
 
-    sess = sgwc_sess_find_by_id(bearer->sess_id);
-    ogs_assert(sess);
+    if (bearer)
+        sess = sgwc_sess_find_by_id(bearer->sess_id);
 
     rv = ogs_gtp_xact_commit(s11_xact);
     ogs_expect(rv == OGS_OK);
+
+    if (!bearer) {
+        ogs_warn("[UBResp] Bearer has already been removed "
+                 "(Delete Session may have been processed first)");
+        ogs_gtp_send_error_message(s5c_xact, 0,
+                OGS_GTP2_UPDATE_BEARER_RESPONSE_TYPE,
+                OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND);
+        return;
+    }
+    if (!sess) {
+        ogs_warn("[UBResp] Session has already been removed");
+        ogs_gtp_send_error_message(s5c_xact, 0,
+                OGS_GTP2_UPDATE_BEARER_RESPONSE_TYPE,
+                OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND);
+        return;
+    }
 
     /*****************************************
      * Check Mandatory/Conditional IE Missing
@@ -1120,7 +1134,6 @@ void sgwc_s11_handle_delete_bearer_response(
                 bearer_id <= OGS_MAX_POOL_ID);
 
         bearer = sgwc_bearer_find_by_id(bearer_id);
-        ogs_assert(bearer);
     } else {
         ogs_assert(s11_xact->data);
         bearer_id = OGS_POINTER_TO_UINT(s11_xact->data);
@@ -1128,14 +1141,29 @@ void sgwc_s11_handle_delete_bearer_response(
                 bearer_id <= OGS_MAX_POOL_ID);
 
         bearer = sgwc_bearer_find_by_id(bearer_id);
-        ogs_assert(bearer);
     }
 
-    sess = sgwc_sess_find_by_id(bearer->sess_id);
-    ogs_assert(sess);
+    if (bearer)
+        sess = sgwc_sess_find_by_id(bearer->sess_id);
 
     rv = ogs_gtp_xact_commit(s11_xact);
     ogs_expect(rv == OGS_OK);
+
+    if (!bearer) {
+        ogs_warn("[DBResp] Bearer has already been removed "
+                 "(Delete Session may have been processed first)");
+        ogs_gtp_send_error_message(s5c_xact, 0,
+                OGS_GTP2_DELETE_BEARER_RESPONSE_TYPE,
+                OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND);
+        return;
+    }
+    if (!sess) {
+        ogs_warn("[DBResp] Session has already been removed");
+        ogs_gtp_send_error_message(s5c_xact, 0,
+                OGS_GTP2_DELETE_BEARER_RESPONSE_TYPE,
+                OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND);
+        return;
+    }
 
     /************************
      * Check SGWC-UE Context

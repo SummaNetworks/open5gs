@@ -159,7 +159,11 @@ void smf_s6b_send_aar(smf_sess_t *sess, ogs_gtp_xact_t *xact)
 
         /* Allocate new session state memory */
         sess_data = new_state(sid);
-        ogs_assert(sess_data);
+        if (!sess_data) {
+            ogs_error("new_state() failed: S6b sess_state_pool exhausted");
+            fd_msg_free(req);
+            return;
+        }
 
         ogs_debug("    Allocate new session: [%s]", sess_data->s6b_sid);
 

@@ -169,7 +169,11 @@ void smf_gx_send_ccr(smf_sess_t *sess, ogs_pool_id_t xact_id,
 
         /* Allocate new session state memory */
         sess_data = new_state(sid);
-        ogs_assert(sess_data);
+        if (!sess_data) {
+            ogs_error("new_state() failed: Gx sess_state_pool exhausted");
+            fd_msg_free(req);
+            return;
+        }
 
         ogs_debug("    Allocate new session: [%s]", sess_data->gx_sid);
 
@@ -1135,13 +1139,19 @@ out:
         sess_data->cc_request_type, sess_data->cc_request_number);
     ogs_debug("    Current CC-Request-Number[%d]", cc_request_number);
     
-    /* Don't automatically cleanup Diameter session state for CCR-T responses.
-     * Let the proper session management flow handle cleanup to avoid race conditions
-     * where RAR arrives after premature Diameter state cleanup. */
-    ogs_debug("    fd_sess_state_store(): [%s]", sess_data->gx_sid);
-    ret = fd_sess_state_store(smf_gx_reg, session, &sess_data);
-    ogs_assert(ret == 0);
-    ogs_assert(sess_data == NULL);
+    if (sess_data->cc_request_type ==
+            OGS_DIAM_GX_CC_REQUEST_TYPE_TERMINATION_REQUEST &&
+        sess_data->cc_request_number <= cc_request_number) {
+        ogs_debug("    [LAST] state_cleanup(): [%s]", sess_data->gx_sid);
+        if (sess)
+            sess->gx_sid = NULL;
+        state_cleanup(sess_data, NULL, NULL);
+    } else {
+        ogs_debug("    fd_sess_state_store(): [%s]", sess_data->gx_sid);
+        ret = fd_sess_state_store(smf_gx_reg, session, &sess_data);
+        ogs_assert(ret == 0);
+        ogs_assert(sess_data == NULL);
+    }
 
     ret = fd_msg_free(*msg);
     ogs_assert(ret == 0);

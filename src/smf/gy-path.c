@@ -702,7 +702,11 @@ void smf_gy_send_ccr(smf_sess_t *sess, ogs_pool_id_t xact_id,
 
         /* Allocate new session state memory */
         sess_data = new_state(sid);
-        ogs_assert(sess_data);
+        if (!sess_data) {
+            ogs_error("new_state() failed: Gy sess_state_pool exhausted");
+            fd_msg_free(req);
+            return;
+        }
 
         ogs_debug("    Allocate new Gy session: [%s]", sess_data->gy_sid);
         /* Save Session-Id to SMF Session Context */

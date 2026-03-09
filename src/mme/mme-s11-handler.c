@@ -1902,10 +1902,15 @@ void mme_s11_handle_create_indirect_data_forwarding_tunnel_response(
         }
     }
 
-    source_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
+    source_ue = enb_ue; /* Already resolved from xact->enb_ue_id at line 1790 */
     if (!source_ue) {
         ogs_error("[%s] Source ENB-S1 context has already been removed",
                 mme_ue->imsi_bcd);
+        if (mme_ue_have_indirect_tunnel(mme_ue) == true) {
+            ogs_warn("[%s] Clearing indirect tunnel locally - "
+                    "SGW-side indirect tunnel may leak",
+                    mme_ue->imsi_bcd);
+        }
         mme_ue_clear_indirect_tunnel(mme_ue);
         return;
     }

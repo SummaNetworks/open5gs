@@ -1831,8 +1831,8 @@ void smf_sess_remove(smf_sess_t *sess)
 
     /* Clean up Diameter session state to prevent "No Session Data" errors */
     if (sess->gx_sid) {
-        ogs_info("Cleaning up Diameter Gx session state: %s", sess->gx_sid);
-        /* Note: sess->gx_sid points to Diameter session state memory, don't free directly */
+        ogs_warn("Diameter Gx session state not cleaned up by CCA-T: %s",
+                sess->gx_sid);
         sess->gx_sid = NULL;
     }
     if (sess->gy_sid) {

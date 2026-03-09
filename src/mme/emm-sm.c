@@ -827,11 +827,14 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                 ogs_debug("    Initial UE Message");
 
                 if (!MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
-                    /* Generate P-TMSI if not available */
-                    ogs_warn("P-TMSI not available for UE[%s] - Generating new one", mme_ue->imsi_bcd);
-                    uint32_t tmsi = ogs_random32();
-                    mme_ue->p_tmsi = tmsi;
-                    mme_ue->current.guti.m_tmsi = tmsi;
+                    ogs_warn("No SGs connection for UE[%s]"
+                             " - CS domain not available",
+                             mme_ue->imsi_bcd);
+                    r = nas_eps_send_service_reject(enb_ue, mme_ue,
+                        OGS_NAS_EMM_CAUSE_CS_DOMAIN_NOT_AVAILABLE);
+                    ogs_expect(r == OGS_OK);
+                    ogs_assert(r != OGS_ERROR);
+                    break;
                 }
 
                 if (mme_ue->nas_eps.service.value ==
@@ -842,12 +845,12 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                             mme_ue->nas_eps.service.value);
                     int rv = sgsap_send_mo_csfb_indication(mme_ue);
                     if (rv != OGS_OK) {
-                        ogs_error("Failed to send MO-CSFB-INDICATION for UE[%s]", mme_ue->imsi_bcd);
+                        ogs_warn("CS domain not available for UE[%s]"
+                                 " - CSFB failed", mme_ue->imsi_bcd);
                         r = nas_eps_send_service_reject(enb_ue, mme_ue,
                             OGS_NAS_EMM_CAUSE_CS_DOMAIN_NOT_AVAILABLE);
                         ogs_expect(r == OGS_OK);
                         ogs_assert(r != OGS_ERROR);
-                        OGS_FSM_TRAN(s, &emm_state_exception);
                         break;
                     }
                 } else if (mme_ue->nas_eps.service.value ==
@@ -861,10 +864,9 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                     ogs_warn(" Unknown CSFB Service Type[%d]",
                             mme_ue->nas_eps.service.value);
                     r = nas_eps_send_service_reject(enb_ue, mme_ue,
-                        OGS_NAS_EMM_CAUSE_UE_IDENTITY_CANNOT_BE_DERIVED_BY_THE_NETWORK);
+                        OGS_NAS_EMM_CAUSE_CS_DOMAIN_NOT_AVAILABLE);
                     ogs_expect(r == OGS_OK);
                     ogs_assert(r != OGS_ERROR);
-                    OGS_FSM_TRAN(s, &emm_state_exception);
                     break;
                 }
 
@@ -877,9 +879,11 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                 ogs_debug("    Uplink NAS Transport");
 
                 if (!MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
-                    ogs_warn("No P-TMSI : UE[%s]", mme_ue->imsi_bcd);
+                    ogs_warn("No SGs connection for UE[%s]"
+                             " - CS domain not available",
+                             mme_ue->imsi_bcd);
                     r = nas_eps_send_service_reject(enb_ue, mme_ue,
-                        OGS_NAS_EMM_CAUSE_UE_IDENTITY_CANNOT_BE_DERIVED_BY_THE_NETWORK);
+                        OGS_NAS_EMM_CAUSE_CS_DOMAIN_NOT_AVAILABLE);
                     ogs_expect(r == OGS_OK);
                     ogs_assert(r != OGS_ERROR);
                     break;
@@ -893,12 +897,12 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                             mme_ue->nas_eps.service.value);
                     int rv = sgsap_send_mo_csfb_indication(mme_ue);
                     if (rv != OGS_OK) {
-                        ogs_error("Failed to send MO-CSFB-INDICATION for UE[%s]", mme_ue->imsi_bcd);
+                        ogs_warn("CS domain not available for UE[%s]"
+                                 " - CSFB failed", mme_ue->imsi_bcd);
                         r = nas_eps_send_service_reject(enb_ue, mme_ue,
                             OGS_NAS_EMM_CAUSE_CS_DOMAIN_NOT_AVAILABLE);
                         ogs_expect(r == OGS_OK);
                         ogs_assert(r != OGS_ERROR);
-                        OGS_FSM_TRAN(s, &emm_state_exception);
                         break;
                     }
                 } else if (mme_ue->nas_eps.service.value ==
@@ -912,10 +916,9 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                     ogs_warn(" Unknown CSFB Service Type[%d]",
                             mme_ue->nas_eps.service.value);
                     r = nas_eps_send_service_reject(enb_ue, mme_ue,
-                        OGS_NAS_EMM_CAUSE_UE_IDENTITY_CANNOT_BE_DERIVED_BY_THE_NETWORK);
+                        OGS_NAS_EMM_CAUSE_CS_DOMAIN_NOT_AVAILABLE);
                     ogs_expect(r == OGS_OK);
                     ogs_assert(r != OGS_ERROR);
-                    OGS_FSM_TRAN(s, &emm_state_exception);
                     break;
                 }
 

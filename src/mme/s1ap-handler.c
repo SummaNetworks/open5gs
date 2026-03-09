@@ -1964,12 +1964,20 @@ void s1ap_handle_ue_context_release_action(enb_ue_t *enb_ue)
         break;
     case S1AP_UE_CTX_REL_S1_REMOVE_AND_UNLINK:
         ogs_debug("    Action: S1 normal release");
-        enb_ue_remove(enb_ue);
-        if (!mme_ue) {
-            ogs_error("No UE(mme-ue) context");
-            return;
+        {
+            ogs_pool_id_t removed_id = enb_ue->id;
+            enb_ue_remove(enb_ue);
+            if (!mme_ue) {
+                ogs_error("No UE(mme-ue) context");
+                return;
+            }
+            if (mme_ue->enb_ue_id == removed_id)
+                enb_ue_unlink(mme_ue);
+            else
+                ogs_warn("S1_REMOVE_AND_UNLINK: enb_ue_id mismatch "
+                         "(current:%d, removed:%d) - skipping unlink",
+                         (int)mme_ue->enb_ue_id, (int)removed_id);
         }
-        enb_ue_unlink(mme_ue);
         break;
     case S1AP_UE_CTX_REL_UE_CONTEXT_REMOVE:
         ogs_debug("    Action: UE context remove");
