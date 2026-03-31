@@ -312,8 +312,13 @@ ogs_pkbuf_t *mme_s11_build_create_session_request(
             memset(&enb_s1u_teid[i], 0, sizeof(ogs_gtp2_f_teid_t));
             enb_s1u_teid[i].interface_type = OGS_GTP2_F_TEID_S1_U_ENODEB_GTP_U;
             enb_s1u_teid[i].teid = htobe32(bearer->enb_s1u_teid);
-            ogs_assert(OGS_OK == ogs_gtp2_ip_to_f_teid(
-                &bearer->enb_s1u_ip, &enb_s1u_teid[i], &enb_s1u_len[i]));
+            rv = ogs_gtp2_ip_to_f_teid(
+                &bearer->enb_s1u_ip, &enb_s1u_teid[i], &enb_s1u_len[i]);
+            if (rv != OGS_OK) {
+                ogs_error("ogs_gtp2_ip_to_f_teid() failed "
+                          "for enb_s1u bearer EBI[%d]", bearer->ebi);
+                return NULL;
+            }
             req->bearer_contexts_to_be_created[i].s1_u_enodeb_f_teid.
                 presence = 1;
             req->bearer_contexts_to_be_created[i].s1_u_enodeb_f_teid.data =
@@ -329,8 +334,13 @@ ogs_pkbuf_t *mme_s11_build_create_session_request(
             memset(&pgw_s5u_teid[i], 0, sizeof(ogs_gtp2_f_teid_t));
             pgw_s5u_teid[i].interface_type = OGS_GTP2_F_TEID_S5_S8_PGW_GTP_U;
             pgw_s5u_teid[i].teid = htobe32(bearer->pgw_s5u_teid);
-            ogs_assert(OGS_OK == ogs_gtp2_ip_to_f_teid(
-                &bearer->pgw_s5u_ip, &pgw_s5u_teid[i], &pgw_s5u_len[i]));
+            rv = ogs_gtp2_ip_to_f_teid(
+                &bearer->pgw_s5u_ip, &pgw_s5u_teid[i], &pgw_s5u_len[i]);
+            if (rv != OGS_OK) {
+                ogs_error("ogs_gtp2_ip_to_f_teid() failed "
+                          "for pgw_s5u bearer EBI[%d]", bearer->ebi);
+                return NULL;
+            }
             req->bearer_contexts_to_be_created[i].s4_u_sgsn_f_teid.
                 presence = 1;
             req->bearer_contexts_to_be_created[i].s4_u_sgsn_f_teid.data =
@@ -389,6 +399,7 @@ ogs_pkbuf_t *mme_s11_build_create_session_request(
 ogs_pkbuf_t *mme_s11_build_modify_bearer_request(
         uint8_t type, mme_ue_t *mme_ue, int uli_presence)
 {
+    int rv;
     ogs_gtp2_message_t gtp_message;
     ogs_gtp2_modify_bearer_request_t *req = NULL;
 
@@ -433,8 +444,13 @@ ogs_pkbuf_t *mme_s11_build_modify_bearer_request(
         memset(&enb_s1u_teid[i], 0, sizeof(ogs_gtp2_f_teid_t));
         enb_s1u_teid[i].interface_type = OGS_GTP2_F_TEID_S1_U_ENODEB_GTP_U;
         enb_s1u_teid[i].teid = htobe32(bearer->enb_s1u_teid);
-        ogs_assert(OGS_OK == ogs_gtp2_ip_to_f_teid(
-            &bearer->enb_s1u_ip, &enb_s1u_teid[i], &enb_s1u_len[i]));
+        rv = ogs_gtp2_ip_to_f_teid(
+            &bearer->enb_s1u_ip, &enb_s1u_teid[i], &enb_s1u_len[i]);
+        if (rv != OGS_OK) {
+            ogs_error("ogs_gtp2_ip_to_f_teid() failed "
+                      "for bearer EBI[%d]", bearer->ebi);
+            return NULL;
+        }
         req->bearer_contexts_to_be_modified[i].s1_u_enodeb_f_teid.presence = 1;
         req->bearer_contexts_to_be_modified[i].s1_u_enodeb_f_teid.data =
             &enb_s1u_teid[i];

@@ -3194,6 +3194,8 @@ void s1ap_handle_handover_request_ack(
     S1AP_MME_UE_S1AP_ID_t *MME_UE_S1AP_ID = NULL;
     S1AP_ENB_UE_S1AP_ID_t *ENB_UE_S1AP_ID = NULL;
     S1AP_E_RABAdmittedList_t *E_RABAdmittedList = NULL;
+    S1AP_E_RABFailedtoSetupListHOReqAck_t
+        *E_RABFailedtoSetupListHOReqAck = NULL;
     S1AP_Target_ToSource_TransparentContainer_t
         *Target_ToSource_TransparentContainer = NULL;
 
@@ -3223,6 +3225,10 @@ void s1ap_handle_handover_request_ack(
             break;
         case S1AP_ProtocolIE_ID_id_E_RABAdmittedList:
             E_RABAdmittedList = &ie->value.choice.E_RABAdmittedList;
+            break;
+        case S1AP_ProtocolIE_ID_id_E_RABFailedToSetupListHOReqAck:
+            E_RABFailedtoSetupListHOReqAck =
+                &ie->value.choice.E_RABFailedtoSetupListHOReqAck;
             break;
         case S1AP_ProtocolIE_ID_id_Target_ToSource_TransparentContainer:
             Target_ToSource_TransparentContainer =
@@ -3407,6 +3413,30 @@ void s1ap_handle_handover_request_ack(
                 ogs_assert(r != OGS_ERROR);
                 return;
             }
+        }
+    }
+
+    if (E_RABFailedtoSetupListHOReqAck) {
+        for (i = 0;
+                i < E_RABFailedtoSetupListHOReqAck->list.count; i++) {
+            S1AP_E_RABFailedtoSetupItemHOReqAckIEs_t *item =
+                (S1AP_E_RABFailedtoSetupItemHOReqAckIEs_t *)
+                E_RABFailedtoSetupListHOReqAck->list.array[i];
+            S1AP_E_RABFailedToSetupItemHOReqAck_t *e_rab = NULL;
+
+            if (!item) {
+                ogs_error(
+                    "No S1AP_E_RABFailedtoSetupItemHOReqAckIEs_t");
+                continue;
+            }
+
+            e_rab = &item->value.choice.E_RABFailedToSetupItemHOReqAck;
+
+            ogs_warn("HO Request Ack: E-RAB[%d] setup failed "
+                     "[Cause Group:%d Cause:%d]",
+                     (int)e_rab->e_RAB_ID,
+                     (int)e_rab->cause.present,
+                     (int)e_rab->cause.choice.radioNetwork);
         }
     }
 
@@ -3961,13 +3991,20 @@ void s1ap_handle_handover_notification(
 
     ogs_list_for_each(&mme_ue->sess_list, sess) {
         ogs_list_for_each(&sess->bearer_list, bearer) {
+            if (!bearer->target_s1u_ip.ipv4 &&
+                    !bearer->target_s1u_ip.ipv6) {
+                ogs_warn("Bearer EBI[%d] has no valid target S1U IP "
+                         "(E-RAB setup may have failed), skipping",
+                         bearer->ebi);
+                continue;
+            }
+
             bearer->enb_s1u_teid = bearer->target_s1u_teid;
             memcpy(&bearer->enb_s1u_ip, &bearer->target_s1u_ip,
                     sizeof(ogs_ip_t));
 
             ogs_list_add(
                     &mme_ue->bearer_to_modify_list, &bearer->to_modify_node);
-
         }
     }
 

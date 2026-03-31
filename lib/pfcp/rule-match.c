@@ -55,7 +55,11 @@ static int decode_ipv6_header(
         uint32_t jp_len = 0;
         struct ip6_opt_jumbo *jumbo = NULL;
 
-        ogs_assert(nxt == 0);
+        if (nxt != 0) {
+            ogs_error("Invalid IPv6 Jumbo Frame: "
+                      "expected HOPOPTS(0) but got nxt=%d", nxt);
+            return OGS_ERROR;
+        }
 
         jumbo = (struct ip6_opt_jumbo *)jp;
         memcpy(&jp_len, jumbo->ip6oj_jumbo_len, sizeof(jp_len));
@@ -150,7 +154,12 @@ ogs_pfcp_rule_t *ogs_pfcp_pdr_rule_find_by_packet(
             ip_h = NULL;
             ip6_h = (struct ip6_hdr *)pkbuf->data;
 
-            decode_ipv6_header(ip6_h, &proto, &ip_hlen);
+            if (decode_ipv6_header(ip6_h, &proto, &ip_hlen) != OGS_OK) {
+                ogs_error("Failed to decode IPv6 header "
+                          "[Packet Length:%d]", pkbuf->len);
+                ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+                continue;
+            }
 
             src_addr = (void *)ip6_h->ip6_src.s6_addr;
             dst_addr = (void *)ip6_h->ip6_dst.s6_addr;
