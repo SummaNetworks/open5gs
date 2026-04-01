@@ -1160,6 +1160,10 @@ struct json_t;
 struct json_t *mme_tenant_control_to_json(void);
 struct json_t *mme_reload_tenant_control_with_diff(void);
 
+/* Test helpers for tenant_control */
+struct json_t *mme_test_compare_tenant_configs(void *old_config, int old_count);
+size_t mme_test_get_tenant_config_backup_size(void);
+
 #ifdef __cplusplus
 }
 #endif

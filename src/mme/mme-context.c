@@ -5338,6 +5338,41 @@ json_t *mme_tenant_control_to_json(void)
             json_array_append_new(imsi_array, imsi_item);
         }
         json_object_set_new(tenant, "allowed_imsi", imsi_array);
+
+        /* Add network_name if configured */
+        if (self->tenant_control[i].full_name.length > 0 ||
+            self->tenant_control[i].short_name.length > 0) {
+            json_t *network_name = json_object();
+
+            if (self->tenant_control[i].full_name.length > 0) {
+                ogs_nas_network_name_t *nn = &self->tenant_control[i].full_name;
+                /* UCS-2 to ASCII: length includes 1 byte for coding_scheme,
+                 * so text bytes = length - 1, ASCII chars = text_bytes / 2 */
+                int text_len = (nn->length - 1) / 2;
+                char name_str[OGS_NAS_MAX_NETWORK_NAME_LEN + 1];
+                int k;
+                for (k = 0; k < text_len && k < OGS_NAS_MAX_NETWORK_NAME_LEN; k++) {
+                    name_str[k] = nn->name[(k*2)+1];
+                }
+                name_str[k] = '\0';
+                json_object_set_new(network_name, "full", json_string(name_str));
+            }
+
+            if (self->tenant_control[i].short_name.length > 0) {
+                ogs_nas_network_name_t *nn = &self->tenant_control[i].short_name;
+                int text_len = (nn->length - 1) / 2;
+                char name_str[OGS_NAS_MAX_NETWORK_NAME_LEN + 1];
+                int k;
+                for (k = 0; k < text_len && k < OGS_NAS_MAX_NETWORK_NAME_LEN; k++) {
+                    name_str[k] = nn->name[(k*2)+1];
+                }
+                name_str[k] = '\0';
+                json_object_set_new(network_name, "short", json_string(name_str));
+            }
+
+            json_object_set_new(tenant, "network_name", network_name);
+        }
+
         json_array_append_new(tenants, tenant);
     }
     
@@ -5508,6 +5543,22 @@ static json_t *compare_tenant_configs(mme_context_t *self,
                     json_decref(imsi_removed);
                 }
 
+                /* Check network_name change */
+                if (memcmp(&self->tenant_control[i].full_name,
+                           &old_config[j].full_name,
+                           sizeof(ogs_nas_network_name_t)) != 0) {
+                    json_object_set_new(changes, "full_name_changed",
+                                       json_true());
+                    has_changes = true;
+                }
+                if (memcmp(&self->tenant_control[i].short_name,
+                           &old_config[j].short_name,
+                           sizeof(ogs_nas_network_name_t)) != 0) {
+                    json_object_set_new(changes, "short_name_changed",
+                                       json_true());
+                    has_changes = true;
+                }
+
                 if (has_changes) {
                     json_t *mod_tenant = json_object();
                     json_object_set_new(mod_tenant, "tenant_id",
@@ -5538,54 +5589,50 @@ json_t *mme_reload_tenant_control_with_diff(void)
     /* Backup current configuration */
     tenant_config_backup_t old_config[16];
     int old_count;
-    
-    /* Lock mutex and backup current configuration */
-    ogs_thread_mutex_lock(&self->tenant_control_mutex);
-    old_count = self->num_of_tenant_control;
-    memcpy(old_config, self->tenant_control, sizeof(self->tenant_control));
-    ogs_thread_mutex_unlock(&self->tenant_control_mutex);
-    
-    /* Parse YAML configuration file */
+
+    /* Parse YAML configuration file (outside mutex - I/O should not block) */
     FILE *file;
     yaml_parser_t parser;
     yaml_document_t *document = NULL;
-    
+
     const char *config_file = ogs_app()->file;
     if (!config_file) {
         config_file = "/etc/open5gs/mme.yaml";
     }
-    
+
     file = fopen(config_file, "rb");
     if (!file) {
         json_object_set_new(result, "status", json_string("error"));
-        json_object_set_new(result, "message", 
+        json_object_set_new(result, "message",
                            json_string("Cannot open configuration file"));
         return result;
     }
-    
+
     if (!yaml_parser_initialize(&parser)) {
         fclose(file);
         json_object_set_new(result, "status", json_string("error"));
-        json_object_set_new(result, "message", 
+        json_object_set_new(result, "message",
                            json_string("Failed to initialize YAML parser"));
         return result;
     }
-    
+
     yaml_parser_set_input_file(&parser, file);
-    
+
     document = calloc(1, sizeof(yaml_document_t));
     if (!yaml_parser_load(&parser, document)) {
         free(document);
         yaml_parser_delete(&parser);
         fclose(file);
         json_object_set_new(result, "status", json_string("error"));
-        json_object_set_new(result, "message", 
+        json_object_set_new(result, "message",
                            json_string("Failed to parse YAML configuration"));
         return result;
     }
-    
-    /* Clear current tenant control configuration */
+
+    /* Lock mutex: backup, clear, re-parse, and diff all under one lock */
     ogs_thread_mutex_lock(&self->tenant_control_mutex);
+    old_count = self->num_of_tenant_control;
+    memcpy(old_config, self->tenant_control, sizeof(self->tenant_control));
     self->num_of_tenant_control = 0;
     
     /* Parse tenant_control section from YAML */
@@ -5636,13 +5683,13 @@ json_t *mme_reload_tenant_control_with_diff(void)
                             } else if (strcmp(tenant_key, "allowed_imsi") == 0) {
                                 ogs_yaml_iter_t imsi_array;
                                 ogs_yaml_iter_recurse(&tenant_control_iter, &imsi_array);
-                                
+
                                 self->tenant_control[self->num_of_tenant_control].num_of_imsi_range = 0;
-                                
+
                                 do {
                                     if (!ogs_yaml_iter_next(&imsi_array))
                                         break;
-                                        
+
                                     const char *imsi_range = ogs_yaml_iter_value(&imsi_array);
                                     if (imsi_range) {
                                         int range_idx = self->tenant_control[self->num_of_tenant_control].num_of_imsi_range;
@@ -5666,6 +5713,55 @@ json_t *mme_reload_tenant_control_with_diff(void)
                                         }
                                     }
                                 } while (ogs_yaml_iter_type(&imsi_array) == YAML_SEQUENCE_NODE);
+                            } else if (strcmp(tenant_key, "network_name") == 0) {
+                                ogs_yaml_iter_t network_name_iter;
+                                ogs_yaml_iter_recurse(&tenant_control_iter, &network_name_iter);
+
+                                while (ogs_yaml_iter_next(&network_name_iter)) {
+                                    const char *network_name_key =
+                                        ogs_yaml_iter_key(&network_name_iter);
+                                    if (!network_name_key)
+                                        continue;
+                                    if (strcmp(network_name_key, "full") == 0) {
+                                        ogs_nas_network_name_t *network_full_name =
+                                            &self->tenant_control[self->num_of_tenant_control].full_name;
+                                        const char *c_network_name =
+                                            ogs_yaml_iter_value(&network_name_iter);
+                                        if (c_network_name) {
+                                            uint8_t size = strlen(c_network_name);
+                                            uint8_t nn_i;
+                                            for (nn_i = 0; nn_i < size; nn_i++) {
+                                                /* Workaround to convert the ASCII to UCS-2 */
+                                                network_full_name->name[nn_i*2] = 0;
+                                                network_full_name->name[(nn_i*2)+1] =
+                                                    c_network_name[nn_i];
+                                            }
+                                            network_full_name->length = size*2+1;
+                                            network_full_name->coding_scheme = 1;
+                                            network_full_name->ext = 1;
+                                        }
+                                    } else if (strcmp(network_name_key, "short") == 0) {
+                                        ogs_nas_network_name_t *network_short_name =
+                                            &self->tenant_control[self->num_of_tenant_control].short_name;
+                                        const char *c_network_name =
+                                            ogs_yaml_iter_value(&network_name_iter);
+                                        if (c_network_name) {
+                                            uint8_t size = strlen(c_network_name);
+                                            uint8_t nn_i;
+                                            for (nn_i = 0; nn_i < size; nn_i++) {
+                                                /* Workaround to convert the ASCII to UCS-2 */
+                                                network_short_name->name[nn_i*2] = 0;
+                                                network_short_name->name[(nn_i*2)+1] =
+                                                    c_network_name[nn_i];
+                                            }
+                                            network_short_name->length = size*2+1;
+                                            network_short_name->coding_scheme = 1;
+                                            network_short_name->ext = 1;
+                                        }
+                                    } else {
+                                        ogs_warn("unknown key `%s` in network_name", network_name_key);
+                                    }
+                                }
                             }
                         }
                         
@@ -5698,4 +5794,18 @@ json_t *mme_reload_tenant_control_with_diff(void)
     ogs_info("Tenant control configuration reloaded from %s", config_file);
 
     return result;
+}
+
+/* Test wrapper for compare_tenant_configs (used by unit tests) */
+json_t *mme_test_compare_tenant_configs(void *old_config, int old_count)
+{
+    return compare_tenant_configs(mme_self(),
+                                 (tenant_config_backup_t *)old_config,
+                                 old_count);
+}
+
+/* Return size of tenant_config_backup_t for test verification */
+size_t mme_test_get_tenant_config_backup_size(void)
+{
+    return sizeof(tenant_config_backup_t);
 }
