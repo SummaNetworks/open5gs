@@ -97,13 +97,29 @@ void esm_state_inactive(ogs_fsm_t *s, mme_event_t *e)
         CLEAR_BEARER_ALL_TIMERS(bearer);
         break;
     case OGS_FSM_EXIT_SIG:
+        /*
+         * T3485 (Activate-default retransmit) is only meaningful while the
+         * bearer is stuck in esm_state_inactive. Clear it on every exit so it
+         * cannot fire in a state that does not handle it (e.g. a stuck bearer
+         * receiving PDN_DISCONNECT_REQUEST transitions to
+         * esm_state_pdn_will_disconnect, which has no T3485 handler). Only
+         * t3485 is cleared here: a deactivate sent just before the transition
+         * arms t3495, which must be preserved (EXIT runs after the handler).
+         */
+        CLEAR_BEARER_TIMER(bearer->t3485);
         break;
     case MME_EVENT_ESM_MESSAGE:
         message = e->nas_message;
         ogs_assert(message);
 
         enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
-        ogs_assert(enb_ue);
+        if (!enb_ue) {
+            ogs_warn("[%s] No eNB-UE context; abort ESM message(type:%d) - "
+                    "S1 context released mid-procedure (no crash)",
+                    mme_ue->imsi_bcd, message->esm.h.message_type);
+            OGS_FSM_TRAN(s, esm_state_exception);
+            break;
+        }
 
         switch (message->esm.h.message_type) {
         case OGS_NAS_EPS_PDN_CONNECTIVITY_REQUEST:
@@ -153,7 +169,13 @@ void esm_state_inactive(ogs_fsm_t *s, mme_event_t *e)
             if (h.integrity_protected == 0) {
                 ogs_error("[%s] No Integrity Protected", mme_ue->imsi_bcd);
 
-                ogs_assert(enb_ue);
+                if (!enb_ue) {
+                ogs_warn("[%s] No eNB-UE context; abort ESM message(type:%d) "
+                        "(no crash)", mme_ue->imsi_bcd,
+                        message->esm.h.message_type);
+                OGS_FSM_TRAN(s, esm_state_exception);
+                break;
+            }
 
                 r = nas_eps_send_attach_reject(enb_ue, mme_ue,
                         OGS_NAS_EMM_CAUSE_SECURITY_MODE_REJECTED_UNSPECIFIED,
@@ -172,7 +194,13 @@ void esm_state_inactive(ogs_fsm_t *s, mme_event_t *e)
             if (!SECURITY_CONTEXT_IS_VALID(mme_ue)) {
                 ogs_warn("[%s] No Security Context", mme_ue->imsi_bcd);
 
-                ogs_assert(enb_ue);
+                if (!enb_ue) {
+                ogs_warn("[%s] No eNB-UE context; abort ESM message(type:%d) "
+                        "(no crash)", mme_ue->imsi_bcd,
+                        message->esm.h.message_type);
+                OGS_FSM_TRAN(s, esm_state_exception);
+                break;
+            }
 
                 r = nas_eps_send_attach_reject(enb_ue, mme_ue,
                         OGS_NAS_EMM_CAUSE_SECURITY_MODE_REJECTED_UNSPECIFIED,
@@ -199,7 +227,11 @@ void esm_state_inactive(ogs_fsm_t *s, mme_event_t *e)
             ogs_debug("Activate default EPS bearer context accept");
             ogs_debug("    IMSI[%s] PTI[%d] EBI[%d]",
                     mme_ue->imsi_bcd, sess->pti, bearer->ebi);
-            /* Check if Initial Context Setup Response or 
+            /* T3485 safety net: activation confirmed -> stop retransmit timer
+             * and clear the stuck marker (no longer a recovery candidate). */
+            CLEAR_BEARER_TIMER(bearer->t3485);
+            bearer->reactivation_stuck = 0;
+            /* Check if Initial Context Setup Response or
              *          E-RAB Setup Response is received */
             if (MME_HAVE_ENB_S1U_PATH(bearer)) {
                 ogs_list_init(&mme_ue->bearer_to_modify_list);
@@ -246,6 +278,52 @@ void esm_state_inactive(ogs_fsm_t *s, mme_event_t *e)
         break;
     case MME_EVENT_ESM_TIMER:
         switch (e->timer_id) {
+        case MME_TIMER_T3485:
+            /*
+             * Activate Default Bearer Context Request retransmission timer
+             * (stuck IMS default-bearer safety net). The connection is still
+             * up (S1 release would have cleared T3485 via CLEAR_BEARER_ALL_
+             * TIMERS). Retransmit the saved ESM PDU via Downlink NAS Transport
+             * (NOT a fresh E-RAB Setup); this recovers the "ACCEPT lost on a
+             * live connection / UE PTI still pending" sub-case.
+             *
+             * On exhaustion, the bearer is genuinely stuck. Do NOT send a
+             * network-initiated Deactivate (the UE rejects it with PTI mismatch
+             * since it is not running a matching procedure). Instead release the
+             * stuck PDN with an MME-driven Delete Session (leak-free SGW/SMF/UPF
+             * teardown); the UE's next PDN connectivity request then creates a
+             * fresh session (see mme_bearer_find_or_add_by_message()).
+             */
+            if (bearer->t3485.retry_count >=
+                    mme_timer_cfg(MME_TIMER_T3485)->max_count) {
+                enb_ue_t *enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
+                sgw_ue_t *sgw_ue = sgw_ue_find_by_id(mme_ue->sgw_ue_id);
+                ogs_warn("[%s] T3485 exhausted for EBI[%d]; releasing stuck "
+                        "PDN session", mme_ue->imsi_bcd, bearer->ebi);
+                CLEAR_BEARER_TIMER(bearer->t3485);
+                bearer->reactivation_stuck = 0;
+                if (sgw_ue && MME_HAVE_SGW_S1U_PATH(sess) &&
+                        !sess->deletion_in_progress) {
+                    sess->deletion_in_progress = true;
+                    ogs_expect(OGS_OK ==
+                        mme_gtp_send_delete_session_request(
+                            enb_ue, sgw_ue, sess, OGS_GTP_DELETE_NO_ACTION));
+                }
+            } else if (ECM_CONNECTED(mme_ue)) {
+                enb_ue_t *enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
+                bearer->t3485.retry_count++;
+                if (enb_ue && bearer->t3485.pkbuf) {
+                    ogs_pkbuf_t *copy = ogs_pkbuf_copy(bearer->t3485.pkbuf);
+                    if (copy) {
+                        r = nas_eps_send_to_downlink_nas_transport(
+                                enb_ue, copy);
+                        ogs_expect(r == OGS_OK);
+                    }
+                    ogs_timer_start(bearer->t3485.timer,
+                            mme_timer_cfg(MME_TIMER_T3485)->duration);
+                }
+            }
+            break;
         case MME_TIMER_T3489:
             if (bearer->t3489.retry_count >=
                     mme_timer_cfg(MME_TIMER_T3489)->max_count) {
@@ -315,7 +393,13 @@ void esm_state_active(ogs_fsm_t *s, mme_event_t *e)
             ogs_debug("PDN Connectivity request");
             ogs_debug("    IMSI[%s] PTI[%d] EBI[%d]",
                     mme_ue->imsi_bcd, sess->pti, bearer->ebi);
-            ogs_assert(enb_ue);
+            if (!enb_ue) {
+                ogs_warn("[%s] No eNB-UE context; abort ESM message(type:%d) "
+                        "(no crash)", mme_ue->imsi_bcd,
+                        message->esm.h.message_type);
+                OGS_FSM_TRAN(s, esm_state_exception);
+                break;
+            }
             rv = esm_handle_pdn_connectivity_request(
                     enb_ue, bearer, &message->esm.pdn_connectivity_request,
                     e->create_action);
@@ -331,7 +415,13 @@ void esm_state_active(ogs_fsm_t *s, mme_event_t *e)
             ogs_debug("    IMSI[%s] PTI[%d] EBI[%d]",
                     mme_ue->imsi_bcd, sess->pti, bearer->ebi);
 
-            ogs_assert(enb_ue);
+            if (!enb_ue) {
+                ogs_warn("[%s] No eNB-UE context; abort ESM message(type:%d) "
+                        "(no crash)", mme_ue->imsi_bcd,
+                        message->esm.h.message_type);
+                OGS_FSM_TRAN(s, esm_state_exception);
+                break;
+            }
             if (MME_HAVE_SGW_S1U_PATH(sess)) {
                 sgw_ue = sgw_ue_find_by_id(mme_ue->sgw_ue_id);
                 ogs_assert(sgw_ue);
@@ -374,7 +464,13 @@ void esm_state_active(ogs_fsm_t *s, mme_event_t *e)
             ogs_debug("Bearer resource allocation request");
             ogs_debug("    IMSI[%s] PTI[%d] EBI[%d]",
                     mme_ue->imsi_bcd, sess->pti, bearer->ebi);
-            ogs_assert(enb_ue);
+            if (!enb_ue) {
+                ogs_warn("[%s] No eNB-UE context; abort ESM message(type:%d) "
+                        "(no crash)", mme_ue->imsi_bcd,
+                        message->esm.h.message_type);
+                OGS_FSM_TRAN(s, esm_state_exception);
+                break;
+            }
             esm_handle_bearer_resource_allocation_request(
                     enb_ue, bearer, message);
             break;
@@ -382,7 +478,13 @@ void esm_state_active(ogs_fsm_t *s, mme_event_t *e)
             ogs_debug("Bearer resource modification request");
             ogs_debug("    IMSI[%s] PTI[%d] EBI[%d]",
                     mme_ue->imsi_bcd, sess->pti, bearer->ebi);
-            ogs_assert(enb_ue);
+            if (!enb_ue) {
+                ogs_warn("[%s] No eNB-UE context; abort ESM message(type:%d) "
+                        "(no crash)", mme_ue->imsi_bcd,
+                        message->esm.h.message_type);
+                OGS_FSM_TRAN(s, esm_state_exception);
+                break;
+            }
             esm_handle_bearer_resource_modification_request(
                     enb_ue, bearer, message);
             break;
@@ -461,7 +563,13 @@ void esm_state_pdn_will_disconnect(ogs_fsm_t *s, mme_event_t *e)
         ogs_assert(message);
 
         enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
-        ogs_assert(enb_ue);
+        if (!enb_ue) {
+            ogs_warn("[%s] No eNB-UE context; abort ESM message(type:%d) - "
+                    "S1 context released mid-procedure (no crash)",
+                    mme_ue->imsi_bcd, message->esm.h.message_type);
+            OGS_FSM_TRAN(s, esm_state_exception);
+            break;
+        }
 
         switch (message->esm.h.message_type) {
         case OGS_NAS_EPS_DEACTIVATE_EPS_BEARER_CONTEXT_ACCEPT:

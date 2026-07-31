@@ -713,8 +713,9 @@ void upf_sess_urr_acc_add(upf_sess_t *sess, ogs_pfcp_urr_t *urr, size_t size, bo
         report.num_of_usage_report = 1;
         upf_sess_urr_acc_snapshot(sess, urr);
 
-        ogs_assert(OGS_OK ==
-            upf_pfcp_send_session_report_request(sess, &report));
+        if (upf_pfcp_send_session_report_request(sess, &report) != OGS_OK)
+            ogs_error("upf_pfcp_send_session_report_request() failed; "
+                    "skipping (no abort)");
         /* Start new report period/iteration: */
         upf_sess_urr_acc_timers_setup(sess, urr);
     }
@@ -806,7 +807,7 @@ static void upf_sess_urr_acc_timers_cb(void *data)
     ogs_pfcp_sess_t *pfcp_sess = urr->sess;
     upf_sess_t *sess = UPF_SESS(pfcp_sess);
 
-    ogs_info("upf_time_threshold_cb() triggered! urr=%p", urr);
+    ogs_debug("upf_time_threshold_cb() triggered! urr=%p", urr);
 
     if (urr->rep_triggers.quota_validity_time ||
         urr->rep_triggers.time_quota ||
@@ -816,8 +817,9 @@ static void upf_sess_urr_acc_timers_cb(void *data)
         report.num_of_usage_report = 1;
         upf_sess_urr_acc_snapshot(sess, urr);
 
-        ogs_assert(OGS_OK ==
-            upf_pfcp_send_session_report_request(sess, &report));
+        if (upf_pfcp_send_session_report_request(sess, &report) != OGS_OK)
+            ogs_error("upf_pfcp_send_session_report_request() failed; "
+                    "skipping (no abort)");
     }
     /* Start new report period/iteration: */
     upf_sess_urr_acc_timers_setup(sess, urr);
@@ -902,4 +904,34 @@ static void upf_sess_urr_acc_remove_all(upf_sess_t *sess)
             sess->urr_acc[i].t_time_quota = NULL;
         }
     }
+}
+
+/*
+ * Remove the accounting/timer state for a single URR id.
+ *
+ * Must be called when a Remove URR is processed (PFCP Session Modification),
+ * BEFORE ogs_pfcp_urr_remove() frees the URR. Otherwise the per-URR
+ * time_quota/time_threshold/validity timers keep running with a callback
+ * data pointer that still references the freed URR -> use-after-free, and
+ * the urr_acc slot (indexed by URR id) keeps stale accumulators that would
+ * corrupt the first delta of a future URR reusing the same id.
+ */
+void upf_sess_urr_acc_remove(upf_sess_t *sess, unsigned int urr_id)
+{
+    upf_sess_urr_acc_t *urr_acc;
+
+    ogs_assert(sess);
+    if (urr_id >= OGS_ARRAY_SIZE(sess->urr_acc))
+        return;
+    urr_acc = &sess->urr_acc[urr_id];
+
+    if (urr_acc->t_time_threshold)
+        ogs_timer_delete(urr_acc->t_time_threshold);
+    if (urr_acc->t_validity_time)
+        ogs_timer_delete(urr_acc->t_validity_time);
+    if (urr_acc->t_time_quota)
+        ogs_timer_delete(urr_acc->t_time_quota);
+
+    /* Clear timers + accumulators so a future URR reusing this id is clean. */
+    memset(urr_acc, 0, sizeof(*urr_acc));
 }

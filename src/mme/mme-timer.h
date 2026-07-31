@@ -38,6 +38,7 @@ typedef enum {
     MME_TIMER_T3450,
     MME_TIMER_T3460,
     MME_TIMER_T3470,
+    MME_TIMER_T3485,
     MME_TIMER_T3489,
     MME_TIMER_T3495,
 
@@ -72,6 +73,7 @@ void mme_timer_t3422_expire(void *data);
 void mme_timer_t3450_expire(void *data);
 void mme_timer_t3460_expire(void *data);
 void mme_timer_t3470_expire(void *data);
+void mme_timer_t3485_expire(void *data);
 void mme_timer_t3489_expire(void *data);
 void mme_timer_t3495_expire(void *data);
 

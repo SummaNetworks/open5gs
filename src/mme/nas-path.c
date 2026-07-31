@@ -607,6 +607,29 @@ int nas_eps_send_activate_default_bearer_context_request(
         return OGS_ERROR;
     }
 
+    /*
+     * T3485 safety net (standalone Activate Default only). The Attach-combined
+     * path (CREATE_IN_ATTACH_REQUEST) is protected by T3450/Attach Complete.
+     * Save a COPY of the ESM PDU now, BEFORE s1ap_build_e_rab_setup_request()
+     * consumes (frees) esmbuf, so a lost ACCEPT can be retransmitted via
+     * Downlink NAS Transport (T3489-style). Mark the bearer reactivation_stuck
+     * so the Recovery-A sweep can re-drive it after S1 release (the flag
+     * survives CLEAR_BEARER_ALL_TIMERS; it is cleared on ACTIVATE_DEFAULT
+     * ACCEPT). Clear any prior T3485 first to avoid leaking a stale pkbuf.
+     */
+    if (mme_self()->bearer_reactivation &&
+            create_action == OGS_GTP_CREATE_IN_UPLINK_NAS_TRANSPORT) {
+        CLEAR_BEARER_TIMER(bearer->t3485);
+        bearer->t3485.pkbuf = ogs_pkbuf_copy(esmbuf);
+        if (bearer->t3485.pkbuf) {
+            ogs_timer_start(bearer->t3485.timer,
+                    mme_timer_cfg(MME_TIMER_T3485)->duration);
+            bearer->reactivation_stuck = 1;
+        } else {
+            ogs_error("ogs_pkbuf_copy(bearer->t3485) failed");
+        }
+    }
+
     s1apbuf = s1ap_build_e_rab_setup_request(bearer, esmbuf);
     if (!s1apbuf) {
         ogs_error("s1ap_build_e_rab_setup_request() failed");

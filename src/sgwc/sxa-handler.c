@@ -501,39 +501,50 @@ void sgwc_sxa_handle_session_modification_response(
             ogs_error("No Context");
 
             sess_id = OGS_POINTER_TO_UINT(pfcp_xact->data);
-            ogs_assert(sess_id >= OGS_MIN_POOL_ID &&
-                    sess_id <= OGS_MAX_POOL_ID);
-
-            sess = sgwc_sess_find_by_id(sess_id);
-            ogs_assert(sess);
+            if (sess_id >= OGS_MIN_POOL_ID && sess_id <= OGS_MAX_POOL_ID)
+                sess = sgwc_sess_find_by_id(sess_id);
 
             cause_value = OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND;
+            /* sess may still be NULL — downstream defensive error path
+             * (cause_value != ACCEPTED branch) handles it. This race occurs
+             * e.g. when MME sends Release Access Bearers Request while a
+             * Delete Session Request for the same UE is still in flight:
+             * SGWU returns the Modification Response with SEID=0 and
+             * Cause=Session context not found, by which time the local
+             * SGWC session has already been freed via the Deletion path. */
         }
 
-        sgwc_ue = sgwc_ue_find_by_id(sess->sgwc_ue_id);
-        ogs_assert(sgwc_ue);
+        if (sess) {
+            sgwc_ue = sgwc_ue_find_by_id(sess->sgwc_ue_id);
+            if (!sgwc_ue) {
+                ogs_error("No SGWC UE Context");
+                cause_value = OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND;
+            }
+        }
 
     } else {
         ogs_pool_id_t bearer_id = OGS_POINTER_TO_UINT(pfcp_xact->data);
-        ogs_assert(bearer_id >= OGS_MIN_POOL_ID &&
-                bearer_id <= OGS_MAX_POOL_ID);
 
-        bearer = sgwc_bearer_find_by_id(bearer_id);
+        if (bearer_id >= OGS_MIN_POOL_ID && bearer_id <= OGS_MAX_POOL_ID)
+            bearer = sgwc_bearer_find_by_id(bearer_id);
+
         if (!bearer) {
             ogs_error("No Bearer Context");
             cause_value = OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND;
         } else {
+            if (!sess)
+                sess = sgwc_sess_find_by_id(bearer->sess_id);
+
             if (!sess) {
                 ogs_error("No Context");
-
-                sess = sgwc_sess_find_by_id(bearer->sess_id);
-                ogs_assert(sess);
-
                 cause_value = OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND;
             }
 
             sgwc_ue = sgwc_ue_find_by_id(bearer->sgwc_ue_id);
-            ogs_assert(sgwc_ue);
+            if (!sgwc_ue) {
+                ogs_error("No SGWC UE Context");
+                cause_value = OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND;
+            }
         }
     }
 
@@ -547,7 +558,7 @@ void sgwc_sxa_handle_session_modification_response(
         cause_value = OGS_GTP2_CAUSE_MANDATORY_IE_MISSING;
     }
 
-    if (cause_value == OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
+    if (cause_value == OGS_GTP2_CAUSE_REQUEST_ACCEPTED && sess && sgwc_ue) {
         uint8_t pfcp_cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
         uint8_t offending_ie_value = 0;
 

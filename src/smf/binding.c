@@ -183,7 +183,6 @@ void smf_bearer_binding(smf_sess_t *sess)
 {
     int rv;
     int i, j;
-    char ruleName[1024] = "";
     smf_bearer_t *bearer = NULL;
     ogs_pcc_rule_t *highest_priority_rule = NULL;
     int highest_priority = -1;
@@ -207,7 +206,7 @@ void smf_bearer_binding(smf_sess_t *sess)
            if (!bearer) {
               ogs_warn("No need to send 'Delete Bearer Request'");
               ogs_warn("  - Bearer[Name:%s] has already been removed.",
-                   ruleName);
+                   pcc_rule->name);
               continue;
            }
 
@@ -247,7 +246,12 @@ void smf_bearer_binding(smf_sess_t *sess)
 
         /* Create new bearer */
         bearer = smf_bearer_add(sess);
-        ogs_assert(bearer);
+        if (!bearer) {
+            ogs_error("Cannot install PCC rule [%s]: PFCP resource exhausted "
+                    "(per-session PDR limit reached). Rejecting the rule; "
+                    "session is kept alive.", highest_priority_rule->name);
+            return;
+        }
 
         dl_pdr = bearer->dl_pdr;
         ogs_assert(dl_pdr);

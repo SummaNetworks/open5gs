@@ -993,7 +993,14 @@ void mme_s11_handle_create_bearer_request(
 
     ogs_assert(sess);
     bearer = mme_bearer_add(sess);
-    ogs_assert(bearer);
+    if (!bearer) {
+        ogs_error("[%s] mme_bearer_add() failed - "
+                "EPS Bearer ID pool exhausted", mme_ue->imsi_bcd);
+        ogs_gtp2_send_error_message(xact, sgw_ue ? sgw_ue->sgw_s11_teid : 0,
+                OGS_GTP2_CREATE_BEARER_RESPONSE_TYPE,
+                OGS_GTP2_CAUSE_NO_RESOURCES_AVAILABLE);
+        return;
+    }
 
     ogs_debug("    MME_S11_TEID[%d] SGW_S11_TEID[%d]",
             mme_ue->mme_s11_teid, sgw_ue->sgw_s11_teid);

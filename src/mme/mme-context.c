@@ -223,6 +223,9 @@ static int mme_context_prepare(void)
     /* Set default paging failure policy */
     self.paging_failure_policy = MME_PAGING_FAILURE_POLICY_NO_ACTION;
 
+    /* Stuck IMS default-bearer auto-recovery: enabled by default */
+    self.bearer_reactivation = true;
+
     return OGS_OK;
 }
 
@@ -2561,6 +2564,38 @@ int mme_context_parse_config(void)
                     }
                 } else if (!strcmp(mme_key, "metrics")) {
                     /* handle config in metrics library */
+                } else if (!strcmp(mme_key, "bearer_reactivation")) {
+                    const char *v = ogs_yaml_iter_value(&mme_iter);
+                    if (v) {
+                        if (!strcmp(v, "false") || !strcmp(v, "no")) {
+                            self.bearer_reactivation = false;
+                            ogs_info("Bearer reactivation (T3485) disabled");
+                        } else {
+                            self.bearer_reactivation = true;
+                            ogs_info("Bearer reactivation (T3485) enabled");
+                        }
+                    }
+                } else if (!strcmp(mme_key,
+                            "bearer_reactivation_t3485_duration")) {
+                    const char *v = ogs_yaml_iter_value(&mme_iter);
+                    if (v) {
+                        int sec = atoi(v);
+                        if (sec > 0) {
+                            mme_timer_cfg(MME_TIMER_T3485)->duration =
+                                ogs_time_from_sec(sec);
+                            ogs_info("T3485 duration set to %d s", sec);
+                        }
+                    }
+                } else if (!strcmp(mme_key,
+                            "bearer_reactivation_t3485_max_count")) {
+                    const char *v = ogs_yaml_iter_value(&mme_iter);
+                    if (v) {
+                        int n = atoi(v);
+                        if (n > 0) {
+                            mme_timer_cfg(MME_TIMER_T3485)->max_count = n;
+                            ogs_info("T3485 max_count set to %d", n);
+                        }
+                    }
                 } else if (!strcmp(mme_key, "paging_failure_policy")) {
                     const char *v = ogs_yaml_iter_value(&mme_iter);
                     if (v) {
@@ -4418,7 +4453,11 @@ mme_sess_t *mme_sess_add(mme_ue_t *mme_ue, uint8_t pti)
     sess->pti = pti;
 
     bearer = mme_bearer_add(sess);
-    ogs_assert(bearer);
+    if (!bearer) {
+        ogs_error("[%s] mme_bearer_add() failed", mme_ue->imsi_bcd);
+        ogs_pool_id_free(&mme_sess_pool, sess);
+        return NULL;
+    }
 
     ogs_list_add(&mme_ue->sess_list, sess);
 
@@ -4556,7 +4595,15 @@ mme_bearer_t *mme_bearer_add(mme_sess_t *sess)
     ogs_list_init(&bearer->update.xact_list);
 
     ogs_pool_alloc(&mme_ue->ebi_pool, &bearer->ebi_node);
-    ogs_assert(bearer->ebi_node);
+    if (!bearer->ebi_node) {
+        ogs_error("[%s] EPS Bearer ID pool exhausted "
+                "(max %d bearers per UE, EBI %d-%d)",
+                mme_ue->imsi_bcd,
+                MAX_EPS_BEARER_ID-MIN_EPS_BEARER_ID+1,
+                MIN_EPS_BEARER_ID, MAX_EPS_BEARER_ID);
+        ogs_pool_id_free(&mme_bearer_pool, bearer);
+        return NULL;
+    }
 
     bearer->ebi = *(bearer->ebi_node);
 
@@ -4568,6 +4615,11 @@ mme_bearer_t *mme_bearer_add(mme_sess_t *sess)
 
     ogs_list_add(&sess->bearer_list, bearer);
 
+    bearer->t3485.timer = ogs_timer_add(
+            ogs_app()->timer_mgr, mme_timer_t3485_expire,
+            OGS_UINT_TO_POINTER(bearer->id));
+    bearer->t3485.pkbuf = NULL;
+
     bearer->t3489.timer = ogs_timer_add(
             ogs_app()->timer_mgr, mme_timer_t3489_expire,
             OGS_UINT_TO_POINTER(bearer->id));
@@ -4576,6 +4628,7 @@ mme_bearer_t *mme_bearer_add(mme_sess_t *sess)
     bearer->t3495.timer = ogs_timer_add(
             ogs_app()->timer_mgr, mme_timer_t3495_expire,
             OGS_UINT_TO_POINTER(bearer->id));
+    /* calloc zeroes reactivation_stuck. */
 
     memset(&e, 0, sizeof(e));
     e.bearer_id = bearer->id;
@@ -4602,6 +4655,7 @@ void mme_bearer_remove(mme_bearer_t *bearer)
     ogs_fsm_fini(&bearer->sm, &e);
 
     CLEAR_BEARER_ALL_TIMERS(bearer);
+    ogs_timer_delete(bearer->t3485.timer);
     ogs_timer_delete(bearer->t3489.timer);
     ogs_timer_delete(bearer->t3495.timer);
 
@@ -4805,6 +4859,63 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
             sess = mme_sess_find_by_apn(mme_ue,
                     pdn_connectivity_request->access_point_name.apn);
             if (sess && create_action != OGS_GTP_CREATE_IN_ATTACH_REQUEST) {
+                mme_bearer_t *def_bearer = mme_default_bearer_in_sess(sess);
+
+                /*
+                 * Stuck IMS default-bearer recovery (replaces the failed
+                 * "Recovery A"). If the existing same-APN session's default
+                 * bearer is genuinely STUCK (its Activate-default ACCEPT was
+                 * lost: reactivation_stuck set, still esm_state_inactive, SGW
+                 * resources present), the UE is re-requesting the APN to heal
+                 * itself but we would otherwise block it forever with cause#55.
+                 *
+                 * Instead, release the stuck session (MME-driven Delete Session
+                 * = leak-free SGW/SMF/UPF teardown) and drop THIS request
+                 * silently. The UE's own NAS retransmission (T3482) re-sends the
+                 * PDN connectivity request; by then the Delete Session Response
+                 * has removed the old session, so it is processed fresh and the
+                 * Activate carries the UE's current PTI -> the UE accepts.
+                 *
+                 * We do NOT create the new session here: the MME shares one
+                 * sgw_ue/S11 association, so creating a new session while the
+                 * Delete Session is in flight would race on the S11 TEID.
+                 */
+                {
+                    sgw_ue_t *sgw_ue = sgw_ue_find_by_id(mme_ue->sgw_ue_id);
+                    /*
+                     * Only take the stuck-recovery path when we can actually
+                     * send the Delete Session (sgw_ue present). Otherwise mark-
+                     * and-no-send would wedge the APN (deletion_in_progress set
+                     * forever, every re-request silently dropped). Fall through
+                     * to the normal cause#55 reject when SGW-UE is missing.
+                     */
+                    if (mme_self()->bearer_reactivation &&
+                            def_bearer &&
+                            def_bearer->reactivation_stuck &&
+                            OGS_FSM_CHECK(&def_bearer->sm,
+                                esm_state_inactive) &&
+                            MME_HAVE_SGW_S1U_PATH(sess) &&
+                            !sess->deletion_in_progress &&
+                            sgw_ue) {
+                        enb_ue_t *enb_ue =
+                            enb_ue_find_by_id(mme_ue->enb_ue_id);
+                        ogs_warn("[%s] releasing stuck PDN [%s] (EBI[%d]) on UE "
+                                "re-request; UE will recreate after delete",
+                                mme_ue->imsi_bcd,
+                                pdn_connectivity_request->
+                                    access_point_name.apn,
+                                def_bearer->ebi);
+                        /* Stop T3485 now so it cannot fire (stray Activate
+                         * retransmit) during the in-flight Delete Session. */
+                        CLEAR_BEARER_TIMER(def_bearer->t3485);
+                        sess->deletion_in_progress = true;
+                        ogs_expect(OGS_OK ==
+                            mme_gtp_send_delete_session_request(
+                                enb_ue, sgw_ue, sess,
+                                OGS_GTP_DELETE_NO_ACTION));
+                        return NULL;
+                    }
+                }
 
                 sess->pti = pti;
 
@@ -4817,6 +4928,32 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
                 ogs_warn("APN duplicated [%s]",
                     pdn_connectivity_request->access_point_name.apn);
                 return NULL;
+            }
+
+            /*
+             * Same-APN session currently being deleted (stuck-recovery in
+             * flight): drop this request silently and let the UE retransmit
+             * once the delete completes. mme_sess_find_by_apn() skips
+             * deletion_in_progress sessions, so without this guard we would
+             * fall through and create a new session while the old Delete
+             * Session is still in flight (S11 TEID race).
+             */
+            if (create_action != OGS_GTP_CREATE_IN_ATTACH_REQUEST) {
+                mme_sess_t *it = NULL;
+                ogs_list_for_each(&mme_ue->sess_list, it) {
+                    if (it->session && it->session->name &&
+                            it->deletion_in_progress &&
+                            ogs_strcasecmp(it->session->name,
+                                pdn_connectivity_request->
+                                    access_point_name.apn) == 0) {
+                        ogs_warn("[%s] APN [%s] delete in progress; "
+                                "drop re-request (UE will retransmit)",
+                                mme_ue->imsi_bcd,
+                                pdn_connectivity_request->
+                                    access_point_name.apn);
+                        return NULL;
+                    }
+                }
             }
         } else {
             sess = mme_sess_first(mme_ue);
@@ -4835,7 +4972,15 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
 
         if (!sess) {
             sess = mme_sess_add(mme_ue, pti);
-            ogs_assert(sess);
+            if (!sess) {
+                ogs_error("[%s] mme_sess_add() failed", mme_ue->imsi_bcd);
+                r = nas_eps_send_attach_reject(enb_ue, mme_ue,
+                        OGS_NAS_EMM_CAUSE_CONGESTION,
+                        OGS_NAS_ESM_CAUSE_INSUFFICIENT_RESOURCES);
+                ogs_expect(r == OGS_OK);
+                ogs_assert(r != OGS_ERROR);
+                return NULL;
+            }
 
             ogs_debug("[%s:%p]", mme_ue->imsi_bcd, mme_ue);
             ogs_debug("[%s:%d:%d:%p]",

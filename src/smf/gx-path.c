@@ -81,11 +81,24 @@ static void state_cleanup(struct sess_state *sess_data, os0_t sid, void *opaque)
         return;
     }
 
-    if (sess_data->gx_sid)
-        ogs_free(sess_data->gx_sid);
+    ogs_debug("[GX_DANGLING] state_cleanup: sess_data=%p gx_sid_ptr=%p "
+              "gx_sid=%s peer_host_ptr=%p",
+              sess_data, sess_data->gx_sid,
+              sess_data->gx_sid ? (char *)sess_data->gx_sid : "(null)",
+              sess_data->peer_host);
 
-    if (sess_data->peer_host)
+    if (sess_data->gx_sid) {
+        /* If this fires for the same gx_sid twice, prior code violated
+         * the "clear local pointer after state_cleanup" invariant
+         * (the !sess path in smf_gx_rar_cb enforces this). */
+        ogs_free(sess_data->gx_sid);
+        sess_data->gx_sid = NULL;
+    }
+
+    if (sess_data->peer_host) {
         ogs_free(sess_data->peer_host);
+        sess_data->peer_host = NULL;
+    }
 
     ogs_thread_mutex_lock(&sess_state_mutex);
     ogs_pool_free(&sess_state_pool, sess_data);
@@ -1207,6 +1220,8 @@ static int smf_gx_rar_cb( struct msg **msg, struct avp *avp,
     ret = fd_sess_state_retrieve(smf_gx_reg, session, &sess_data);
     ogs_assert(ret == 0);
     if (!sess_data) {
+        ogs_debug("[GX_DANGLING] !sess_data path: session=%p "
+                  "(already released)", session);
         ogs_warn("No Session Data - session already released, sending UNKNOWN_SESSION_ID");
         result_code = OGS_DIAM_UNKNOWN_SESSION_ID;
         goto out;
@@ -1215,9 +1230,25 @@ static int smf_gx_rar_cb( struct msg **msg, struct avp *avp,
     /* Get Session Information */
     sess = smf_sess_find_by_id(sess_data->sess_id);
     if (!sess) {
-        ogs_warn("No Session ID [%d] - session already released, cleaning up Diameter state", 
+        ogs_debug("[GX_DANGLING] !sess path: sess_id=%d sess_data=%p "
+                  "gx_sid_ptr=%p gx_sid=%s",
+                  sess_data->sess_id, sess_data, sess_data->gx_sid,
+                  sess_data->gx_sid ? (char *)sess_data->gx_sid : "(null)");
+        ogs_warn("No Session ID [%d] - session already released, cleaning up Diameter state",
                 sess_data->sess_id);
         state_cleanup(sess_data, NULL, NULL);
+        /*
+         * state_cleanup() returned the sess_state to the pool and freed
+         * gx_sid/peer_host, so the local sess_data is now dangling. If
+         * we fall through to the shared "out:" path with sess_data still
+         * pointing at the freed slot, fd_sess_state_store() would re-
+         * attach the dangling pointer to the freeDiameter session — and
+         * the next RAR (or fd-session GC) would call state_cleanup on it
+         * again, hitting talloc double-free -> SIGABRT (no ogs_log
+         * output, because talloc_abort() bypasses ogs_log). Null the
+         * local pointer here so the store at "out:" attaches NULL.
+         */
+        sess_data = NULL;
         result_code = OGS_DIAM_UNKNOWN_SESSION_ID;
         goto out;
     }
@@ -1380,6 +1411,9 @@ static int smf_gx_rar_cb( struct msg **msg, struct avp *avp,
     return 0;
 
 out:
+    ogs_debug("[GX_DANGLING] out: result_code=%u sess_data=%p",
+              result_code, sess_data);
+
     if (result_code == OGS_DIAM_UNKNOWN_SESSION_ID) {
         ret = fd_msg_rescode_set(ans,
                     (char *)"DIAMETER_UNKNOWN_SESSION_ID", NULL, NULL, 1);
@@ -1389,8 +1423,13 @@ out:
         ogs_assert(ret == 0);
     }
 
-    /* Store this value in the session */
+    /* Store this value in the session.
+     * After the !sess fix above, sess_data is guaranteed to be NULL on
+     * the dangling path, so the unconditional store is safe — fd accepts
+     * NULL and attaches no state. ret == 0 assert added to match the
+     * successful path's pattern (the original out: was missing it). */
     ret = fd_sess_state_store(smf_gx_reg, session, &sess_data);
+    ogs_assert(ret == 0);
     ogs_assert(sess_data == NULL);
 
     ret = fd_msg_send(msg, NULL, NULL);

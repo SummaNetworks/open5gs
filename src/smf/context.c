@@ -2431,7 +2431,10 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     ogs_assert(sess);
 
     ogs_pool_id_calloc(&smf_bearer_pool, &bearer);
-    ogs_assert(bearer);
+    if (!bearer) {
+        ogs_error("smf_bearer_add: bearer pool exhausted");
+        return NULL;
+    }
 
     /* Initialize race condition handling flags */
     bearer->create_pending = false;
@@ -2445,8 +2448,8 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
 
     /* PDR */
     dl_pdr = ogs_pfcp_pdr_add(&sess->pfcp);
-    ogs_assert(dl_pdr);
     bearer->dl_pdr = dl_pdr;
+    if (!dl_pdr) goto error;
 
     ogs_assert(sess->session.name);
     dl_pdr->apn = ogs_strdup(sess->session.name);
@@ -2455,8 +2458,8 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     dl_pdr->src_if = OGS_PFCP_INTERFACE_CORE;
 
     ul_pdr = ogs_pfcp_pdr_add(&sess->pfcp);
-    ogs_assert(ul_pdr);
     bearer->ul_pdr = ul_pdr;
+    if (!ul_pdr) goto error;
 
     ogs_assert(sess->session.name);
     ul_pdr->apn = ogs_strdup(sess->session.name);
@@ -2480,7 +2483,7 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     // Eureka - ktsubouc: start
     if (!bearer->urr)
         bearer->urr = ogs_pfcp_urr_add(&sess->pfcp);
-    ogs_assert(bearer->urr);
+    if (!bearer->urr) goto error;
 
     bearer->urr->meas_method = OGS_PFCP_MEASUREMENT_METHOD_VOLUME;
     bearer->urr->rep_triggers.volume_threshold = 1;
@@ -2502,8 +2505,8 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
 
     /* FAR */
     dl_far = ogs_pfcp_far_add(&sess->pfcp);
-    ogs_assert(dl_far);
     bearer->dl_far = dl_far;
+    if (!dl_far) goto error;
 
     ogs_assert(sess->session.name);
     dl_far->apn = ogs_strdup(sess->session.name);
@@ -2517,8 +2520,8 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     ogs_assert(sess->pfcp.bar);
 
     ul_far = ogs_pfcp_far_add(&sess->pfcp);
-    ogs_assert(ul_far);
     bearer->ul_far = ul_far;
+    if (!ul_far) goto error;
 
     ogs_assert(sess->session.name);
     ul_far->apn = ogs_strdup(sess->session.name);
@@ -2535,6 +2538,31 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
 
     smf_metrics_inst_global_inc(SMF_METR_GLOB_GAUGE_BEARERS_ACTIVE);
     return bearer;
+
+error:
+    /*
+     * PFCP resource (PDR/FAR/URR id pool) exhausted mid-creation.
+     * Roll back every partial allocation and return NULL instead of
+     * asserting, so the caller (e.g. Gx Charging-Rule-Install binding)
+     * can reject the rule gracefully rather than crashing the SMF.
+     * The bearer is not yet on sess->bearer_list and the active gauge
+     * was not incremented, so neither needs undoing here.
+     */
+    ogs_error("smf_bearer_add: PFCP resource exhausted; "
+            "aborting bearer creation (no crash)");
+    if (bearer->dl_pdr)
+        ogs_pfcp_pdr_remove(bearer->dl_pdr);
+    if (bearer->ul_pdr)
+        ogs_pfcp_pdr_remove(bearer->ul_pdr);
+    if (bearer->dl_far)
+        ogs_pfcp_far_remove(bearer->dl_far);
+    if (bearer->ul_far)
+        ogs_pfcp_far_remove(bearer->ul_far);
+    if (bearer->urr)
+        ogs_pfcp_urr_remove(bearer->urr);
+    smf_pf_identifier_pool_final(bearer);
+    ogs_pool_id_free(&smf_bearer_pool, bearer);
+    return NULL;
 }
 
 int smf_bearer_remove(smf_bearer_t *bearer)

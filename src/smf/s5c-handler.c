@@ -318,7 +318,11 @@ uint8_t smf_s5c_handle_create_session_request(
                 req->bearer_contexts_to_be_created[i].bearer_level_qos.len);
 
         bearer = smf_bearer_add(sess);
-        ogs_assert(bearer);
+        if (!bearer) {
+            ogs_error("smf_bearer_add() failed (PFCP resource exhausted) "
+                    "in Create Session Request");
+            return OGS_GTP2_CAUSE_NO_RESOURCES_AVAILABLE;
+        }
 
         /* Set Bearer EBI */
         bearer->ebi = req->bearer_contexts_to_be_created[i].eps_bearer_id.u8;

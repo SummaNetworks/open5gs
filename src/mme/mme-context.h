@@ -189,6 +189,13 @@ typedef struct mme_context_s {
 #define MME_PAGING_FAILURE_POLICY_NO_ACTION         0
 #define MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS   1
     uint8_t paging_failure_policy;
+
+    /*
+     * Stuck IMS default-bearer auto-recovery (T3485 safety net).
+     * Gates Recovery-A sweep, T3485 retransmit, and the #39 teardown.
+     * Default true; set false in mme.yaml to revert to legacy behavior.
+     */
+    bool bearer_reactivation;
 } mme_context_t;
 
 typedef struct mme_sgsn_route_s {
@@ -536,7 +543,7 @@ struct mme_ue_s {
     ogs_list_t      sess_list;
 
 #define MIN_EPS_BEARER_ID           5
-#define MAX_EPS_BEARER_ID           15
+#define MAX_EPS_BEARER_ID           12
 
 #define CLEAR_EPS_BEARER_ID(__mME) \
     do { \
@@ -894,6 +901,7 @@ typedef struct mme_bearer_s {
 
 #define CLEAR_BEARER_ALL_TIMERS(__bEARER) \
     do { \
+        CLEAR_BEARER_TIMER((__bEARER)->t3485); \
         CLEAR_BEARER_TIMER((__bEARER)->t3489); \
         CLEAR_BEARER_TIMER((__bEARER)->t3495); \
     } while(0);
@@ -910,6 +918,11 @@ typedef struct mme_bearer_s {
     struct {
         ogs_pkbuf_t     *pkbuf;
         ogs_timer_t     *timer;
+        uint32_t        retry_count;
+    } t3485;
+    struct {
+        ogs_pkbuf_t     *pkbuf;
+        ogs_timer_t     *timer;
         uint32_t        retry_count;;
     } t3489;
     struct {
@@ -917,6 +930,18 @@ typedef struct mme_bearer_s {
         ogs_timer_t     *timer;
         uint32_t        retry_count;
     } t3495;
+
+    /*
+     * Bearer-reactivation (T3485) safety net.
+     *
+     * reactivation_stuck: set when a standalone Activate Default Bearer
+     *   Context Request is sent (T3485 armed) and cleared when its ACCEPT
+     *   arrives. Intentionally NOT cleared by CLEAR_BEARER_ALL_TIMERS so it
+     *   survives S1 release: a stuck (lost-ACCEPT) default bearer is then
+     *   recognised when the UE re-requests the APN, and its session is
+     *   released so the UE can recreate it (mme_bearer_find_or_add_by_message).
+     */
+    uint8_t         reactivation_stuck;
 
     /* Related Context */
     ogs_pool_id_t   mme_ue_id;

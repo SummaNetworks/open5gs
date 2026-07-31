@@ -227,7 +227,7 @@ int esm_handle_information_response(
                         sess, OGS_NAS_ESM_CAUSE_UNKNOWN_PDN_TYPE,
                         OGS_GTP_CREATE_IN_ATTACH_REQUEST);
                 ogs_expect(r == OGS_OK);
-                ogs_assert(r != OGS_ERROR);
+                /* send may fail if S1 context is gone; do not crash */
                 return OGS_ERROR;
             }
         } else {
@@ -246,7 +246,12 @@ int esm_handle_information_response(
                     OGS_NAS_ATTACH_TYPE_EPS_ATTACH) {
                 r = nas_eps_send_attach_accept(mme_ue);
                 ogs_expect(r == OGS_OK);
-                ogs_assert(r != OGS_ERROR);
+                if (r != OGS_OK) {
+                    ogs_warn("[%s] nas_eps_send_attach_accept() failed; "
+                            "S1 context may be gone (no crash)",
+                            mme_ue->imsi_bcd);
+                    return OGS_ERROR;
+                }
             } else {
                 ogs_assert(OGS_OK ==
                     sgsap_send_location_update_request(mme_ue));
@@ -266,7 +271,7 @@ int esm_handle_information_response(
                 sess, OGS_NAS_ESM_CAUSE_MISSING_OR_UNKNOWN_APN,
                 OGS_GTP_CREATE_IN_ATTACH_REQUEST);
         ogs_expect(r == OGS_OK);
-        ogs_assert(r != OGS_ERROR);
+        /* send may fail if S1 context is gone; do not crash */
         return OGS_ERROR;
     }
 

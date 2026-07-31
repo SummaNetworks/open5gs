@@ -333,6 +333,15 @@ void upf_n4_handle_session_modification_request(
         goto cleanup;
 
     for (i = 0; i < OGS_MAX_NUM_OF_URR; i++) {
+        if (req->remove_urr[i].presence == 0)
+            break;
+        /*
+         * Tear down this URR's accounting/timer state BEFORE the URR is
+         * freed by ogs_pfcp_handle_remove_urr(); an armed time-threshold/
+         * quota timer would otherwise fire later on the freed URR (UAF).
+         */
+        if (req->remove_urr[i].urr_id.presence)
+            upf_sess_urr_acc_remove(sess, req->remove_urr[i].urr_id.u32);
         if (ogs_pfcp_handle_remove_urr(&sess->pfcp, &req->remove_urr[i],
                 &cause_value, &offending_ie_value) == false)
             break;

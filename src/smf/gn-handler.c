@@ -257,7 +257,11 @@ uint8_t smf_gn_handle_create_pdp_context_request(
 
     /* Setup Default Bearer */
     bearer = smf_bearer_add(sess);
-    ogs_assert(bearer);
+    if (!bearer) {
+        ogs_error("smf_bearer_add() failed (PFCP resource exhausted) "
+                "in Create PDP Context Request");
+        return OGS_GTP1_CAUSE_NO_RESOURCES_AVAILABLE;
+    }
 
     /* Set Bearer EBI */
     /* 3GPP TS 23.060 clause 9.2.1A: "1:1 mapping between NSAPI and EPS Bearer ID" */

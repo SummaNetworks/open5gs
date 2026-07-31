@@ -226,6 +226,7 @@ static mme_sess_t *mme_ue_session_from_gtp1_pdp_ctx(mme_ue_t *mme_ue, const ogs_
     uint8_t pti = 1; /* Default PTI : 1 */
     uint8_t qci = 0;
     ogs_session_t *ogs_sess;
+    bool created_sess = false;
 
     ogs_sess = mme_session_find_by_apn(mme_ue, gtp1_pdp_ctx->apn);
     if (!ogs_sess) {
@@ -253,7 +254,11 @@ static mme_sess_t *mme_ue_session_from_gtp1_pdp_ctx(mme_ue_t *mme_ue, const ogs_
     sess = mme_sess_find_by_pti(mme_ue, pti);
     if (!sess) {
         sess = mme_sess_add(mme_ue, pti);
-        ogs_assert(sess);
+        if (!sess) {
+            ogs_error("[%s] mme_sess_add() failed", mme_ue->imsi_bcd);
+            return NULL;
+        }
+        created_sess = true;
     }
 
     sess->session = ogs_sess;
@@ -279,7 +284,12 @@ static mme_sess_t *mme_ue_session_from_gtp1_pdp_ctx(mme_ue_t *mme_ue, const ogs_
         bearer = mme_default_bearer_in_sess(sess);
         if (!bearer) {
             bearer = mme_bearer_add(sess);
-            ogs_assert(bearer);
+            if (!bearer) {
+                ogs_error("[%s] mme_bearer_add() failed", mme_ue->imsi_bcd);
+                if (created_sess)
+                    mme_sess_remove(sess);
+                return NULL;
+            }
         }
     }
     bearer->pgw_s5u_teid = gtp1_pdp_ctx->ul_teid;

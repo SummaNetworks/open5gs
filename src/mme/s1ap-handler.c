@@ -1088,6 +1088,17 @@ void s1ap_handle_initial_context_setup_response(
         }
     }
 
+    /*
+     * NOTE: A previous "Recovery A" here re-sent Activate Default Bearer
+     * Context Request on reconnect to recover a stuck IMS default bearer.
+     * Lab testing proved this cannot work: Activate-default is only valid as
+     * the response to the UE's CURRENT PDN-connectivity/Attach procedure, and
+     * the UE issues a fresh PTI on each reconnect, so a re-sent Activate with
+     * the stale stored PTI is always rejected (PTI mismatch). The stuck bearer
+     * is instead recovered by releasing the stuck session when the UE
+     * re-requests the APN (see mme_bearer_find_or_add_by_message()).
+     */
+
     if (MME_PAGING_ONGOING(mme_ue))
         mme_send_after_paging(mme_ue, false);
 }

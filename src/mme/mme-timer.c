@@ -46,6 +46,10 @@ static mme_timer_cfg_t g_mme_timer_cfg[MAX_NUM_OF_MME_TIMER] = {
     [MME_TIMER_T3470] =
         { .have = true, .max_count = 4, .duration = ogs_time_from_sec(3) },
 
+    /* ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST sent (standalone) */
+    [MME_TIMER_T3485] =
+        { .have = true, .max_count = 4, .duration = ogs_time_from_sec(8) },
+
     /* ESM INFORMATION REQUEST sent */
     [MME_TIMER_T3489] =
         { .have = true, .max_count = 2, .duration = ogs_time_from_sec(4) },
@@ -112,6 +116,8 @@ const char *mme_timer_get_name(mme_timer_e id)
         return "MME_TIMER_T3460";
     case MME_TIMER_T3470:
         return "MME_TIMER_T3470";
+    case MME_TIMER_T3485:
+        return "MME_TIMER_T3485";
     case MME_TIMER_T3489:
         return "MME_TIMER_T3489";
     case MME_TIMER_T3495:
@@ -215,6 +221,10 @@ static void esm_timer_event_send(mme_timer_e timer_id, void *data)
     }
 }
 
+void mme_timer_t3485_expire(void *data)
+{
+    esm_timer_event_send(MME_TIMER_T3485, data);
+}
 void mme_timer_t3489_expire(void *data)
 {
     esm_timer_event_send(MME_TIMER_T3489, data);
