@@ -19,6 +19,7 @@
 
 #include "mme-event.h"
 #include "mme-timer.h"
+#include "metrics.h"
 #include "s1ap-handler.h"
 #include "mme-gn-handler.h"
 #include "mme-fd-path.h"
@@ -144,6 +145,12 @@ void emm_state_registered(ogs_fsm_t *s, mme_event_t *e)
                 /* Paging failed */
                 ogs_warn("Paging to IMSI[%s] failed. Stop paging",
                         mme_ue->imsi_bcd);
+                /* KPI Tier 1: paging timeout (MM.PagingEpsFail). Clear
+                 * kpi_paging_sent_us so a subsequent successful paging
+                 * cycle does not observe a stale latency. */
+                mme_metrics_inst_global_ext_inc(
+                        MME_METR_GLOB_CTR_PAGING_TIMEOUT);
+                mme_ue->kpi_paging_sent_us = 0;
                 CLEAR_MME_UE_TIMER(mme_ue->t3413);
                 mme_ue->paging.failed = true;
 
@@ -348,9 +355,27 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                 == OGS_NAS_SECURITY_HEADER_FOR_SERVICE_REQUEST_MESSAGE) {
             ogs_info("[%s] Service request", mme_ue->imsi_bcd);
 
+            /* KPI Tier 1: paging success and response-duration. If
+             * kpi_paging_sent_us is set, this SR is in reply to an
+             * outstanding Paging. */
+            if (mme_ue->kpi_paging_sent_us) {
+                ogs_time_t elapsed_us = ogs_get_monotonic_time() -
+                        mme_ue->kpi_paging_sent_us;
+                mme_metrics_inst_global_ext_inc(
+                        MME_METR_GLOB_CTR_PAGING_SUCCESS);
+                mme_metrics_inst_histogram_seconds_observe(
+                        MME_METR_HIST_PAGING_RESPONSE_DURATION,
+                        (int)(elapsed_us / OGS_USEC_PER_SEC));
+                mme_ue->kpi_paging_sent_us = 0;
+            }
+
             if (state != EMM_COMMON_STATE_REGISTERED) {
                 ogs_info("Service request : Not registered[%s]",
                         mme_ue->imsi_bcd);
+                /* KPI Tier 1: service_request rejected. */
+                mme_metrics_inst_by_result_cause_ext_inc(
+                        "reject", "identity_unknown",
+                        MME_METR_BY_RESULT_CAUSE_EXT_SERVICE_REQUEST);
                 r = nas_eps_send_service_reject(enb_ue, mme_ue,
                     OGS_NAS_EMM_CAUSE_UE_IDENTITY_CANNOT_BE_DERIVED_BY_THE_NETWORK);
                 ogs_expect(r == OGS_OK);
@@ -363,12 +388,18 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                     enb_ue, mme_ue, &message->emm.service_request);
             if (rv != OGS_OK) {
                 ogs_error("emm_handle_service_request() failed");
+                mme_metrics_inst_by_result_cause_ext_inc(
+                        "reject", "parse_failed",
+                        MME_METR_BY_RESULT_CAUSE_EXT_SERVICE_REQUEST);
                 OGS_FSM_TRAN(s, emm_state_exception);
                 break;
             }
 
             if (!MME_UE_HAVE_IMSI(mme_ue)) {
                 ogs_info("Service request : Unknown UE");
+                mme_metrics_inst_by_result_cause_ext_inc(
+                        "reject", "identity_unknown",
+                        MME_METR_BY_RESULT_CAUSE_EXT_SERVICE_REQUEST);
                 r = nas_eps_send_service_reject(enb_ue, mme_ue,
                     OGS_NAS_EMM_CAUSE_UE_IDENTITY_CANNOT_BE_DERIVED_BY_THE_NETWORK);
                 ogs_expect(r == OGS_OK);
@@ -413,6 +444,12 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
              * the UEContextReleaseCommand/Complete with the eNB
              */
             CLEAR_S1_CONTEXT(mme_ue);
+
+            /* KPI Tier 1: Service Request accepted, proceeding to
+             * Initial Context Setup. cause = "accepted". */
+            mme_metrics_inst_by_result_cause_ext_inc(
+                    "accept", "accepted",
+                    MME_METR_BY_RESULT_CAUSE_EXT_SERVICE_REQUEST);
 
             r = s1ap_send_initial_context_setup_request(mme_ue);
             ogs_expect(r == OGS_OK);
@@ -665,8 +702,21 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
              * 10. UplinkNASTransport + Tracking area update complete (Target)
              */
 
-            if (e->s1ap_code == S1AP_ProcedureCode_id_initialUEMessage) {
-                ogs_debug("    Iniital UE Message");
+            /* Phase 4 Step 4-4: Run local PDN deactivation for bearer
+             * status mismatch on both InitialUEMessage and
+             * UplinkNASTransport carrying the TAU.
+             *
+             * TS 24.301: MME shall locally deactivate EPS bearers on
+             * mismatch regardless of how the TAU arrived. In real
+             * scenarios the UE often is already in connected mode
+             * (e.g. after a Service Request), so the TAU comes over
+             * UplinkNASTransport and the previous code path skipped
+             * the cleanup, leaving zombie sessions that caused later
+             * PDN connectivity requests to be rejected with
+             * "Multiple PDN connections for a given APN not allowed". */
+            if (e->s1ap_code == S1AP_ProcedureCode_id_initialUEMessage ||
+                e->s1ap_code == S1AP_ProcedureCode_id_uplinkNASTransport) {
+                ogs_debug("    InitialUEMessage / UplinkNASTransport");
 
                 /* Local deactivation of PDN sessions with bearer status mismatch
                  * (3GPP TS 24.301: MME shall deactivate EPS bearer contexts locally
@@ -691,7 +741,21 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                              * with OGS_GTP_DELETE_NO_ACTION to prevent
                              * sending Deactivate Bearer Context Request to UE
                              * and E-RAB Release to eNB */
-                            if (MME_HAVE_SGW_S1U_PATH(sess)) {
+                            if (sess->deletion_in_progress) {
+                                /* Already being deleted by another path
+                                 * (e.g. the E-RAB Setup reject handler or the
+                                 * PR6-B HO rescue). Sending a second Delete
+                                 * Session Request would overwrite
+                                 * delete_xact_id and race the in-flight
+                                 * teardown, so skip it; the in-progress delete
+                                 * will remove the session. */
+                                ogs_warn("[%s] PDN[APN:%s] delete already in "
+                                        "progress; skip duplicate Delete "
+                                        "Session Request",
+                                        mme_ue->imsi_bcd,
+                                        sess->session ?
+                                            sess->session->name : "unknown");
+                            } else if (MME_HAVE_SGW_S1U_PATH(sess)) {
                                 mme_gtp_send_delete_session_request(
                                     enb_ue, sgw_ue, sess,
                                     OGS_GTP_DELETE_NO_ACTION);

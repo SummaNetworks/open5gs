@@ -284,10 +284,23 @@ bool ogs_pfcp_up_handle_pdr(
 
     if (buffering == true) {
 
-        if (far->num_of_buffered_packet == 0) {
-            /* Only the first time a packet is buffered,
-             * it reports downlink notifications. */
+        if (far->dl_data_report_sent == false) {
+            /*
+             * Report once per buffering episode, not once per empty buffer.
+             *
+             * The old test was "num_of_buffered_packet == 0", but that
+             * counter is only cleared by ogs_pfcp_send_buffered_packet(),
+             * which requires the FAR to be back in FORW - which requires the
+             * UE to be CONNECTED - which requires this very report. A single
+             * stranded packet therefore suppressed every further Downlink
+             * Data Report on this FAR permanently.
+             *
+             * The flag is re-armed when the CP re-requests buffering (see
+             * ogs_pfcp_handle_update_far()) and on flush, so a full buffer
+             * no longer silences notifications either.
+             */
             report->type.downlink_data_report = 1;
+            far->dl_data_report_sent = true;
         }
 
         if (far->num_of_buffered_packet < OGS_MAX_NUM_OF_PACKET_BUFFER) {
@@ -1068,8 +1081,25 @@ ogs_pfcp_far_t *ogs_pfcp_handle_update_far(ogs_pfcp_sess_t *sess,
         return NULL;
     }
 
-    if (message->apply_action.presence)
+    if (message->apply_action.presence) {
         far->apply_action = message->apply_action.u16;
+
+        /*
+         * Re-arm the Downlink Data Report whenever the CP (re-)requests
+         * buffering. Level-triggered on purpose: an edge test (BUFF newly
+         * set) would not fire in the very case this exists for, where the
+         * FAR went to BUFF, never returned to FORW, and the CP later sent
+         * BUFF again. Without the re-arm a FAR that already reported once
+         * stays silent until it is flushed - which cannot happen while the
+         * UE is unreachable.
+         *
+         * This does NOT discard the buffered packets: 3GPP has
+         * PFCPSMReq-Flags.DROBU / PFCPSRRsp-Flags.DROBU for that, so BUFF
+         * on its own must leave the buffer alone.
+         */
+        if (far->apply_action & OGS_PFCP_APPLY_ACTION_BUFF)
+            far->dl_data_report_sent = false;
+    }
 
     if (message->update_forwarding_parameters.presence) {
         if (message->update_forwarding_parameters.

@@ -21,6 +21,7 @@
 #include "s1ap-build.h"
 #include "esm-build.h"
 #include "emm-build.h"
+#include "metrics.h"
 #include "nas-path.h"
 #include "mme-event.h"
 #include "mme-timer.h"
@@ -123,6 +124,11 @@ int nas_eps_send_attach_accept(mme_ue_t *mme_ue)
         return OGS_NOTFOUND;
     }
 
+    /* KPI: count successful attach. emm_cause is "accepted" (=0). */
+    mme_metrics_inst_by_result_cause_inc(
+            "accept", mme_emm_cause_bucket(0),
+            MME_METR_BY_RESULT_CAUSE_ATTACH);
+
     enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
     if (!enb_ue) {
         ogs_error("S1 context has already been removed");
@@ -193,6 +199,11 @@ int nas_eps_send_attach_reject(enb_ue_t *enb_ue, mme_ue_t *mme_ue,
     int rv;
     mme_sess_t *sess = NULL;
     ogs_pkbuf_t *esmbuf = NULL, *emmbuf = NULL;
+
+    /* KPI: count attach reject bucketed by emm_cause. */
+    mme_metrics_inst_by_result_cause_inc(
+            "reject", mme_emm_cause_bucket(emm_cause),
+            MME_METR_BY_RESULT_CAUSE_ATTACH);
 
     if (!mme_ue) {
         ogs_error("UE(mme-ue) context has already been removed");
@@ -486,6 +497,14 @@ int nas_eps_send_pdn_connectivity_reject(
     ogs_pkbuf_t *esmbuf = NULL;
 
     ogs_assert(sess);
+
+    /* KPI: bucket the reject by request_type (already captured in
+     * sess->ue_request_type during esm_handle_pdn_connectivity_request)
+     * and esm_cause. */
+    mme_metrics_inst_by_req_type_cause_inc(
+            mme_request_type_bucket(sess->ue_request_type.value),
+            mme_esm_cause_bucket(esm_cause),
+            MME_METR_BY_REQ_TYPE_CAUSE_PDN_CONN_REJECT);
 
     mme_ue = mme_ue_find_by_id(sess->mme_ue_id);
     if (!mme_ue) {
@@ -786,6 +805,70 @@ int nas_eps_send_deactivate_bearer_context_request(mme_bearer_t *bearer)
     ogs_expect(rv == OGS_OK);
 
     ogs_timer_start(bearer->t3495.timer,
+            mme_timer_cfg(MME_TIMER_T3495)->duration);
+
+    return rv;
+}
+
+/*
+ * Phase 4 Step 4-8: Deactivate PDN (default + dedicated) with single S1AP
+ * E-RAB Release Command containing all active EBIs.
+ *
+ * NAS layer: only the default bearer's Deactivate Bearer Context Request
+ * is built and carried in NAS PDU. UE handles dedicated release implicitly
+ * per TS 24.301 6.4.4.3.
+ *
+ * S1AP layer: all active E-RABs of the PDN are listed in E-RABToBeReleased
+ * list so that eNB cleans up internal state for every dedicated bearer,
+ * working around vendors that don't cascade implicit release.
+ */
+int nas_eps_send_deactivate_pdn_with_dedicated(mme_bearer_t *default_bearer)
+{
+    int rv;
+    ogs_pkbuf_t *s1apbuf = NULL;
+    ogs_pkbuf_t *esmbuf = NULL;
+    mme_ue_t *mme_ue = NULL;
+    enb_ue_t *enb_ue = NULL;
+
+    ogs_assert(default_bearer);
+
+    mme_ue = mme_ue_find_by_id(default_bearer->mme_ue_id);
+    if (!mme_ue) {
+        ogs_error("UE(mme-ue) context has already been removed");
+        return OGS_NOTFOUND;
+    }
+
+    enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
+    if (!enb_ue) {
+        ogs_error("S1 context has already been removed");
+        return OGS_NOTFOUND;
+    }
+
+    esmbuf = esm_build_deactivate_bearer_context_request(
+            default_bearer, OGS_NAS_ESM_CAUSE_REGULAR_DEACTIVATION);
+    if (!esmbuf) {
+        ogs_error("esm_build_deactivate_bearer_context_request() failed");
+        return OGS_ERROR;
+    }
+
+    s1apbuf = s1ap_build_e_rab_release_command_with_dedicated(
+            default_bearer, esmbuf,
+            S1AP_Cause_PR_nas, S1AP_CauseNas_normal_release);
+    if (!s1apbuf) {
+        ogs_error("s1ap_build_e_rab_release_command_with_dedicated() failed");
+        return OGS_ERROR;
+    }
+
+    rv = nas_eps_send_to_enb(mme_ue, s1apbuf);
+    ogs_expect(rv == OGS_OK);
+
+    /* Start T3495 timer for retransmission per TS 24.301 §6.4.4.5(a).
+     * Without this, MME never retransmits Deactivate EPS Bearer Context
+     * Request when UE misses it (e.g. radio loss during HO), and UE
+     * retries of PDN Disconnect Request lead to a NAS dead window that
+     * eventually drops the call via SIP BYE.
+     * Companion start in nas_eps_send_deactivate_bearer_context_request(). */
+    ogs_timer_start(default_bearer->t3495.timer,
             mme_timer_cfg(MME_TIMER_T3495)->duration);
 
     return rv;

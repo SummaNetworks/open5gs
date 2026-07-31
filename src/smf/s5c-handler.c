@@ -21,6 +21,7 @@
 #include "context.h"
 #include "gtp-path.h"
 #include "fd-path.h"
+#include "metrics.h"
 #include "s5c-build.h"
 #include "s5c-handler.h"
 #include "pfcp-path.h"
@@ -244,17 +245,285 @@ uint8_t smf_s5c_handle_create_session_request(
     if (!OGS_FSM_CHECK(&sess->pfcp_node->sm, smf_pfcp_state_associated))
         return OGS_GTP2_CAUSE_REMOTE_PEER_NOT_RESPONDING;
 
+    /* Handover Indication detection (bidirectional) */
+    if (req->indication_flags.presence &&
+        req->indication_flags.data && req->indication_flags.len) {
+        ogs_gtp2_indication_t *indication = req->indication_flags.data;
+        if (indication->handover_indication) {
+            uint8_t peer_rat = 0;
+
+            if (sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_WLAN) {
+                peer_rat = OGS_GTP2_RAT_TYPE_EUTRAN;
+            } else if (sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_EUTRAN) {
+                peer_rat = OGS_GTP2_RAT_TYPE_WLAN;
+            }
+
+            if (peer_rat) {
+                smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
+                if (smf_ue) {
+                    smf_sess_t *peer_sess = smf_sess_find_by_apn(
+                            smf_ue, sess->session.name, peer_rat);
+                    if (peer_sess) {
+                        ogs_info("%s->%s HO detected: "
+                                "linking [0x%x] <-> [0x%x]",
+                                peer_rat == OGS_GTP2_RAT_TYPE_EUTRAN ?
+                                    "VoLTE" : "VoWiFi",
+                                sess->gtp_rat_type ==
+                                    OGS_GTP2_RAT_TYPE_WLAN ?
+                                    "VoWiFi" : "VoLTE",
+                                (int)peer_sess->smf_n4_teid,
+                                (int)sess->smf_n4_teid);
+
+                        /* Set bidirectional peer link */
+                        sess->epc_handover.peer_sess_id = peer_sess->id;
+                        peer_sess->epc_handover.peer_sess_id = sess->id;
+
+                        /* Set HO state */
+                        sess->epc_handover.state =
+                            SMF_HO_STATE_TARGET_ACTIVE;
+                        peer_sess->epc_handover.state =
+                            SMF_HO_STATE_SOURCE_HOLD;
+
+                        /* KPI: record HO start. Direction is determined
+                         * by the *target* side (sess), not the source. */
+                        sess->epc_handover.kpi_start_us =
+                                ogs_get_monotonic_time();
+                        sess->epc_handover.kpi_direction =
+                                (sess->gtp_rat_type ==
+                                        OGS_GTP2_RAT_TYPE_WLAN) ?
+                                    "volte_to_vowifi" :
+                                    "vowifi_to_volte";
+                        smf_metrics_inst_by_direction_inc(
+                                sess->epc_handover.kpi_direction,
+                                SMF_METR_BY_DIRECTION_CTR_HO_ATTEMPT);
+
+                        /*
+                         * The source-release hold timer is deliberately
+                         * NOT armed here.
+                         *
+                         * Arming it at HO detection makes it a
+                         * speculative kill switch: if the target then
+                         * fails to come up - e.g. the PCRF never answers
+                         * the CCR-U, for which there is no Gx timeout -
+                         * the timer still fires and deletes the source
+                         * session, destroying the very session the UE
+                         * would otherwise have fallen back to. Observed
+                         * in production: CCR-U at T+0.1s, timer fired at
+                         * T+5.0s, old LTE session removed, and the UE
+                         * ended up re-attaching with a different IP (no
+                         * IP preservation, no voice bearer) because the
+                         * retransmitted CSReq no longer found a peer.
+                         *
+                         * Releasing the old access is only correct once
+                         * the target has actually been accepted, so the
+                         * timer is armed on the success edge instead -
+                         * right after smf_gtp2_send_create_session_
+                         * response() succeeds, next to the existing
+                         * peer PFCP deactivation in gsm-sm.c. That turns
+                         * it into a post-success old-access release.
+                         *
+                         * Still only for a non-3GPP target (VoLTE→VoWiFi):
+                         * VoWiFi→VoLTE has its own cleanup path via
+                         * MBR(HI=1) on S5/S8 (Phase 1 deferred DBReq ->
+                         * ePDG). The actual Delete Bearer Request remains
+                         * behind the `enable_sgw_cleanup` feature flag.
+                         */
+
+                        /* Transfer Gx session ownership */
+                        if (peer_sess->gx_sid) {
+                            /*
+                             * Ownership move, so anything already held here
+                             * has to be released first. The target is a
+                             * freshly created session and normally has none,
+                             * but overwriting without freeing would leak the
+                             * string now that each session owns its copy.
+                             */
+                            if (sess->gx_sid)
+                                ogs_free(sess->gx_sid);
+                            sess->gx_sid = peer_sess->gx_sid;
+                            peer_sess->gx_sid = NULL;
+                            ogs_info("Gx session transferred: "
+                                    "[%s]", sess->gx_sid);
+
+                            /*
+                             * The freeDiameter sess_state.sess_id back-
+                             * reference is NOT rewritten here. It is
+                             * refreshed by smf_gx_send_ccr() (which sets
+                             * sess_data->sess_id unconditionally for every
+                             * CC-Request-Type), and until that CCR-U goes
+                             * out an incoming RAR follows the peer link in
+                             * smf_gx_rar_cb() instead. Doing the rewrite
+                             * from this (main) thread would require a
+                             * fd_sess_state_retrieve()/store() pair that
+                             * races the freeDiameter dispatch threads, and
+                             * fd_sess_fromsid_msg() would leak a session
+                             * msg reference on every handover.
+                             */
+                        }
+
+                        /* Restore session info from peer */
+                        /* QoS: always copy from peer for HO */
+                        memcpy(&sess->session.qos,
+                                &peer_sess->session.qos,
+                                sizeof(sess->session.qos));
+                        ogs_info("HO: QoS restored (QCI=%d)",
+                                sess->session.qos.index);
+
+                        /* Copy all dedicated PCC rules from peer
+                         * session's policy for bearer_binding() to
+                         * re-establish via CBReq after PFCP setup
+                         * (TS 23.402). Iterate policy.pcc_rule[]
+                         * directly so multiple rules bound to the same
+                         * dedicated bearer (e.g. RTP + RTCP) are all
+                         * copied. Default-bearer rules are excluded by
+                         * QCI comparison (Phase 3 interim - TS 23.203
+                         * 6.3.1 full QCI+ARP binding deferred). */
+                        {
+                            smf_bearer_t *peer_default;
+                            uint8_t default_qci;
+                            int pi;
+                            int copied = 0;
+
+                            peer_default =
+                                smf_default_bearer_in_sess(peer_sess);
+                            default_qci = peer_default ?
+                                peer_default->qos.index :
+                                peer_sess->session.qos.index;
+
+                            /* Phase 4.2b #15 detector: Open5GS does not
+                             * support multi-dedicated-bearer per session.
+                             * If the source session has >1 dedicated
+                             * bearer (e.g. call-waiting created a 2nd
+                             * bearer via RAR overwrite side-effect), HO
+                             * will lose bearer #2+ because policy.
+                             * pcc_rule[] reflects only one bearer's
+                             * rules. Pure observation: no behavior
+                             * change to the HO copy below. */
+                            if (peer_default) {
+                                int dedicated_count = 0;
+                                smf_bearer_t *db = NULL;
+                                ogs_list_for_each(
+                                        &peer_sess->bearer_list, db) {
+                                    if (db != peer_default)
+                                        dedicated_count++;
+                                }
+                                if (dedicated_count > 1) {
+                                    ogs_warn("[Phase 4.2b #15 detector] "
+                                            "HO source sess has %d "
+                                            "dedicated bearers but "
+                                            "Open5GS supports only 1 "
+                                            "per session; bearer #2+ "
+                                            "will be lost on target "
+                                            "(call-waiting / multi-"
+                                            "stream HO drop expected, "
+                                            "future-work.md section "
+                                            "2.2 issue 15)",
+                                            dedicated_count);
+                                    smf_metrics_inst_by_direction_inc(
+                                        sess->epc_handover.kpi_direction,
+                                        SMF_METR_BY_DIRECTION_CTR_HO_MULTI_DEDICATED_BEARER_LOSS);
+                                }
+                            }
+
+                            for (pi = 0;
+                                 pi < peer_sess->policy.num_of_pcc_rule;
+                                 pi++) {
+                                ogs_pcc_rule_t *src_rule =
+                                    &peer_sess->policy.pcc_rule[pi];
+
+                                if (src_rule->type !=
+                                        OGS_PCC_RULE_TYPE_INSTALL)
+                                    continue;
+                                if (!src_rule->name)
+                                    continue;
+                                /* Skip default-bearer rules */
+                                if (src_rule->qos.index == default_qci)
+                                    continue;
+
+                                if (sess->policy.num_of_pcc_rule >=
+                                        OGS_MAX_NUM_OF_PCC_RULE) {
+                                    ogs_warn("HO: PCC rule copy limit "
+                                            "reached");
+                                    break;
+                                }
+
+                                OGS_STORE_PCC_RULE(
+                                    &sess->policy.pcc_rule[
+                                        sess->policy.num_of_pcc_rule],
+                                    src_rule);
+                                /* Ensure type is INSTALL for
+                                 * bearer_binding() */
+                                sess->policy.pcc_rule[
+                                    sess->policy.num_of_pcc_rule].type =
+                                        OGS_PCC_RULE_TYPE_INSTALL;
+                                sess->policy.num_of_pcc_rule++;
+                                copied++;
+
+                                ogs_info("HO: Copied PCC rule [%s] "
+                                        "QCI=%d (%d flows) from peer",
+                                        src_rule->name,
+                                        src_rule->qos.index,
+                                        src_rule->num_of_flow);
+                            }
+
+                            if (copied > 0) {
+                                ogs_info("HO: %d dedicated PCC rule(s) "
+                                        "copied for CBReq "
+                                        "re-establishment", copied);
+                            }
+                        }
+
+                        /* PAA=0: Restore IP from peer session.
+                         * Use peer_sess->ipv4->addr (actual allocated IP),
+                         * not peer_sess->session.ue_ip (may be 0 if
+                         * original PAA was also 0). */
+                        if (req->pdn_address_allocation.presence) {
+                            ogs_paa_t *check_paa =
+                                req->pdn_address_allocation.data;
+                            if (check_paa && peer_sess->ipv4 &&
+                                check_paa->addr == 0) {
+                                char buf[OGS_ADDRSTRLEN];
+                                sess->session.session_type =
+                                    peer_sess->session.session_type;
+                                sess->session.ue_ip.addr =
+                                    peer_sess->ipv4->addr[0];
+                                sess->session.ue_ip.ipv4 = 1;
+                                ogs_info("HO: PAA=0, restoring IP [%s] "
+                                        "from peer session",
+                                        OGS_INET_NTOP(
+                                            &sess->session.ue_ip.addr,
+                                            buf));
+                            }
+                        }
+                    } else {
+                        ogs_warn("HO: peer session not found "
+                                "for APN[%s] RAT[%d]",
+                                sess->session.name, peer_rat);
+                    }
+                }
+            }
+        }
+    }
+
     /* UE IP Address */
     paa = req->pdn_address_allocation.data;
     ogs_assert(paa);
 
-    /* Store UE Session Type (IPv4, IPv6, IPv4v6) */
-    sess->ue_session_type = paa->session_type;
+    if (sess->epc_handover.state == SMF_HO_STATE_TARGET_ACTIVE &&
+        sess->session.ue_ip.addr) {
+        /* HO with PAA=0: IP already restored from peer session.
+         * Use restored session_type and ue_ip.
+         * smf_sess_set_ue_ip() will allocate via static IP path. */
+        sess->ue_session_type = sess->session.session_type;
+    } else {
+        /* Store UE Session Type (IPv4, IPv6, IPv4v6) */
+        sess->ue_session_type = paa->session_type;
 
-    /* Initially Set Session Type from UE */
-    sess->session.session_type = sess->ue_session_type;
-    rv = ogs_paa_to_ip(paa, &sess->session.ue_ip);
-    ogs_assert(rv == OGS_OK);
+        /* Initially Set Session Type from UE */
+        sess->session.session_type = sess->ue_session_type;
+        rv = ogs_paa_to_ip(paa, &sess->session.ue_ip);
+        ogs_assert(rv == OGS_OK);
+    }
 
     /* Set UE IP Address */
     rv = smf_sess_set_ue_ip(sess);
@@ -466,6 +735,33 @@ uint8_t smf_s5c_handle_delete_session_request(
 
     ogs_assert(xact);
     ogs_assert(req);
+
+    /*
+     * Phase 4 PR3a (Step 4-3a):
+     * If the UE-initiated PDN Disconnect arrived in time for the
+     * SOURCE_HOLD session, cancel the source-release hold timer so
+     * that the active cleanup path (PR3b) does not duplicate work
+     * after the regular delete completes. Generation is bumped to
+     * invalidate any callback that may already be queued.
+     */
+    if (sess->epc_handover.state == SMF_HO_STATE_SOURCE_HOLD &&
+        sess->epc_handover.hold_timer) {
+        ogs_info("HO: hold timer cancelled by UE Delete Session "
+                "(gen=%u -> %u)",
+                sess->epc_handover.hold_generation,
+                sess->epc_handover.hold_generation + 1);
+        ogs_timer_stop(sess->epc_handover.hold_timer);
+        sess->epc_handover.hold_generation++;
+    }
+
+    /* Step 1-1: Protect new WLAN session during HO.
+     * If this session is TARGET_ACTIVE, the Delete Session is meant for
+     * the old EUTRAN session. Accept it but skip actual deletion. */
+    if (sess->epc_handover.state == SMF_HO_STATE_TARGET_ACTIVE) {
+        ogs_warn("Delete Session Request received for TARGET_ACTIVE "
+                "session - protecting VoWiFi session");
+        return OGS_GTP2_CAUSE_REQUEST_ACCEPTED;
+    }
 
     if (!ogs_diam_is_relay_or_app_advertised(OGS_DIAM_GX_APPLICATION_ID)) {
         ogs_error("No Gx Diameter Peer");
@@ -681,10 +977,129 @@ void smf_s5c_handle_modify_bearer_request(
         }
 
         if (indication && indication->handover_indication) {
+            /* KPI: VoWiFi -> VoLTE HO control-plane success on the SMF
+             * side. The TARGET (EUTRAN) session received an MBR with
+             * the Handover Indication, mirroring the MME-side
+             * epc_mme_handover_success_total. */
+            if (sess->epc_handover.kpi_start_us &&
+                    sess->epc_handover.kpi_direction) {
+                ogs_time_t elapsed_us = ogs_get_monotonic_time() -
+                        sess->epc_handover.kpi_start_us;
+                smf_metrics_inst_by_direction_inc(
+                        sess->epc_handover.kpi_direction,
+                        SMF_METR_BY_DIRECTION_CTR_HO_SUCCESS);
+                smf_metrics_inst_histogram_observe(
+                        sess->epc_handover.kpi_direction,
+                        SMF_METR_HISTOGRAM_HO_DURATION,
+                        (int)(elapsed_us / 1000));
+                sess->epc_handover.kpi_start_us = 0;
+            }
             ogs_assert(OGS_OK == smf_epc_pfcp_send_deactivation(sess,
                     OGS_GTP2_CAUSE_ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP));
+
+            /* Send Delete Bearer Request to ePDG to release
+             * the old WLAN session.
+             * If CBReq is pending (dedicated bearer being created),
+             * defer until CBResp to avoid deleting the old voice
+             * bearer before the new one is established (TS 23.402
+             * 8.6.1.1: old access release is the final step). */
+            if (sess->epc_handover.peer_sess_id !=
+                    OGS_INVALID_POOL_ID) {
+                smf_bearer_t *b;
+                bool has_pending_cbr = false;
+                int pending_cbr_count = 0; /* Phase 4.2b #13 detector */
+
+                ogs_list_for_each(&sess->bearer_list, b) {
+                    if (b->create_pending) {
+                        has_pending_cbr = true;
+                        pending_cbr_count++;
+                    }
+                }
+
+                if (has_pending_cbr) {
+                    /*
+                     * Phase 4.2b #13 detector: the deferred_
+                     * deactivation flag is single-bool, so the first
+                     * CBResp fires the DBReq to ePDG regardless of
+                     * how many CBReq remain pending. This is safe for
+                     * single-dedicated-bearer UEs (the only case
+                     * observed in our test env) but breaks with
+                     * multi-dedicated-bearer UEs (e.g. voice QCI=1 +
+                     * IMS sig QCI=5, video QCI=2) because parallel
+                     * CBResps would prematurely release the old WLAN
+                     * session. Phase 5 will replace the bool with a
+                     * pending-count or EBI-set; until then, warn so
+                     * the misfire condition is logged on appearance.
+                     */
+                    if (pending_cbr_count > 1) {
+                        ogs_warn("[Phase 4.2b #13 detector] MBR(HI=1) "
+                                "with %d pending CBReq during HO - "
+                                "deferred_deactivation single-bool "
+                                "granularity may misfire on first "
+                                "CBResp (TS 23.402, future-work.md "
+                                "§2 #13)", pending_cbr_count);
+                    }
+                    ogs_info("MBR(HI=1): CBReq pending, deferring "
+                            "DBReq to ePDG until CBResp");
+                    sess->epc_handover.deferred_deactivation = true;
+                    smf_metrics_inst_global_inc(
+                        SMF_METR_GLOB_GAUGE_DEFERRED_DEACTIVATION_PENDING);
+                } else {
+                    smf_sess_t *wlan_sess = smf_sess_find_by_id(
+                            sess->epc_handover.peer_sess_id);
+                    if (wlan_sess) {
+                        smf_bearer_t *linked_bearer =
+                            ogs_list_first(&wlan_sess->bearer_list);
+                        if (linked_bearer) {
+                            ogs_info("MBR(HI=1): sending DBReq to ePDG "
+                                    "for old WLAN session");
+                            smf_gtp2_send_delete_bearer_request(
+                                    linked_bearer,
+                                OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
+                                OGS_GTP2_CAUSE_ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP);
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+/* Phase 4 Step 4-5: Helper to execute deferred DBReq->ePDG.
+ *
+ * The Phase 3 C feature defers the DBReq to ePDG until CBResp arrives.
+ * When CBResp is a failure (e.g. eNB invalid-qos-combination), the SMF
+ * still needs to flush this deferred work so the old WLAN session is not
+ * leaked. This helper is called on every CBResp return path (success and
+ * failure) so the deferred DBReq is not stuck. */
+static void smf_ho_flush_deferred_deactivation(smf_sess_t *sess)
+{
+    smf_sess_t *wlan_sess = NULL;
+    smf_bearer_t *linked_bearer = NULL;
+
+    if (!sess->epc_handover.deferred_deactivation)
+        return;
+
+    sess->epc_handover.deferred_deactivation = false;
+    smf_metrics_inst_global_dec(
+            SMF_METR_GLOB_GAUGE_DEFERRED_DEACTIVATION_PENDING);
+
+    if (sess->epc_handover.peer_sess_id == OGS_INVALID_POOL_ID)
+        return;
+
+    wlan_sess = smf_sess_find_by_id(sess->epc_handover.peer_sess_id);
+    if (!wlan_sess)
+        return;
+
+    linked_bearer = ogs_list_first(&wlan_sess->bearer_list);
+    if (!linked_bearer)
+        return;
+
+    ogs_info("HO: CBResp processed, sending deferred DBReq to ePDG");
+    smf_gtp2_send_delete_bearer_request(
+            linked_bearer,
+            OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
+            OGS_GTP2_CAUSE_ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP);
 }
 
 void smf_s5c_handle_create_bearer_response(
@@ -724,24 +1139,16 @@ void smf_s5c_handle_create_bearer_response(
         return;
     }
 
-    /************************
-     * Check Session Context
-     ************************/
-    cause_value = OGS_GTP2_CAUSE_REQUEST_ACCEPTED;
-
-    if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
-        ogs_assert(OGS_OK ==
-            smf_epc_pfcp_send_one_bearer_modification_request(
-                bearer, OGS_INVALID_POOL_ID, OGS_PFCP_MODIFY_REMOVE,
-                OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
-                OGS_GTP2_CAUSE_UNDEFINED_VALUE));
-        return;
-    }
-
     /*****************************************
      * Check Mandatory/Conditional IE Missing
+     *
+     * Phase 4 Step 4-5 (Codex-validated): TEIDs in Bearer Context are
+     * Conditional (TS 29.274 7.2.4) - required only when bearer-level
+     * Cause is "Request accepted". On failure (e.g. eNB
+     * invalid-qos-combination), MME omits TEIDs and includes only
+     * EBI + Cause. The bearer is already located via xact->data above.
      *****************************************/
-    ogs_assert(cause_value == OGS_GTP2_CAUSE_REQUEST_ACCEPTED);
+    cause_value = OGS_GTP2_CAUSE_REQUEST_ACCEPTED;
 
     if (rsp->bearer_contexts.presence == 0) {
         ogs_error("No Bearer");
@@ -751,40 +1158,6 @@ void smf_s5c_handle_create_bearer_response(
         ogs_error("No EPS Bearer ID");
         cause_value = OGS_GTP2_CAUSE_MANDATORY_IE_MISSING;
     }
-
-    if (rsp->bearer_contexts.s5_s8_u_pgw_f_teid.presence &&
-        rsp->bearer_contexts.s5_s8_u_sgw_f_teid.presence) {
-        if (rsp->bearer_contexts.s5_s8_u_pgw_f_teid.presence)
-            pgw_s5u_teid = rsp->bearer_contexts.s5_s8_u_pgw_f_teid.data;
-        if (rsp->bearer_contexts.s5_s8_u_sgw_f_teid.presence)
-            sgw_s5u_teid = rsp->bearer_contexts.s5_s8_u_sgw_f_teid.data;
-    }
-
-    if (rsp->bearer_contexts.s2b_u_pgw_f_teid.presence &&
-        rsp->bearer_contexts.s2b_u_epdg_f_teid_8.presence) {
-        if (rsp->bearer_contexts.s2b_u_pgw_f_teid.presence)
-            pgw_s5u_teid = rsp->bearer_contexts.s2b_u_pgw_f_teid.data;
-        if (rsp->bearer_contexts.s2b_u_epdg_f_teid_8.presence)
-            sgw_s5u_teid = rsp->bearer_contexts.s2b_u_epdg_f_teid_8.data;
-    }
-
-    if (!pgw_s5u_teid) {
-        ogs_error("No PGW TEID - SGW did not provide S5/S8 PGW F-TEID in Create Bearer Response");
-        ogs_error("Bearer context presence: %lu, s5_s8_u_pgw_f_teid presence: %lu, s2b_u_pgw_f_teid presence: %lu",
-                rsp->bearer_contexts.presence,
-                rsp->bearer_contexts.s5_s8_u_pgw_f_teid.presence,
-                rsp->bearer_contexts.s2b_u_pgw_f_teid.presence);
-        cause_value = OGS_GTP2_CAUSE_CONDITIONAL_IE_MISSING;
-    }
-    if (!sgw_s5u_teid) {
-        ogs_error("No SGW TEID - SGW did not provide S5/S8 SGW F-TEID in Create Bearer Response");
-        ogs_error("Bearer context presence: %lu, s5_s8_u_sgw_f_teid presence: %lu, s2b_u_epdg_f_teid_8 presence: %lu",
-                rsp->bearer_contexts.presence,
-                rsp->bearer_contexts.s5_s8_u_sgw_f_teid.presence,
-                rsp->bearer_contexts.s2b_u_epdg_f_teid_8.presence);
-        cause_value = OGS_GTP2_CAUSE_CONDITIONAL_IE_MISSING;
-    }
-
     if (rsp->cause.presence == 0) {
         ogs_error("No Cause in Create Bearer Response");
         cause_value = OGS_GTP2_CAUSE_MANDATORY_IE_MISSING;
@@ -800,30 +1173,33 @@ void smf_s5c_handle_create_bearer_response(
         ogs_info("Create Bearer Response - Bearer Cause: %d", bearer_cause->value);
     }
 
+    /* Reject early on missing mandatory IEs */
     if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
         ogs_assert(OGS_OK ==
             smf_epc_pfcp_send_one_bearer_modification_request(
                 bearer, OGS_INVALID_POOL_ID, OGS_PFCP_MODIFY_REMOVE,
                 OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
                 OGS_GTP2_CAUSE_UNDEFINED_VALUE));
+        smf_ho_flush_deferred_deactivation(sess);
         return;
     }
 
     /********************
      * Check Cause Value
      ********************/
-    ogs_assert(cause_value == OGS_GTP2_CAUSE_REQUEST_ACCEPTED);
-
     cause = rsp->bearer_contexts.cause.data;
     ogs_assert(cause);
     cause_value = cause->value;
     if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
-        ogs_error("GTP Bearer Cause [VALUE:%d]", cause_value);
+        ogs_warn("GTP Bearer Cause [VALUE:%d] - cleaning up new bearer "
+                "and flushing any deferred HO deactivation",
+                cause_value);
         ogs_assert(OGS_OK ==
             smf_epc_pfcp_send_one_bearer_modification_request(
                 bearer, OGS_INVALID_POOL_ID, OGS_PFCP_MODIFY_REMOVE,
                 OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
                 OGS_GTP2_CAUSE_UNDEFINED_VALUE));
+        smf_ho_flush_deferred_deactivation(sess);
         return;
     }
 
@@ -831,12 +1207,41 @@ void smf_s5c_handle_create_bearer_response(
     ogs_assert(cause);
     cause_value = cause->value;
     if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
-        ogs_error("GTP Cause [Value:%d]", cause_value);
+        ogs_warn("GTP Cause [Value:%d] - cleaning up new bearer and "
+                "flushing any deferred HO deactivation", cause_value);
         ogs_assert(OGS_OK ==
             smf_epc_pfcp_send_one_bearer_modification_request(
                 bearer, OGS_INVALID_POOL_ID, OGS_PFCP_MODIFY_REMOVE,
                 OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
                 OGS_GTP2_CAUSE_UNDEFINED_VALUE));
+        smf_ho_flush_deferred_deactivation(sess);
+        return;
+    }
+
+    /***********************************************
+     * Cause = Request accepted -> require TEIDs now
+     ***********************************************/
+    if (rsp->bearer_contexts.s5_s8_u_pgw_f_teid.presence &&
+        rsp->bearer_contexts.s5_s8_u_sgw_f_teid.presence) {
+        pgw_s5u_teid = rsp->bearer_contexts.s5_s8_u_pgw_f_teid.data;
+        sgw_s5u_teid = rsp->bearer_contexts.s5_s8_u_sgw_f_teid.data;
+    }
+
+    if (rsp->bearer_contexts.s2b_u_pgw_f_teid.presence &&
+        rsp->bearer_contexts.s2b_u_epdg_f_teid_8.presence) {
+        pgw_s5u_teid = rsp->bearer_contexts.s2b_u_pgw_f_teid.data;
+        sgw_s5u_teid = rsp->bearer_contexts.s2b_u_epdg_f_teid_8.data;
+    }
+
+    if (!pgw_s5u_teid || !sgw_s5u_teid) {
+        ogs_error("Missing F-TEID on accepted CBResp (PGW=%p SGW=%p) - "
+                "cleaning up", pgw_s5u_teid, sgw_s5u_teid);
+        ogs_assert(OGS_OK ==
+            smf_epc_pfcp_send_one_bearer_modification_request(
+                bearer, OGS_INVALID_POOL_ID, OGS_PFCP_MODIFY_REMOVE,
+                OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
+                OGS_GTP2_CAUSE_UNDEFINED_VALUE));
+        smf_ho_flush_deferred_deactivation(sess);
         return;
     }
 
@@ -898,6 +1303,10 @@ void smf_s5c_handle_create_bearer_response(
             bearer, OGS_INVALID_POOL_ID, OGS_PFCP_MODIFY_ACTIVATE,
             OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
             OGS_GTP2_CAUSE_UNDEFINED_VALUE));
+
+    /* HO: Send deferred DBReq to ePDG now that dedicated bearer
+     * is established (CBResp received with Cause=accepted). */
+    smf_ho_flush_deferred_deactivation(sess);
 }
 
 void smf_s5c_handle_update_bearer_response(
@@ -1023,21 +1432,26 @@ static smf_sess_t *smf_sess_find_by_ip_and_different_rat(
     smf_ue = smf_ue_find_by_id(current_sess->smf_ue_id);
     ogs_assert(smf_ue);
 
+    /*
+     * Phase 4 case Y (now Phase 4.2a): match the actually-allocated UE
+     * IP rather than session.ue_ip — for Initial-Attach sessions, MME
+     * sends CSR with PAA=0.0.0.0 and the real address is only kept in
+     * sess->ipv4. The helper smf_sess_match_ue_ip() (context.c) is
+     * shared with smf_find_s2b_session_for_ue() in pfcp-path.c so the
+     * comparison logic stays consistent across both call sites.
+     *
+     * s5c-handler.c around line 407 documents the same gotcha for the
+     * HO peer-link path: "Use peer_sess->ipv4->addr (actual allocated
+     * IP), not peer_sess->session.ue_ip (may be 0 if original PAA was
+     * also 0)".
+     */
     ogs_list_for_each(&smf_ue->sess_list, sess) {
-        if (sess == current_sess) {
+        if (sess == current_sess)
             continue;
-        }
-
-        /* Skip if RAT type is the same */
-        if (sess->gtp_rat_type == current_sess->gtp_rat_type) {
+        if (sess->gtp_rat_type == current_sess->gtp_rat_type)
             continue;
-        }
-
-        /* Skip if IP addresses don't match */
-        if (memcmp(&sess->session.ue_ip, &current_sess->session.ue_ip,
-                sizeof(sess->session.ue_ip)) != 0) {
+        if (!smf_sess_match_ue_ip(sess, current_sess))
             continue;
-        }
 
         ogs_debug("Found session with same IP but different RAT type: "
                 "Current[RAT:%d] Other[RAT:%d]",

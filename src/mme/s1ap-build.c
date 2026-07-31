@@ -18,6 +18,7 @@
  */
 
 #include "mme-context.h"
+#include "metrics.h"
 
 #include "mme-sm.h"
 #include "s1ap-build.h"
@@ -578,6 +579,50 @@ ogs_pkbuf_t *s1ap_build_initial_context_setup_request(
                             "ENB_UE_S1AP_ID[%d] MME_UE_S1AP_ID[%d]",
                             mme_ue->imsi_bcd, mme_ue->nas_eps.type,
                             enb_ue->enb_ue_s1ap_id, enb_ue->mme_ue_s1ap_id);
+                    continue;
+                }
+
+                /*
+                 * Phase 4 PR4 (Step 4-4b):
+                 * Skip every bearer of a PDN session that Step 4-4 has
+                 * already marked for deletion via deletion_in_progress.
+                 * The mismatch deactivation path (emm-sm.c around
+                 * line 693) sends Delete Session Request to the SGW and
+                 * sets sess->deletion_in_progress=true *before* the
+                 * TAU Accept / ICS Request is built. Without this
+                 * guard, the still-in-list session's bearers leak into
+                 * the ICS E-RAB list and the eNB rejects the request
+                 * as "Invalid IE" (the eNB cannot reconcile bearers
+                 * the UE reports as inactive).
+                 *
+                 * We deliberately do NOT key on the UE-mask intersect
+                 * alone:
+                 *
+                 *   - On a normal idle→connected resume the UE may
+                 *     legitimately report a QCI=1 dedicated bearer as
+                 *     inactive (its radio side is gone) even though the
+                 *     PDN itself is alive. In that case Step 4-4 leaves
+                 *     deletion_in_progress unset and we MUST still
+                 *     include the bearer in the ICS so that the eNB
+                 *     re-establishes its radio side. Without this
+                 *     guard, voice call resume would break for every UE
+                 *     that goes through idle.
+                 *
+                 *   - In the Razr-fail scenario, the UE reports the
+                 *     default bearer of a leaked LTE PDN as inactive
+                 *     and Step 4-4 marks the whole session with
+                 *     deletion_in_progress, so all of its bearers
+                 *     (default + dedicated) are removed from the ICS
+                 *     while the remaining PDNs (e.g. internet) are
+                 *     still activated normally.
+                 */
+                if (sess->deletion_in_progress) {
+                    ogs_info("ICS: skip EBI[%d] "
+                            "(PDN deletion in progress)",
+                            bearer->ebi);
+                    mme_metrics_inst_by_reason_outcome_inc(
+                            "deletion_in_progress", "filtered",
+                            MME_METR_BY_REASON_OUTCOME_ICS_FILTER);
                     continue;
                 }
 
@@ -1459,6 +1504,135 @@ ogs_pkbuf_t *s1ap_build_e_rab_release_command(
     return ogs_s1ap_encode(&pdu);
 }
 
+ogs_pkbuf_t *s1ap_build_e_rab_release_command_with_dedicated(
+        mme_bearer_t *default_bearer, ogs_pkbuf_t *esmbuf,
+        S1AP_Cause_PR group, long cause)
+{
+    S1AP_S1AP_PDU_t pdu;
+    S1AP_InitiatingMessage_t *initiatingMessage = NULL;
+    S1AP_E_RABReleaseCommand_t *E_RABReleaseCommand = NULL;
+
+    S1AP_E_RABReleaseCommandIEs_t *ie = NULL;
+    S1AP_MME_UE_S1AP_ID_t *MME_UE_S1AP_ID = NULL;
+    S1AP_ENB_UE_S1AP_ID_t *ENB_UE_S1AP_ID = NULL;
+    S1AP_E_RABList_t *E_RABList = NULL;
+    S1AP_NAS_PDU_t *nasPdu = NULL;
+
+    S1AP_E_RABItemIEs_t *item = NULL;
+    S1AP_E_RABItem_t *e_rab = NULL;
+
+    mme_ue_t *mme_ue = NULL;
+    enb_ue_t *enb_ue = NULL;
+    mme_sess_t *sess = NULL;
+    mme_bearer_t *bearer = NULL;
+    int n_listed = 0;
+
+    ogs_assert(esmbuf);
+    ogs_assert(default_bearer);
+
+    mme_ue = mme_ue_find_by_id(default_bearer->mme_ue_id);
+    ogs_assert(mme_ue);
+    enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
+    ogs_assert(enb_ue);
+    sess = mme_sess_find_by_id(default_bearer->sess_id);
+    ogs_assert(sess);
+
+    ogs_debug("E-RABReleaseCommand (with dedicated)");
+
+    memset(&pdu, 0, sizeof (S1AP_S1AP_PDU_t));
+    pdu.present = S1AP_S1AP_PDU_PR_initiatingMessage;
+    pdu.choice.initiatingMessage = CALLOC(1, sizeof(S1AP_InitiatingMessage_t));
+
+    initiatingMessage = pdu.choice.initiatingMessage;
+    initiatingMessage->procedureCode = S1AP_ProcedureCode_id_E_RABRelease;
+    initiatingMessage->criticality = S1AP_Criticality_reject;
+    initiatingMessage->value.present =
+        S1AP_InitiatingMessage__value_PR_E_RABReleaseCommand;
+
+    E_RABReleaseCommand = &initiatingMessage->value.choice.E_RABReleaseCommand;
+
+    ie = CALLOC(1, sizeof(S1AP_E_RABReleaseCommandIEs_t));
+    ASN_SEQUENCE_ADD(&E_RABReleaseCommand->protocolIEs, ie);
+    ie->id = S1AP_ProtocolIE_ID_id_MME_UE_S1AP_ID;
+    ie->criticality = S1AP_Criticality_reject;
+    ie->value.present = S1AP_E_RABReleaseCommandIEs__value_PR_MME_UE_S1AP_ID;
+    MME_UE_S1AP_ID = &ie->value.choice.MME_UE_S1AP_ID;
+
+    ie = CALLOC(1, sizeof(S1AP_E_RABReleaseCommandIEs_t));
+    ASN_SEQUENCE_ADD(&E_RABReleaseCommand->protocolIEs, ie);
+    ie->id = S1AP_ProtocolIE_ID_id_eNB_UE_S1AP_ID;
+    ie->criticality = S1AP_Criticality_reject;
+    ie->value.present = S1AP_E_RABReleaseCommandIEs__value_PR_ENB_UE_S1AP_ID;
+    ENB_UE_S1AP_ID = &ie->value.choice.ENB_UE_S1AP_ID;
+
+    ie = CALLOC(1, sizeof(S1AP_E_RABReleaseCommandIEs_t));
+    ASN_SEQUENCE_ADD(&E_RABReleaseCommand->protocolIEs, ie);
+    ie->id = S1AP_ProtocolIE_ID_id_E_RABToBeReleasedList;
+    ie->criticality = S1AP_Criticality_ignore;
+    ie->value.present = S1AP_E_RABReleaseCommandIEs__value_PR_E_RABList;
+    E_RABList = &ie->value.choice.E_RABList;
+
+    ie = CALLOC(1, sizeof(S1AP_E_RABReleaseCommandIEs_t));
+    ASN_SEQUENCE_ADD(&E_RABReleaseCommand->protocolIEs, ie);
+    ie->id = S1AP_ProtocolIE_ID_id_NAS_PDU;
+    ie->criticality = S1AP_Criticality_ignore;
+    ie->value.present = S1AP_E_RABReleaseCommandIEs__value_PR_NAS_PDU;
+    nasPdu = &ie->value.choice.NAS_PDU;
+
+    ogs_debug("    ENB_UE_S1AP_ID[%d] MME_UE_S1AP_ID[%d]",
+            enb_ue->enb_ue_s1ap_id, enb_ue->mme_ue_s1ap_id);
+
+    *MME_UE_S1AP_ID = enb_ue->mme_ue_s1ap_id;
+    *ENB_UE_S1AP_ID = enb_ue->enb_ue_s1ap_id;
+
+    /* Add all active dedicated bearers first, then default bearer.
+     * Order chosen to match the VoLTE-only successful release pattern
+     * observed in eNB logs (dedicated released first via PCRF-driven
+     * Delete Bearer Request, then default at PDN teardown). */
+    ogs_list_for_each(&sess->bearer_list, bearer) {
+        if (bearer == default_bearer)
+            continue;
+        if (!OGS_FSM_CHECK(&bearer->sm, esm_state_active))
+            continue;
+
+        item = CALLOC(1, sizeof(S1AP_E_RABItemIEs_t));
+        ASN_SEQUENCE_ADD(&E_RABList->list, item);
+        item->id = S1AP_ProtocolIE_ID_id_E_RABItem;
+        item->criticality = S1AP_Criticality_ignore;
+        item->value.present = S1AP_E_RABItemIEs__value_PR_E_RABItem;
+        e_rab = &item->value.choice.E_RABItem;
+        e_rab->e_RAB_ID = bearer->ebi;
+        e_rab->cause.present = group;
+        e_rab->cause.choice.radioNetwork = cause;
+
+        ogs_info("Step 4-8: Adding dedicated EBI[%d] to E-RAB Release "
+                "Command (eNB zombie workaround)", bearer->ebi);
+        n_listed++;
+    }
+
+    /* Default bearer last (NAS PDU is for this bearer's deactivation) */
+    item = CALLOC(1, sizeof(S1AP_E_RABItemIEs_t));
+    ASN_SEQUENCE_ADD(&E_RABList->list, item);
+    item->id = S1AP_ProtocolIE_ID_id_E_RABItem;
+    item->criticality = S1AP_Criticality_ignore;
+    item->value.present = S1AP_E_RABItemIEs__value_PR_E_RABItem;
+    e_rab = &item->value.choice.E_RABItem;
+    e_rab->e_RAB_ID = default_bearer->ebi;
+    e_rab->cause.present = group;
+    e_rab->cause.choice.radioNetwork = cause;
+    n_listed++;
+
+    ogs_debug("    Default EBI[%d] Group[%d] Cause[%d] (total %d E-RABs)",
+            default_bearer->ebi, group, (int)cause, n_listed);
+
+    nasPdu->size = esmbuf->len;
+    nasPdu->buf = CALLOC(nasPdu->size, sizeof(uint8_t));
+    memcpy(nasPdu->buf, esmbuf->data, nasPdu->size);
+    ogs_pkbuf_free(esmbuf);
+
+    return ogs_s1ap_encode(&pdu);
+}
+
 ogs_pkbuf_t *s1ap_build_e_rab_modification_confirm(mme_ue_t *mme_ue)
 {
     S1AP_S1AP_PDU_t pdu;
@@ -1869,6 +2043,20 @@ ogs_pkbuf_t *s1ap_build_path_switch_ack(
             ogs_list_for_each(&sess->bearer_list, bearer) {
                 S1AP_E_RABToBeSwitchedULItemIEs_t *item = NULL;
                 S1AP_E_RABToBeSwitchedULItem_t *e_rab = NULL;
+
+                /*
+                 * Defensive: skip bearers without an established SGW S1-U
+                 * path. Passing an empty sgw_s1u_ip to
+                 * ogs_asn_ip_to_BIT_STRING() would hit
+                 * ogs_assert_if_reached() (conv.c) and abort the MME
+                 * (same crash class as the HandoverRequest path).
+                 */
+                if (!bearer->sgw_s1u_teid ||
+                    (!bearer->sgw_s1u_ip.ipv4 && !bearer->sgw_s1u_ip.ipv6)) {
+                    ogs_warn("PathSwitchAck: skip bearer w/o SGW S1U "
+                            "[IMSI:%s EBI:%d]", mme_ue->imsi_bcd, bearer->ebi);
+                    continue;
+                }
 
                 item = CALLOC(1, sizeof(S1AP_E_RABToBeSwitchedULItemIEs_t));
                 ASN_SEQUENCE_ADD(&E_RABToBeSwitchedULList->list, item);
@@ -2358,6 +2546,27 @@ ogs_pkbuf_t *s1ap_build_handover_request(
             S1AP_E_RABToBeSetupItemHOReq_t *e_rab = NULL;
             S1AP_GBR_QosInformation_t *gbrQosInformation = NULL;
 
+            /*
+             * Skip any bearer whose SGW S1-U path is not usable yet.
+             *
+             * A second PDN (or a dedicated bearer) may still be waiting
+             * for its Create Session Response when HandoverRequired
+             * arrives; bearer->sgw_s1u_ip is then all-zero and passing it
+             * to ogs_asn_ip_to_BIT_STRING() hits ogs_assert_if_reached()
+             * (conv.c) and aborts the MME. sgw_s1u_ip and sgw_s1u_teid are
+             * set together from the Create Session Response
+             * (mme-s11-handler.c). We also drop esm_state_inactive bearers
+             * (not yet activated by the UE), mirroring the guard already
+             * used when building the InitialContextSetupRequest above.
+             */
+            if (OGS_FSM_CHECK(&bearer->sm, esm_state_inactive) ||
+                !bearer->sgw_s1u_teid ||
+                (!bearer->sgw_s1u_ip.ipv4 && !bearer->sgw_s1u_ip.ipv6)) {
+                ogs_warn("HandoverRequest: skip bearer w/o SGW S1U "
+                        "[IMSI:%s EBI:%d]", mme_ue->imsi_bcd, bearer->ebi);
+                continue;
+            }
+
             item = CALLOC(1, sizeof(S1AP_E_RABToBeSetupItemHOReqIEs_t));
             ASN_SEQUENCE_ADD(&E_RABToBeSetupListHOReq->list, item);
 
@@ -2408,6 +2617,20 @@ ogs_pkbuf_t *s1ap_build_handover_request(
                     bearer->sgw_s1u_teid, &e_rab->gTP_TEID);
             ogs_debug("    SGW-S1U-TEID[%d]", bearer->sgw_s1u_teid);
         }
+    }
+
+    /*
+     * If every bearer was skipped above there is no E-RAB to hand over.
+     * Encoding an empty E-RABToBeSetupListHOReq violates the S1AP
+     * SIZE(1..maxnoofE-RABs) constraint, so fail the build cleanly here.
+     * The sender (s1ap_send_handover_request) turns this NULL into a
+     * HandoverPreparationFailure rather than sending an invalid message.
+     */
+    if (!E_RABToBeSetupListHOReq->list.count) {
+        ogs_error("HandoverRequest: no active E-RAB, "
+                "abort handover preparation [IMSI:%s]", mme_ue->imsi_bcd);
+        ogs_s1ap_free(&pdu);
+        return NULL;
     }
 
     ogs_s1ap_buffer_to_OCTET_STRING(

@@ -462,42 +462,35 @@ ogs_pkbuf_t *mme_s11_build_modify_bearer_request(
 
     /* Indication */
     memset(&indication, 0, sizeof(ogs_gtp2_indication_t));
-    
-    /* 
-     * The handover indication flag must be set only for actual handovers and not for
-     * other scenarios like paging responses (service requests). This check determines
-     * if we're in a real handover scenario.
+
+    /*
+     * Set HI flag based on session's ue_request_type, not nas_eps.type.
+     * VoWiFi→VoLTE HO: UE sends Service Request first (nas_eps.type=SERVICE_REQUEST),
+     * then PDN connectivity request (Handover). The session's ue_request_type
+     * correctly reflects the HO, but nas_eps.type remains SERVICE_REQUEST.
      */
     bool is_handover = false;
-    
-    /* First check: If this is a service request, it's definitely not a handover */
-    if (mme_ue->nas_eps.type != MME_EPS_TYPE_SERVICE_REQUEST) {
-        /* Second check: See if any session has handover as request type */
-        ogs_list_for_each_entry(&mme_ue->bearer_to_modify_list, bearer, to_modify_node) {
-            mme_sess_t *sess = mme_sess_find_by_id(bearer->sess_id);
-            ogs_assert(sess);
-            
-            if (sess->ue_request_type.value == OGS_NAS_EPS_REQUEST_TYPE_HANDOVER) {
-                /* This is a valid handover */
-                is_handover = true;
-                ogs_debug("    Setting handover_indication: Bearer ID=%d, Session ID=%d",
-                         bearer->ebi, sess->pti);
-                break;
-            }
+
+    ogs_list_for_each_entry(
+            &mme_ue->bearer_to_modify_list, bearer, to_modify_node) {
+        mme_sess_t *sess = mme_sess_find_by_id(bearer->sess_id);
+        ogs_assert(sess);
+
+        if (sess->ue_request_type.value ==
+                OGS_NAS_EPS_REQUEST_TYPE_HANDOVER) {
+            is_handover = true;
+            ogs_debug("    Setting handover_indication: "
+                    "Bearer EBI=%d", bearer->ebi);
+            break;
         }
-    } else {
-        ogs_debug("    Not setting handover_indication flag: this is a service request (paging response)");
     }
-    
-    /* Set indication flag only for genuine handover scenarios */
+
     if (is_handover) {
         indication.handover_indication = 1;
         req->indication_flags.presence = 1;
         req->indication_flags.data = &indication;
         req->indication_flags.len = sizeof(ogs_gtp2_indication_t);
         ogs_debug("    Handover indication flag set");
-    } else {
-        ogs_debug("    Handover indication flag NOT set");
     }
 
     /* User Location Information(ULI) */
@@ -634,12 +627,22 @@ ogs_pkbuf_t *mme_s11_build_create_bearer_response(
     rsp->cause.len = sizeof(cause);
     rsp->cause.data = &cause;
 
-    if (cause_value == OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
-        /* Bearer Context : EBI */
-        rsp->bearer_contexts.presence = 1;
-        rsp->bearer_contexts.eps_bearer_id.presence = 1;
-        rsp->bearer_contexts.eps_bearer_id.u8 = bearer->ebi;
+    /* Bearer Context (mandatory per TS 29.274 7.2.4):
+     * - On success: include EBI + TEIDs + bearer-level Cause
+     * - On failure: include EBI + bearer-level Cause (TEIDs omitted)
+     *   so that the receiving node (SGW/PGW) can identify which bearer
+     *   failed instead of rejecting the response as
+     *   "Mandatory IE missing". */
+    rsp->bearer_contexts.presence = 1;
+    rsp->bearer_contexts.eps_bearer_id.presence = 1;
+    rsp->bearer_contexts.eps_bearer_id.u8 = bearer->ebi;
 
+    /* Bearer Context : Cause (always present) */
+    rsp->bearer_contexts.cause.presence = 1;
+    rsp->bearer_contexts.cause.len = sizeof(cause);
+    rsp->bearer_contexts.cause.data = &cause;
+
+    if (cause_value == OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
         /* Data Plane(DL) : ENB-S1U */
         memset(&enb_s1u_teid, 0, sizeof(ogs_gtp2_f_teid_t));
         enb_s1u_teid.interface_type = OGS_GTP2_F_TEID_S1_U_ENODEB_GTP_U;
@@ -665,11 +668,6 @@ ogs_pkbuf_t *mme_s11_build_create_bearer_response(
         rsp->bearer_contexts.s4_u_sgsn_f_teid.presence = 1;
         rsp->bearer_contexts.s4_u_sgsn_f_teid.data = &sgw_s1u_teid;
         rsp->bearer_contexts.s4_u_sgsn_f_teid.len = OGS_GTP2_F_TEID_IPV4_LEN;
-
-        /* Bearer Context : Cause */
-        rsp->bearer_contexts.cause.presence = 1;
-        rsp->bearer_contexts.cause.len = sizeof(cause);
-        rsp->bearer_contexts.cause.data = &cause;
     }
 
     /* User Location Information(ULI) */

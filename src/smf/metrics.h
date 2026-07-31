@@ -24,6 +24,9 @@ typedef enum smf_metric_type_global_s {
     SMF_METR_GLOB_GAUGE_GTP1_PDPCTXS_ACTIVE,
     SMF_METR_GLOB_GAUGE_GTP2_SESSIONS_ACTIVE,
     SMF_METR_GLOB_GAUGE_GTP_PEERS_ACTIVE,
+    /* Open5GS implementation-specific (Phase 4 / Phase 4.1 hotfix). */
+    SMF_METR_GLOB_CTR_PCC_RULE_SYNC_MISMATCH,
+    SMF_METR_GLOB_GAUGE_DEFERRED_DEACTIVATION_PENDING,
     _SMF_METR_GLOB_MAX,
 } smf_metric_type_global_t;
 extern ogs_metrics_inst_t *smf_metrics_inst_global[_SMF_METR_GLOB_MAX];
@@ -96,6 +99,84 @@ typedef enum smf_metric_type_by_cause_s {
 
 void smf_metrics_inst_by_cause_add(
     int cause, smf_metric_type_by_cause_t t, int val);
+
+/* BY RAT (rat label, "lte"/"wlan"): VoLTE / VoWiFi split for normal-path
+ * session / bearer KPIs. Existing s5c_rx_* / ues_active / bearers_active
+ * are kept untouched so existing dashboards keep working; this scope is
+ * what should be wired into new dashboards. */
+typedef enum smf_metric_type_by_rat_s {
+    SMF_METR_BY_RAT_CTR_SESSION_CREATE = 0,
+    SMF_METR_BY_RAT_CTR_SESSION_DELETE,
+    SMF_METR_BY_RAT_GAUGE_SESSION_ACTIVE,
+    SMF_METR_BY_RAT_CTR_BEARER_CREATE,
+    SMF_METR_BY_RAT_GAUGE_BEARER_ACTIVE,
+    _SMF_METR_BY_RAT_MAX,
+} smf_metric_type_by_rat_t;
+
+void smf_metrics_inst_by_rat_add(
+        const char *rat, smf_metric_type_by_rat_t t, int val);
+static inline void smf_metrics_inst_by_rat_inc(
+        const char *rat, smf_metric_type_by_rat_t t)
+{ smf_metrics_inst_by_rat_add(rat, t, 1); }
+static inline void smf_metrics_inst_by_rat_dec(
+        const char *rat, smf_metric_type_by_rat_t t)
+{ smf_metrics_inst_by_rat_add(rat, t, -1); }
+
+/* Map sess->gtp_rat_type -> stable label string. */
+const char *smf_rat_label(uint8_t gtp_rat_type);
+
+/* BY DIRECTION (direction label, "volte_to_vowifi"/"vowifi_to_volte"):
+ * HO tracking on the SMF side for MME-SMF cross-checking. */
+typedef enum smf_metric_type_by_direction_s {
+    SMF_METR_BY_DIRECTION_CTR_HO_ATTEMPT = 0,
+    SMF_METR_BY_DIRECTION_CTR_HO_SUCCESS,
+    SMF_METR_BY_DIRECTION_CTR_DATA_PLANE_PATH_SWITCH,
+    SMF_METR_BY_DIRECTION_CTR_HO_MULTI_DEDICATED_BEARER_LOSS,
+    _SMF_METR_BY_DIRECTION_MAX,
+} smf_metric_type_by_direction_t;
+
+void smf_metrics_inst_by_direction_add(
+        const char *direction, smf_metric_type_by_direction_t t, int val);
+static inline void smf_metrics_inst_by_direction_inc(
+        const char *direction, smf_metric_type_by_direction_t t)
+{ smf_metrics_inst_by_direction_add(direction, t, 1); }
+
+/* BY APP+EVENT (app + event, Diameter lifecycle). */
+typedef enum smf_metric_type_by_app_event_s {
+    SMF_METR_BY_APP_EVENT_CTR_DIAMETER_LIFECYCLE = 0,
+    _SMF_METR_BY_APP_EVENT_MAX,
+} smf_metric_type_by_app_event_t;
+
+void smf_metrics_inst_by_app_event_add(
+        const char *app, const char *event,
+        smf_metric_type_by_app_event_t t, int val);
+static inline void smf_metrics_inst_by_app_event_inc(
+        const char *app, const char *event,
+        smf_metric_type_by_app_event_t t)
+{ smf_metrics_inst_by_app_event_add(app, event, t, 1); }
+
+/* BY OUTCOME (outcome label): Hold Timer outcome. */
+typedef enum smf_metric_type_by_outcome_s {
+    SMF_METR_BY_OUTCOME_CTR_HOLD_TIMER = 0,
+    _SMF_METR_BY_OUTCOME_MAX,
+} smf_metric_type_by_outcome_t;
+
+void smf_metrics_inst_by_outcome_add(
+        const char *outcome, smf_metric_type_by_outcome_t t, int val);
+static inline void smf_metrics_inst_by_outcome_inc(
+        const char *outcome, smf_metric_type_by_outcome_t t)
+{ smf_metrics_inst_by_outcome_add(outcome, t, 1); }
+
+/* HISTOGRAM (direction label, milliseconds): HO duration on SMF side. */
+typedef enum smf_metric_type_histogram_s {
+    SMF_METR_HISTOGRAM_HO_DURATION = 0,
+    _SMF_METR_HISTOGRAM_MAX,
+} smf_metric_type_histogram_t;
+
+void smf_metrics_inst_histogram_observe(
+        const char *direction, smf_metric_type_histogram_t t,
+        int milliseconds);
+
 void smf_metrics_init(void);
 void smf_metrics_final(void);
 

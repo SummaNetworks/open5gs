@@ -21,6 +21,7 @@
 
 #include "mme-event.h"
 #include "mme-timer.h"
+#include "metrics.h"
 
 #include "nas-security.h"
 #include "nas-path.h"
@@ -497,7 +498,7 @@ int s1ap_send_paging(mme_ue_t *mme_ue, S1AP_CNDomain_t cn_domain)
         ogs_error("UE(mme-ue) context has already been removed");
         return OGS_NOTFOUND;
     }
-    
+
     /*
      * Global check for all paging attempts:
      * 1. Check if the UE has any sessions pending release
@@ -507,6 +508,23 @@ int s1ap_send_paging(mme_ue_t *mme_ue, S1AP_CNDomain_t cn_domain)
         ogs_debug("    Skipping paging for IMSI:[%s] - UE has sessions pending release",
                   mme_ue->imsi_bcd);
         return OGS_OK; /* Return success but don't actually page */
+    }
+
+    /* KPI Tier 1: count Paging attempts (only the first send per
+     * paging procedure, not the T3413 retries). retry_count == 0 marks
+     * the original attempt; T3413 retransmits pass cn_domain=0.
+     * Capture the send timestamp so the Paging→SR latency histogram
+     * can be observed in emm-sm.c when the UE responds. */
+    if (mme_ue->t3413.retry_count == 0) {
+        const char *paging_cause_label;
+        switch (cn_domain) {
+        case S1AP_CNDomain_ps: paging_cause_label = "ddn"; break;
+        case S1AP_CNDomain_cs: paging_cause_label = "mt_cs"; break;
+        default:               paging_cause_label = "other"; break;
+        }
+        mme_metrics_inst_by_paging_cause_inc(paging_cause_label,
+                MME_METR_BY_PAGING_CAUSE_ATTEMPT);
+        mme_ue->kpi_paging_sent_us = ogs_get_monotonic_time();
     }
 
     /* Find enB with matched TAI */
@@ -746,6 +764,9 @@ int s1ap_send_handover_request(
     ogs_pkbuf_t *s1apbuf = NULL;
 
     enb_ue_t *target_ue = NULL;
+    mme_ue_t *mme_ue = NULL;
+    uint8_t old_nhcc = 0;
+    uint8_t old_nh[OGS_SHA256_DIGEST_SIZE];
 
     ogs_assert(target_enb);
 
@@ -816,12 +837,44 @@ int s1ap_send_handover_request(
 
     enb_ue_source_associate_target(source_ue, target_ue);
 
+    /*
+     * Advance the NH (Next Hop) key here, immediately before building the
+     * HandoverRequest that carries it (nextHopChainingCount / NH). Keep the
+     * pre-advance value so it can be rolled back if the build fails and no
+     * HandoverRequest is sent; otherwise the NH chaining count desyncs from
+     * the eNB. (Moved here from s1ap_handle_handover_required_intralte.)
+     */
+    mme_ue = mme_ue_find_by_id(source_ue->mme_ue_id);
+    ogs_assert(mme_ue);
+    old_nhcc = mme_ue->nhcc;
+    memcpy(old_nh, mme_ue->nh, sizeof(old_nh));
+    mme_ue->nhcc++;
+    ogs_kdf_nh_enb(mme_ue->kasme, mme_ue->nh, mme_ue->nh);
+
     s1apbuf = s1ap_build_handover_request(
             target_ue, handovertype, cause,
             source_totarget_transparentContainer);
     if (!s1apbuf) {
         ogs_error("s1ap_build_handover_request() failed");
-        return OGS_ERROR;
+
+        /*
+         * No HandoverRequest was produced (e.g. no handoverable E-RAB).
+         * Roll back the NH advance and the target UE we just created, and
+         * report the failure to the source eNB. Do NOT return OGS_ERROR:
+         * the caller (s1ap_handle_handover_required_intralte) asserts
+         * r != OGS_ERROR, so returning it would abort the MME.
+         */
+        mme_ue->nhcc = old_nhcc;
+        memcpy(mme_ue->nh, old_nh, sizeof(old_nh));
+
+        enb_ue_source_deassociate_target(target_ue);
+        enb_ue_remove(target_ue);
+
+        rv = s1ap_send_handover_preparation_failure(source_ue,
+                S1AP_Cause_PR_radioNetwork,
+                S1AP_CauseRadioNetwork_unspecified);
+        ogs_expect(rv == OGS_OK);
+        return rv == OGS_ERROR ? OGS_OK : rv;
     }
 
     rv = s1ap_send_to_enb_ue(target_ue, s1apbuf);

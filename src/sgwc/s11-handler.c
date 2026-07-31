@@ -19,6 +19,7 @@
 
 #include "gtp-path.h"
 #include "pfcp-path.h"
+#include "s11-build.h"
 
 #include "s11-handler.h"
 
@@ -732,6 +733,44 @@ void sgwc_s11_handle_delete_session_request(
     }
 }
 
+/* Phase 4 Step 4-5: Helper to send a proper failure CBResp toward PGW.
+ *
+ * Builds and commits a Create Bearer Response with:
+ *   - Top-level Cause = cause_value
+ *   - Bearer Context  = { EBI, bearer-level Cause = cause_value }
+ * On failure to build/send, falls back to ogs_gtp_send_error_message()
+ * so the PGW at least gets a Cause IE. */
+static void sgwc_send_failure_cbresp(ogs_gtp_xact_t *s5c_xact,
+        sgwc_sess_t *sess, uint8_t cause_value, uint8_t ebi)
+{
+    int rv;
+    ogs_gtp2_header_t h;
+    ogs_pkbuf_t *pkbuf = NULL;
+
+    memset(&h, 0, sizeof(h));
+    h.type = OGS_GTP2_CREATE_BEARER_RESPONSE_TYPE;
+    h.teid = sess ? sess->pgw_s5c_teid : 0;
+
+    pkbuf = sgwc_s11_build_create_bearer_response_failure(
+            h.type, cause_value, ebi, cause_value);
+    if (!pkbuf) {
+        ogs_error("sgwc_s11_build_create_bearer_response_failure() failed "
+                "- fallback to error message");
+        ogs_gtp_send_error_message(s5c_xact, h.teid, h.type, cause_value);
+        return;
+    }
+
+    rv = ogs_gtp_xact_update_tx(s5c_xact, &h, pkbuf);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_gtp_xact_update_tx() failed - fallback");
+        ogs_gtp_send_error_message(s5c_xact, h.teid, h.type, cause_value);
+        return;
+    }
+
+    rv = ogs_gtp_xact_commit(s5c_xact);
+    ogs_expect(rv == OGS_OK);
+}
+
 void sgwc_s11_handle_create_bearer_response(
         sgwc_ue_t *sgwc_ue, ogs_gtp_xact_t *s11_xact,
         ogs_pkbuf_t *gtpbuf, ogs_gtp2_message_t *message)
@@ -799,6 +838,13 @@ void sgwc_s11_handle_create_bearer_response(
 
     /*****************************************
      * Check Mandatory/Conditional IE Missing
+     *
+     * Phase 4 Step 4-5 (Codex-validated): TS 29.274 7.2.4 marks F-TEIDs
+     * in Bearer Context as Conditional. They are required ONLY when the
+     * bearer-level Cause is "Request accepted". When MME rejects E-RAB
+     * Setup (e.g. invalid-qos-combination), the response carries only
+     * EBI + bearer-level Cause and must be forwarded to PGW so SMF can
+     * release the new bearer instead of waiting forever.
      *****************************************/
     cause_value = OGS_GTP2_CAUSE_REQUEST_ACCEPTED;
 
@@ -810,14 +856,6 @@ void sgwc_s11_handle_create_bearer_response(
         ogs_error("No EPS Bearer ID");
         cause_value = OGS_GTP2_CAUSE_MANDATORY_IE_MISSING;
     }
-    if (rsp->bearer_contexts.s1_u_enodeb_f_teid.presence == 0) {
-        ogs_error("No eNB TEID");
-        cause_value = OGS_GTP2_CAUSE_CONDITIONAL_IE_MISSING;
-    }
-    if (rsp->bearer_contexts.s4_u_sgsn_f_teid.presence == 0) {
-        ogs_error("No SGW TEID");
-        cause_value = OGS_GTP2_CAUSE_CONDITIONAL_IE_MISSING;
-    }
 
     if (rsp->cause.presence == 0) {
         ogs_error("No Cause");
@@ -826,6 +864,27 @@ void sgwc_s11_handle_create_bearer_response(
     if (rsp->bearer_contexts.cause.presence == 0) {
         ogs_error("No Bearer Cause");
         cause_value = OGS_GTP2_CAUSE_MANDATORY_IE_MISSING;
+    }
+
+    /* TEIDs are conditional - only required when bearer Cause=accepted */
+    {
+        uint8_t bearer_cause_value = OGS_GTP2_CAUSE_REQUEST_ACCEPTED;
+        if (rsp->bearer_contexts.cause.presence &&
+                rsp->bearer_contexts.cause.data) {
+            ogs_gtp2_cause_t *bc =
+                (ogs_gtp2_cause_t *)rsp->bearer_contexts.cause.data;
+            bearer_cause_value = bc->value;
+        }
+        if (bearer_cause_value == OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
+            if (rsp->bearer_contexts.s1_u_enodeb_f_teid.presence == 0) {
+                ogs_error("No eNB TEID");
+                cause_value = OGS_GTP2_CAUSE_CONDITIONAL_IE_MISSING;
+            }
+            if (rsp->bearer_contexts.s4_u_sgsn_f_teid.presence == 0) {
+                ogs_error("No SGW TEID");
+                cause_value = OGS_GTP2_CAUSE_CONDITIONAL_IE_MISSING;
+            }
+        }
     }
 
     if (!bearer) {
@@ -838,14 +897,19 @@ void sgwc_s11_handle_create_bearer_response(
     }
 
     if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
+        uint8_t ebi = (rsp->bearer_contexts.eps_bearer_id.presence) ?
+            rsp->bearer_contexts.eps_bearer_id.u8 : 0;
         if (bearer) {
             ogs_assert(OGS_OK ==
                 sgwc_pfcp_send_bearer_modification_request(
                     bearer, OGS_INVALID_POOL_ID, NULL,
                     OGS_PFCP_MODIFY_UL_ONLY|OGS_PFCP_MODIFY_REMOVE));
+            if (!ebi) ebi = bearer->ebi;
         }
-        ogs_gtp_send_error_message(s5c_xact, sess ? sess->pgw_s5c_teid : 0,
-                OGS_GTP2_CREATE_BEARER_RESPONSE_TYPE, cause_value);
+        /* Phase 4 Step 4-5: Build proper failure CBResp with Bearer
+         * Context (TS 29.274 7.2.4 Mandatory) instead of bare
+         * ogs_gtp_send_error_message(). */
+        sgwc_send_failure_cbresp(s5c_xact, sess, cause_value, ebi);
         return;
     }
 
@@ -858,13 +922,18 @@ void sgwc_s11_handle_create_bearer_response(
     ogs_assert(cause);
     cause_value = cause->value;
     if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
-        ogs_error("GTP Cause [Value:%d]", cause_value);
+        uint8_t ebi = (rsp->bearer_contexts.eps_bearer_id.presence) ?
+            rsp->bearer_contexts.eps_bearer_id.u8 : (bearer ? bearer->ebi : 0);
+        ogs_warn("Bearer-level GTP Cause [Value:%d] - forwarding failure "
+                "to PGW with Bearer Context (EBI=%d, Cause=%d)",
+                cause_value, ebi, cause_value);
         ogs_assert(OGS_OK ==
             sgwc_pfcp_send_bearer_modification_request(
                 bearer, OGS_INVALID_POOL_ID, NULL,
                 OGS_PFCP_MODIFY_UL_ONLY|OGS_PFCP_MODIFY_REMOVE));
-        ogs_gtp_send_error_message(s5c_xact, sess ? sess->pgw_s5c_teid : 0,
-                OGS_GTP2_CREATE_BEARER_RESPONSE_TYPE, cause_value);
+        /* Phase 4 Step 4-5: Forward MME's failure with proper Bearer
+         * Context (TS 29.274 7.2.4). */
+        sgwc_send_failure_cbresp(s5c_xact, sess, cause_value, ebi);
         return;
     }
 

@@ -18,12 +18,20 @@
  */
 
 #include "fd-path.h"
+#include "metrics.h"
 
 static struct session_handler *smf_s6b_reg = NULL;
 static struct disp_hdl *hdl_s6b_fb = NULL;
 
 struct sess_state {
-    smf_sess_t *sess;
+    /*
+     * Pool id, not a raw pointer: the callbacks run long after the request
+     * was sent and the smf_sess_t may have been removed meanwhile (the
+     * TS 29.274 7.2.1 collision path does exactly that). A stale pointer
+     * would survive ogs_assert(sess) and be dereferenced; a stale id simply
+     * fails to resolve.
+     */
+    ogs_pool_id_t sess_id;
     os0_t       s6b_sid;             /* S6B Session-Id */
 
     ogs_pool_id_t xact_id;
@@ -77,6 +85,169 @@ static void state_cleanup(struct sess_state *sess_data, os0_t sid, void *opaque)
     ogs_thread_mutex_unlock(&sess_state_mutex);
 }
 
+/*
+ * Re-attach a state that fd_sess_state_retrieve() detached, tolerating the
+ * case where a newer state already owns this handler's slot.
+ *
+ * fd_sess_state_store() returns EALREADY - leaving *sess_data untouched -
+ * when an entry for smf_s6b_reg is already linked, which happens when the
+ * SMF main thread sent a new S6b request while this callback held the state
+ * detached. Asserting ret == 0 there would abort the whole process for what
+ * is a per-session race, so treat EALREADY as "we are holding a redundant
+ * state": a newer one owns the slot and smf_sess_t keeps its own copy of
+ * the Session-Id, which makes state_cleanup() the correct disposal.
+ *
+ * A NULL *sess_data is a no-op: nothing was detached, and storing NULL
+ * would link a NULL-payload entry that steals the slot from whoever really
+ * owns the state (libfdproto does not special-case NULL).
+ */
+static bool s6b_state_reattach(struct session *session,
+        struct sess_state **sess_data)
+{
+    int ret;
+
+    ogs_assert(sess_data);
+
+    if (!*sess_data)
+        return true;
+
+    ret = fd_sess_state_store(smf_s6b_reg, session, sess_data);
+    if (ret != 0) {
+        ogs_warn("fd_sess_state_store() failed (%d) - a newer S6b state owns "
+                "the slot, releasing the orphaned state [%s]", ret,
+                (*sess_data)->s6b_sid ?
+                    (char *)(*sess_data)->s6b_sid : "(null)");
+        state_cleanup(*sess_data, NULL, NULL);
+        *sess_data = NULL;
+        return false;
+    }
+
+    ogs_assert(*sess_data == NULL);
+    return true;
+}
+
+/*
+ * Dispose of a detached state when an answer cannot be processed.
+ *
+ * Never just re-attach: the Session-Id may have no user left, in which case
+ * re-attaching would leave behind exactly the orphan this series reclaims.
+ * The owner is identified by comparing Session-Id strings, since each side
+ * keeps its own copy.
+ *
+ * Always leaves *sess_data NULL, so the caller can return without stranding
+ * anything.
+ */
+static void s6b_state_dispose(struct session *session,
+        struct sess_state **sess_data)
+{
+    smf_sess_t *sess = NULL;
+
+    ogs_assert(sess_data);
+
+    if (!*sess_data)
+        return;
+
+    sess = smf_sess_find_by_id((*sess_data)->sess_id);
+    if (sess && sess->s6b_sid && (*sess_data)->s6b_sid &&
+            strcmp(sess->s6b_sid, (char *)(*sess_data)->s6b_sid) == 0) {
+        s6b_state_reattach(session, sess_data);
+        return;
+    }
+
+    ogs_warn("S6b Session-Id [%s] no longer used - releasing state",
+            (*sess_data)->s6b_sid ?
+                (char *)(*sess_data)->s6b_sid : "(null)");
+    state_cleanup(*sess_data, NULL, NULL);
+    *sess_data = NULL;
+}
+
+/*
+ * Report an S6b request that could not be sent, as if the AAA server had
+ * answered it with a failure.
+ *
+ * The caller sets sm_data.s6b_aar_in_flight around the send and the GSM
+ * state machine only leaves smf_gsm_state_wait_epc_auth_initial through
+ * test_can_proceed(), which is driven purely by sm_data and has no S6b
+ * timeout. Returning silently would therefore wedge the session on an
+ * answer that was never asked for - no Create Session Response, no error.
+ *
+ * Mirrors gx_report_ccr_send_failure(): synthesise the failure so the
+ * existing, already-tested handling clears the flag, records the error and
+ * runs test_can_proceed(). When no GTP transaction can be resolved the
+ * event is not posted - the receiving branches and test_can_proceed()
+ * dereference it - and the failure is recorded in sm_data directly.
+ *
+ * Used for both directions: the AAR gates
+ * smf_gsm_state_wait_epc_auth_initial via s6b_aar_in_flight, and the STR
+ * gates smf_gsm_state_wait_epc_auth_release via s6b_str_in_flight.
+ */
+static void s6b_report_send_failure(smf_sess_t *sess,
+        ogs_pool_id_t xact_id, uint32_t cmd_code)
+{
+    ogs_diam_s6b_message_t *s6b_message = NULL;
+    smf_event_t *e = NULL;
+    int rv;
+    bool is_str = (cmd_code == OGS_DIAM_S6B_CMD_SESSION_TERMINATION);
+
+    ogs_assert(sess);
+
+    if (xact_id < OGS_MIN_POOL_ID || xact_id > OGS_MAX_POOL_ID ||
+            !ogs_gtp_xact_find_by_id(xact_id)) {
+        ogs_error("S6b request(cmd:%d) not sent and no GTP transaction to "
+                "report it on - recording the failure only", cmd_code);
+        if (is_str) {
+            sess->sm_data.s6b_str_in_flight = false;
+            sess->sm_data.s6b_sta_err = ER_DIAMETER_UNABLE_TO_COMPLY;
+        } else {
+            sess->sm_data.s6b_aar_in_flight = false;
+            sess->sm_data.s6b_aaa_err = ER_DIAMETER_UNABLE_TO_COMPLY;
+        }
+        return;
+    }
+
+    s6b_message = ogs_calloc(1, sizeof(ogs_diam_s6b_message_t));
+    if (!s6b_message) {
+        /* Fall back to recording it directly, or the in-flight flag stays
+         * set and test_can_proceed() never converges. */
+        ogs_error("ogs_calloc() failed");
+        if (is_str) {
+            sess->sm_data.s6b_str_in_flight = false;
+            sess->sm_data.s6b_sta_err = ER_DIAMETER_UNABLE_TO_COMPLY;
+        } else {
+            sess->sm_data.s6b_aar_in_flight = false;
+            sess->sm_data.s6b_aaa_err = ER_DIAMETER_UNABLE_TO_COMPLY;
+        }
+        return;
+    }
+    s6b_message->cmd_code = cmd_code;
+    s6b_message->result_code = ER_DIAMETER_UNABLE_TO_COMPLY;
+
+    e = smf_event_new(SMF_EVT_S6B_MESSAGE);
+    ogs_assert(e);
+    e->sess_id = sess->id;
+    e->s6b_message = s6b_message;
+    e->gtp_xact_id = xact_id;
+
+    rv = ogs_queue_push(ogs_app()->queue, e);
+    if (rv != OGS_OK) {
+        /* The report is what makes test_can_proceed() converge, so its own
+         * failure must not leave the flag set. */
+        ogs_error("ogs_queue_push() failed:%d", (int)rv);
+        ogs_free(s6b_message);
+        ogs_event_free(e);
+        if (is_str) {
+            sess->sm_data.s6b_str_in_flight = false;
+            sess->sm_data.s6b_sta_err = ER_DIAMETER_UNABLE_TO_COMPLY;
+        } else {
+            sess->sm_data.s6b_aar_in_flight = false;
+            sess->sm_data.s6b_aaa_err = ER_DIAMETER_UNABLE_TO_COMPLY;
+        }
+        return;
+    }
+
+    ogs_pollset_notify(ogs_app()->pollset);
+}
+
 static int smf_s6b_fb_cb(struct msg **msg, struct avp *avp,
         struct session *sess, void *opaque, enum disp_action *act)
 {
@@ -84,6 +255,83 @@ static int smf_s6b_fb_cb(struct msg **msg, struct avp *avp,
     ogs_warn("Unexpected message received!");
 
     return ENOTSUP;
+}
+
+
+/*
+ * No answer came back. freeDiameter has dropped the request from its
+ * sent-request table by now, so a late answer finds no query and is
+ * discarded; this is the last chance to release whatever is waiting.
+ *
+ * Runs on a freeDiameter thread. `data` is compared, never dereferenced, and
+ * the state is recovered from the session - the same discipline the answer
+ * callbacks use. *req is left in place for freeDiameter to free.
+ */
+static void s6b_request_expire_cb(void *data, DiamId_t peer_id,
+        size_t peer_len, struct msg **req, uint32_t cmd_code)
+{
+    struct session *session = NULL;
+    struct sess_state *sess_data = NULL;
+    smf_sess_t *sess = NULL;
+    ogs_pool_id_t xact_id = OGS_INVALID_POOL_ID;
+    bool is_str = (cmd_code == OGS_DIAM_S6B_CMD_SESSION_TERMINATION);
+    int ret;
+
+    if (!req || !*req)
+        return;
+
+    ret = fd_msg_sess_get(fd_g_config->cnf_dict, *req, &session, NULL);
+    if (ret != 0 || !session) {
+        ogs_error("S6b request timed out but its Session could not be "
+                "resolved");
+        return;
+    }
+
+    ret = fd_sess_state_retrieve(smf_s6b_reg, session, &sess_data);
+    if (ret != 0 || !sess_data) {
+        /* The answer path got there first and already converged. */
+        return;
+    }
+    if ((void *)sess_data != data) {
+        /* A newer request owns the slot - put it back untouched. */
+        s6b_state_reattach(session, &sess_data);
+        return;
+    }
+
+    xact_id = sess_data->xact_id;
+    sess = smf_sess_find_by_id(sess_data->sess_id);
+
+    ogs_error("S6b %s timed out after %ds [%s]",
+            is_str ? "STR" : "AAR",
+            (int)ogs_time_to_sec(
+                ogs_local_conf()->time.message.diameter.timeout_duration),
+            sess_data->s6b_sid ? (char *)sess_data->s6b_sid : "(null)");
+
+    /*
+     * Only report while the flag this request set is still up. If it has
+     * already been cleared the procedure moved on without us, and failing it
+     * now would consume a GTP transaction that belongs to something else.
+     */
+    if (sess &&
+            ((is_str && sess->sm_data.s6b_str_in_flight) ||
+             (!is_str && sess->sm_data.s6b_aar_in_flight)))
+        s6b_report_send_failure(sess, xact_id, cmd_code);
+
+    s6b_state_dispose(session, &sess_data);
+}
+
+static void smf_s6b_aar_expire_cb(void *data, DiamId_t peer_id,
+        size_t peer_len, struct msg **req)
+{
+    s6b_request_expire_cb(data, peer_id, peer_len, req,
+            OGS_DIAM_S6B_CMD_AUTHENTICATION_AUTHORIZATION);
+}
+
+static void smf_s6b_str_expire_cb(void *data, DiamId_t peer_id,
+        size_t peer_len, struct msg **req)
+{
+    s6b_request_expire_cb(data, peer_id, peer_len, req,
+            OGS_DIAM_S6B_CMD_SESSION_TERMINATION);
 }
 
 void smf_s6b_send_aar(smf_sess_t *sess, ogs_gtp_xact_t *xact)
@@ -160,20 +408,34 @@ void smf_s6b_send_aar(smf_sess_t *sess, ogs_gtp_xact_t *xact)
         /* Allocate new session state memory */
         sess_data = new_state(sid);
         if (!sess_data) {
-            ogs_error("new_state() failed: S6b sess_state_pool exhausted");
+            /*
+             * Same wedge as on Gx: the caller has set s6b_aar_in_flight and
+             * there is no S6b timeout, so a silent return would leave
+             * test_can_proceed() waiting forever. Report it as a failed AAA.
+             */
+            ogs_error("new_state() failed: S6b sess_state_pool exhausted "
+                    "- abandoning AAR");
             fd_msg_free(req);
+            s6b_report_send_failure(sess,
+                    xact ? xact->id : OGS_INVALID_POOL_ID,
+                    OGS_DIAM_S6B_CMD_AUTHENTICATION_AUTHORIZATION);
             return;
         }
 
         ogs_debug("    Allocate new session: [%s]", sess_data->s6b_sid);
 
-        /* Save Session-Id to SMF Session Context */
-        sess->s6b_sid = (char *)sess_data->s6b_sid;
+        /*
+         * sess->s6b_sid is NOT published here: it is set after the state has
+         * been stored successfully, at the end of this function. Publishing
+         * now would advertise ownership of a Session-Id whose state may lose
+         * the slot, and the assignment would overwrite - and leak - any copy
+         * already held.
+         */
     } else
         ogs_debug("    Retrieve session: [%s]", sess_data->s6b_sid);
 
     /* Update session state */
-    sess_data->sess = sess;
+    sess_data->sess_id = sess->id;
     sess_data->xact_id = xact ? xact->id : OGS_INVALID_POOL_ID;
 
     /* Set Origin-Host & Origin-Realm */
@@ -324,13 +586,53 @@ void smf_s6b_send_aar(smf_sess_t *sess, ogs_gtp_xact_t *xact)
     svg = sess_data;
 
     /* Store this value in the session */
-    ret = fd_sess_state_store(smf_s6b_reg, session, &sess_data);
-    ogs_assert(ret == 0);
-    ogs_assert(sess_data == NULL);
+    if (s6b_state_reattach(session, &sess_data) == false) {
+        /*
+         * A newer state took the slot, so ours has been released. Sending
+         * now would hand freeDiameter a callback cookie pointing at freed
+         * state, and the answer would be discarded on the stale-data path -
+         * leaving s6b_aar_in_flight set forever. Abandon the request and
+         * report it, exactly as the Gx sender does.
+         */
+        ogs_error("S6b AAR: state lost the slot - abandoning request");
+        fd_msg_free(req);
+        s6b_report_send_failure(sess, xact ? xact->id : OGS_INVALID_POOL_ID,
+                OGS_DIAM_S6B_CMD_AUTHENTICATION_AUTHORIZATION);
+        return;
+    }
+
+    /*
+     * Publish the Session-Id only now that the state is attached, and only
+     * when the value actually changes - mirroring the Gx sender. Publishing
+     * earlier would advertise ownership of a Session-Id whose state may not
+     * have made it into the slot, and overwriting without freeing would leak
+     * the previous copy.
+     */
+    if (!sess->s6b_sid || strcmp(sess->s6b_sid, (char *)svg->s6b_sid) != 0) {
+        if (sess->s6b_sid)
+            ogs_free(sess->s6b_sid);
+        sess->s6b_sid = ogs_strdup((char *)svg->s6b_sid);
+        ogs_assert(sess->s6b_sid);
+    }
 
     /* Send the request */
-    ret = fd_msg_send(&req, smf_s6b_aaa_cb, svg);
-    ogs_assert(ret == 0);
+    {
+        struct timespec ts;
+        struct timeval tv;
+
+        ogs_gettimeofday(&tv);
+        ts.tv_sec = tv.tv_sec +
+            ogs_time_to_sec(
+                ogs_local_conf()->time.message.diameter.timeout_duration);
+        ts.tv_nsec = tv.tv_usec * 1000;
+        ret = fd_msg_send_timeout(&req, smf_s6b_aaa_cb, svg, smf_s6b_aar_expire_cb, &ts);
+    }
+    if (ret != 0) {
+        ogs_error("fd_msg_send() failed (%d) - abandoning S6b AAR", ret);
+        s6b_report_send_failure(sess, xact ? xact->id : OGS_INVALID_POOL_ID,
+                OGS_DIAM_S6B_CMD_AUTHENTICATION_AUTHORIZATION);
+        return;
+    }
 
     /* Increment the counter */
     ogs_assert(pthread_mutex_lock(&ogs_diam_stats_self()->stats_lock) == 0);
@@ -373,20 +675,66 @@ static void smf_s6b_aaa_cb(void *data, struct msg **msg)
     ret = fd_sess_state_retrieve(smf_s6b_reg, session, &sess_data);
     ogs_assert(ret == 0);
     if (!sess_data) {
+        /* Consume the answer here rather than relying on freeDiameter's
+         * fallback-handler drop path. */
         ogs_error("No Session Data");
+        fd_msg_free(*msg);
+        *msg = NULL;
         return;
     }
-    ogs_assert((void *)sess_data == data);
+    if ((void *)sess_data != data) {
+        /*
+         * The state this request was sent with is no longer the one attached
+         * to the Session-Id - the same detached-state/replacement race that
+         * s6b_state_reattach() handles from the other side. The answer
+         * belongs to the old request, so put the current state back and drop
+         * it rather than acting on the wrong transaction.
+         *
+         * `data` is only compared, never dereferenced: it may already have
+         * been returned to sess_state_pool.
+         */
+        ogs_warn("S6b answer for a stale sess_state - dropping [%s]",
+                sess_data->s6b_sid ? (char *)sess_data->s6b_sid : "(null)");
+        s6b_state_dispose(session, &sess_data);
+        fd_msg_free(*msg);
+        *msg = NULL;
+        return;
+    }
 
     ogs_debug("    Retrieve its data: [%s]", sess_data->s6b_sid);
 
-    sess = sess_data->sess;
-    ogs_assert(sess);
+    /*
+     * Resolve the session that owns this S6b Session-Id. The one named when
+     * the request was sent may have been removed since - the TS 29.274
+     * 7.2.1 collision path removes sessions locally - so verify the
+     * Session-Id still matches rather than trusting the back-reference.
+     * When nobody owns it the state is a genuine orphan and is released
+     * here; nothing else would ever reclaim it.
+     */
+    sess = smf_sess_find_by_id(sess_data->sess_id);
+    if (!sess || !sess->s6b_sid || !sess_data->s6b_sid ||
+            strcmp(sess->s6b_sid, (char *)sess_data->s6b_sid) != 0) {
+        ogs_warn("S6b: no session owns Session-Id [%s] - releasing state",
+                sess_data->s6b_sid ?
+                    (char *)sess_data->s6b_sid : "(null)");
+        state_cleanup(sess_data, NULL, NULL);
+        sess_data = NULL;
+        /* This callback owns the answer; the shared exit is not reached. */
+        fd_msg_free(*msg);
+        *msg = NULL;
+        return;
+    }
 
     s6b_message = ogs_calloc(1, sizeof(ogs_diam_s6b_message_t));
     ogs_assert(s6b_message);
     /* Set Session Termination Command */
     s6b_message->cmd_code = OGS_DIAM_S6B_CMD_AUTHENTICATION_AUTHORIZATION;
+
+    /* Phase 4 PR8: parse IETF Result-Code (RFC 6733 §7.1.3) and
+     * 3GPP Experimental-Result-Code (TS 29.230) in parallel. Either
+     * may be absent, but they may also be present together — keep
+     * both so the GTP-C v2 Cause mapper can disambiguate value 5001
+     * (IETF AVP_UNSUPPORTED vs 3GPP USER_UNKNOWN). */
 
     /* Value of Result Code */
     ret = fd_msg_search_avp(*msg, ogs_diam_result_code, &avp);
@@ -395,28 +743,52 @@ static void smf_s6b_aaa_cb(void *data, struct msg **msg)
         ret = fd_msg_avp_hdr(avp, &hdr);
         ogs_assert(ret == 0);
         s6b_message->result_code = hdr->avp_value->i32;
+        /* KPI: S6b AAA result. The AA request initialises the S2b
+         * session, so a successful AAA maps to "init". Failures roll
+         * up to "error" regardless of the underlying experimental
+         * code so the time series stays simple to chart. */
+        smf_metrics_inst_by_app_event_inc("s6b",
+                s6b_message->result_code == ER_DIAMETER_SUCCESS ?
+                    "init" : "error",
+                SMF_METR_BY_APP_EVENT_CTR_DIAMETER_LIFECYCLE);
         if (s6b_message->result_code != ER_DIAMETER_SUCCESS) {
             ogs_error("Result Code: %d", s6b_message->result_code);
             error++;
         }
-    } else {
-        error++;
+    }
 
-        ret = fd_msg_search_avp(*msg, ogs_diam_experimental_result, &avp);
+    /* Value of Experimental-Result (vendor + code) */
+    ret = fd_msg_search_avp(*msg, ogs_diam_experimental_result, &avp);
+    ogs_assert(ret == 0);
+    if (avp) {
+        struct avp *avpch_vendor = NULL;
+
+        ret = fd_avp_search_avp(avp, ogs_diam_vendor_id, &avpch_vendor);
         ogs_assert(ret == 0);
-        if (avp) {
-            ret = fd_avp_search_avp(
-                    avp, ogs_diam_experimental_result_code, &avpch1);
+        if (avpch_vendor) {
+            ret = fd_msg_avp_hdr(avpch_vendor, &hdr);
             ogs_assert(ret == 0);
-            if (avpch1) {
-                ret = fd_msg_avp_hdr(avpch1, &hdr);
-                ogs_assert(ret == 0);
-                s6b_message->result_code = hdr->avp_value->i32;
-                ogs_error("Experimental Result Code: %d", s6b_message->result_code);
-            }
-        } else {
-            ogs_error("no Result-Code");
+            s6b_message->experimental_vendor_id = hdr->avp_value->u32;
         }
+
+        ret = fd_avp_search_avp(
+                avp, ogs_diam_experimental_result_code, &avpch1);
+        ogs_assert(ret == 0);
+        if (avpch1) {
+            ret = fd_msg_avp_hdr(avpch1, &hdr);
+            ogs_assert(ret == 0);
+            s6b_message->experimental_result_code = hdr->avp_value->u32;
+            ogs_error("Experimental Result Code: %u (Vendor-Id: %u)",
+                    s6b_message->experimental_result_code,
+                    s6b_message->experimental_vendor_id);
+            error++;
+        }
+    }
+
+    if (!s6b_message->result_code &&
+        !s6b_message->experimental_result_code) {
+        ogs_error("no Result-Code");
+        error++;
     }
 
     /* Value of Origin-Host */
@@ -448,7 +820,12 @@ static void smf_s6b_aaa_cb(void *data, struct msg **msg)
     e = smf_event_new(SMF_EVT_S6B_MESSAGE);
     ogs_assert(e);
 
-    if (error && s6b_message->result_code == ER_DIAMETER_SUCCESS)
+    /* Phase 4 PR8: only fall back to the local error counter if neither
+     * Result-Code nor Experimental-Result-Code provided a value. With
+     * Experimental-Result-Code now stored separately, downstream
+     * gtp_cause_from_diameter() can inspect both fields directly. */
+    if (error && s6b_message->result_code == ER_DIAMETER_SUCCESS &&
+            !s6b_message->experimental_result_code)
             s6b_message->result_code = error;
 
     e->sess_id = sess->id;
@@ -499,9 +876,7 @@ static void smf_s6b_aaa_cb(void *data, struct msg **msg)
                 (int)(ts.tv_sec + 1 - sess_data->ts.tv_sec),
                 (long)(1000000000 + ts.tv_nsec - sess_data->ts.tv_nsec) / 1000);
 
-    ret = fd_sess_state_store(smf_s6b_reg, session, &sess_data);
-    ogs_assert(ret == 0);
-    ogs_assert(sess_data == NULL);
+    s6b_state_reattach(session, &sess_data);
 
     ret = fd_msg_free(*msg);
     ogs_assert(ret == 0);
@@ -561,13 +936,24 @@ void smf_s6b_send_str(smf_sess_t *sess, ogs_gtp_xact_t *xact, uint32_t cause)
     ret = fd_sess_state_retrieve(smf_s6b_reg, session, &sess_data);
     ogs_assert(ret == 0);
     if (!sess_data) {
-        ogs_error("No Session Data");
+        /*
+         * The S6b state is already gone - the orphan-release paths added
+         * with the ownership split can reclaim it before a later teardown
+         * gets here. Returning silently would leak the request AND wedge
+         * smf_gsm_state_wait_epc_auth_release, which waits on
+         * s6b_str_in_flight and only ever clears it on STA receipt.
+         */
+        ogs_error("No Session Data - abandoning STR");
+        fd_msg_free(req);
+        s6b_report_send_failure(sess,
+                xact ? xact->id : OGS_INVALID_POOL_ID,
+                OGS_DIAM_S6B_CMD_SESSION_TERMINATION);
         return;
     }
     ogs_debug("    Retrieve session: [%s]", sess_data->s6b_sid);
 
     /* Update session state */
-    sess_data->sess = sess;
+    sess_data->sess_id = sess->id;
     sess_data->xact_id = xact ? xact->id : OGS_INVALID_POOL_ID;
 
     /* Set Origin-Host & Origin-Realm */
@@ -623,13 +1009,32 @@ void smf_s6b_send_str(smf_sess_t *sess, ogs_gtp_xact_t *xact, uint32_t cause)
     svg = sess_data;
 
     /* Store this value in the session */
-    ret = fd_sess_state_store(smf_s6b_reg, session, &sess_data);
-    ogs_assert(ret == 0);
-    ogs_assert(sess_data == NULL);
+    if (s6b_state_reattach(session, &sess_data) == false) {
+        ogs_error("S6b STR: state lost the slot - abandoning request");
+        fd_msg_free(req);
+        s6b_report_send_failure(sess, xact ? xact->id : OGS_INVALID_POOL_ID,
+                OGS_DIAM_S6B_CMD_SESSION_TERMINATION);
+        return;
+    }
 
     /* Send the request */
-    ret = fd_msg_send(&req, smf_s6b_sta_cb, svg);
-    ogs_assert(ret == 0);
+    {
+        struct timespec ts;
+        struct timeval tv;
+
+        ogs_gettimeofday(&tv);
+        ts.tv_sec = tv.tv_sec +
+            ogs_time_to_sec(
+                ogs_local_conf()->time.message.diameter.timeout_duration);
+        ts.tv_nsec = tv.tv_usec * 1000;
+        ret = fd_msg_send_timeout(&req, smf_s6b_sta_cb, svg, smf_s6b_str_expire_cb, &ts);
+    }
+    if (ret != 0) {
+        ogs_error("fd_msg_send() failed (%d) - abandoning S6b STR", ret);
+        s6b_report_send_failure(sess, xact ? xact->id : OGS_INVALID_POOL_ID,
+                OGS_DIAM_S6B_CMD_SESSION_TERMINATION);
+        return;
+    }
 
     /* Increment the counter */
     ogs_assert(pthread_mutex_lock(&ogs_diam_stats_self()->stats_lock) == 0);
@@ -672,21 +1077,63 @@ static void smf_s6b_sta_cb(void *data, struct msg **msg)
     ret = fd_sess_state_retrieve(smf_s6b_reg, session, &sess_data);
     ogs_assert(ret == 0);
     if (!sess_data) {
+        /* Consume the answer here rather than relying on freeDiameter's
+         * fallback-handler drop path. */
         ogs_error("No Session Data");
+        fd_msg_free(*msg);
+        *msg = NULL;
         return;
     }
-    ogs_assert((void *)sess_data == data);
+    if ((void *)sess_data != data) {
+        /*
+         * The state this request was sent with is no longer the one attached
+         * to the Session-Id - the same detached-state/replacement race that
+         * s6b_state_reattach() handles from the other side. The answer
+         * belongs to the old request, so put the current state back and drop
+         * it rather than acting on the wrong transaction.
+         *
+         * `data` is only compared, never dereferenced: it may already have
+         * been returned to sess_state_pool.
+         */
+        ogs_warn("S6b answer for a stale sess_state - dropping [%s]",
+                sess_data->s6b_sid ? (char *)sess_data->s6b_sid : "(null)");
+        s6b_state_dispose(session, &sess_data);
+        fd_msg_free(*msg);
+        *msg = NULL;
+        return;
+    }
 
     ogs_debug("    Retrieve its data: [%s]", sess_data->s6b_sid);
 
-    sess = sess_data->sess;
-    ogs_assert(sess);
+    /*
+     * Resolve the session that owns this S6b Session-Id. The one named when
+     * the request was sent may have been removed since - the TS 29.274
+     * 7.2.1 collision path removes sessions locally - so verify the
+     * Session-Id still matches rather than trusting the back-reference.
+     * When nobody owns it the state is a genuine orphan and is released
+     * here; nothing else would ever reclaim it.
+     */
+    sess = smf_sess_find_by_id(sess_data->sess_id);
+    if (!sess || !sess->s6b_sid || !sess_data->s6b_sid ||
+            strcmp(sess->s6b_sid, (char *)sess_data->s6b_sid) != 0) {
+        ogs_warn("S6b: no session owns Session-Id [%s] - releasing state",
+                sess_data->s6b_sid ?
+                    (char *)sess_data->s6b_sid : "(null)");
+        state_cleanup(sess_data, NULL, NULL);
+        sess_data = NULL;
+        /* This callback owns the answer; the shared exit is not reached. */
+        fd_msg_free(*msg);
+        *msg = NULL;
+        return;
+    }
 
     s6b_message = ogs_calloc(1, sizeof(ogs_diam_s6b_message_t));
     ogs_assert(s6b_message);
     /* Set Session Termination Command */
     s6b_message->cmd_code = OGS_DIAM_S6B_CMD_SESSION_TERMINATION;
 
+    /* Phase 4 PR8: parse IETF Result-Code and 3GPP Experimental-
+     * Result-Code in parallel (see AAA callback for rationale). */
 
     /* Value of Result Code */
     ret = fd_msg_search_avp(*msg, ogs_diam_result_code, &avp);
@@ -700,26 +1147,42 @@ static void smf_s6b_sta_cb(void *data, struct msg **msg)
             ogs_error("Result Code: %d", s6b_message->result_code);
             error++;
         }
-    } else {
-        error++;
+    }
 
-        ret = fd_msg_search_avp(*msg, ogs_diam_experimental_result, &avp);
+    /* Value of Experimental-Result (vendor + code) */
+    ret = fd_msg_search_avp(*msg, ogs_diam_experimental_result, &avp);
+    ogs_assert(ret == 0);
+    if (avp) {
+        struct avp *avpch_vendor = NULL;
+
+        ret = fd_avp_search_avp(avp, ogs_diam_vendor_id, &avpch_vendor);
         ogs_assert(ret == 0);
-        if (avp) {
-            ret = fd_avp_search_avp(
-                    avp, ogs_diam_experimental_result_code, &avpch1);
+        if (avpch_vendor) {
+            ret = fd_msg_avp_hdr(avpch_vendor, &hdr);
             ogs_assert(ret == 0);
-            if (avpch1) {
-                ret = fd_msg_avp_hdr(avpch1, &hdr);
-                ogs_assert(ret == 0);
-                s6b_message->result_code = hdr->avp_value->i32;
-                s6b_message->exp_err = &s6b_message->result_code;
-                ogs_error("Experimental Result Code: %d",
-                        s6b_message->result_code);
-            }
-        } else {
-            ogs_error("no Result-Code");
+            s6b_message->experimental_vendor_id = hdr->avp_value->u32;
         }
+
+        ret = fd_avp_search_avp(
+                avp, ogs_diam_experimental_result_code, &avpch1);
+        ogs_assert(ret == 0);
+        if (avpch1) {
+            ret = fd_msg_avp_hdr(avpch1, &hdr);
+            ogs_assert(ret == 0);
+            s6b_message->experimental_result_code = hdr->avp_value->u32;
+            s6b_message->exp_err =
+                &s6b_message->experimental_result_code;
+            ogs_error("Experimental Result Code: %u (Vendor-Id: %u)",
+                    s6b_message->experimental_result_code,
+                    s6b_message->experimental_vendor_id);
+            error++;
+        }
+    }
+
+    if (!s6b_message->result_code &&
+        !s6b_message->experimental_result_code) {
+        ogs_error("no Result-Code");
+        error++;
     }
 
     /* Value of Origin-Host */
@@ -753,6 +1216,13 @@ static void smf_s6b_sta_cb(void *data, struct msg **msg)
         ogs_assert(e);
 
         e->sess_id = sess->id;
+        /*
+         * Carry the GTP transaction the STR was sent for, exactly as the AAA
+         * callback does. Without it a release FSM that converges on this STA
+         * has no transaction to answer, and the Delete Session Response is
+         * never sent.
+         */
+        e->gtp_xact_id = sess_data->xact_id;
         e->s6b_message = s6b_message;
         rv = ogs_queue_push(ogs_app()->queue, e);
         if (rv != OGS_OK) {
@@ -802,9 +1272,7 @@ static void smf_s6b_sta_cb(void *data, struct msg **msg)
                 (int)(ts.tv_sec + 1 - sess_data->ts.tv_sec),
                 (long)(1000000000 + ts.tv_nsec - sess_data->ts.tv_nsec) / 1000);
 
-    ret = fd_sess_state_store(smf_s6b_reg, session, &sess_data);
-    ogs_assert(ret == 0);
-    ogs_assert(sess_data == NULL);
+    s6b_state_reattach(session, &sess_data);
 
     ret = fd_msg_free(*msg);
     ogs_assert(ret == 0);

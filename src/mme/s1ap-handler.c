@@ -19,6 +19,7 @@
 
 #include "mme-event.h"
 #include "mme-timer.h"
+#include "metrics.h"
 
 #include "s1ap-path.h"
 #include "nas-path.h"
@@ -33,6 +34,32 @@
 
 #include "mme-path.h"
 #include "mme-sm.h"
+
+/* Phase 4 PR5: stringify the S1AP_UE_CTX_REL_* values so the monitoring
+ * warn can include a human-readable action name. */
+static const char *s1ap_ue_ctx_rel_action_name(uint8_t action)
+{
+    switch (action) {
+    case S1AP_UE_CTX_REL_INVALID_ACTION:
+        return "INVALID";
+    case S1AP_UE_CTX_REL_S1_CONTEXT_REMOVE:
+        return "S1_CONTEXT_REMOVE";
+    case S1AP_UE_CTX_REL_S1_REMOVE_AND_UNLINK:
+        return "S1_REMOVE_AND_UNLINK";
+    case S1AP_UE_CTX_REL_UE_CONTEXT_REMOVE:
+        return "UE_CONTEXT_REMOVE";
+    case S1AP_UE_CTX_REL_S1_HANDOVER_COMPLETE:
+        return "S1_HANDOVER_COMPLETE";
+    case S1AP_UE_CTX_REL_S1_HANDOVER_CANCEL:
+        return "S1_HANDOVER_CANCEL";
+    case S1AP_UE_CTX_REL_S1_HANDOVER_FAILURE:
+        return "S1_HANDOVER_FAILURE";
+    case S1AP_UE_CTX_REL_S1_PAGING:
+        return "S1_PAGING";
+    default:
+        return "UNKNOWN";
+    }
+}
 
 static bool maximum_number_of_enbs_is_reached(void)
 {
@@ -992,6 +1019,20 @@ void s1ap_handle_initial_context_setup_response(
         return;
     }
 
+    /* KPI Tier 2: ICS Response success + ECM state transition to
+     * CM-CONNECTED + start of connected_state_duration measurement.
+     * The same UE may receive multiple ICS Responses across its
+     * lifetime (e.g. Service Request after idle), so only inc the
+     * gauge if we have not yet timestamped this connected window. */
+    mme_metrics_inst_by_result_cause_ext_inc(
+            "success", "accepted",
+            MME_METR_BY_RESULT_CAUSE_EXT_ICS);
+    if (!mme_ue->kpi_connected_us) {
+        mme_metrics_inst_by_state_inc("connected",
+                MME_METR_BY_STATE_UES_IN_STATE);
+        mme_ue->kpi_connected_us = ogs_get_monotonic_time();
+    }
+
     if (E_RABSetupListCtxtSURes) {
         int uli_presence = 0;
 
@@ -1205,6 +1246,16 @@ void s1ap_handle_initial_context_setup_failure(
 
     ogs_debug("    Cause[Group:%d Cause:%d]",
             Cause->present, (int)Cause->choice.radioNetwork);
+
+    /* KPI Tier 2: ICS failure, bucketed by S1AP cause. */
+    {
+        const char *cg, *cs;
+        mme_s1ap_release_cause_bucket(Cause->present,
+                (int)Cause->choice.radioNetwork, &cg, &cs);
+        mme_metrics_inst_by_result_cause_ext_inc(
+                "failure", cs ? cs : "other",
+                MME_METR_BY_RESULT_CAUSE_EXT_ICS);
+    }
 
     mme_ue = mme_ue_find_by_id(enb_ue->mme_ue_id);
 
@@ -1549,6 +1600,49 @@ void s1ap_handle_e_rab_setup_response(
         return;
     }
 
+    /* Phase 4 PR5 (Step 4-1+4-2 monitoring):
+     * Detect E-RABSetupResponse arriving while a UE Context Release
+     * is already in progress (a Phase 3 PCAP race observed once but
+     * not yet reproduced). Log + counter only so we can confirm
+     * recurrence before deciding on the full mitigation.
+     *
+     * Limit warn() to the three release actions that signify the
+     * race scenario (S1_CONTEXT_REMOVE / S1_REMOVE_AND_UNLINK /
+     * UE_CONTEXT_REMOVE) to avoid false positives from HO completion
+     * paths and paging that also use ue_ctx_rel_action. */
+    switch (enb_ue->ue_ctx_rel_action) {
+    case S1AP_UE_CTX_REL_S1_CONTEXT_REMOVE:
+    case S1AP_UE_CTX_REL_S1_REMOVE_AND_UNLINK:
+    case S1AP_UE_CTX_REL_UE_CONTEXT_REMOVE:
+    {
+        /* KPI: promote the PR5 race counter from a process-local static
+         * to a Prometheus counter so a single instance's history is no
+         * longer the only signal we have. */
+        mme_metrics_inst_global_inc(
+                MME_METR_GLOB_CTR_E_RAB_SETUP_RELEASE_RACE);
+        ogs_warn("[PR5] E-RABSetupResponse received while UE Context "
+                "Release in progress "
+                "[ENB_UE_S1AP_ID:%d MME_UE_S1AP_ID:%d "
+                "rel_action:%s(%d)]",
+                enb_ue->enb_ue_s1ap_id, enb_ue->mme_ue_s1ap_id,
+                s1ap_ue_ctx_rel_action_name(enb_ue->ue_ctx_rel_action),
+                enb_ue->ue_ctx_rel_action);
+        break;
+    }
+    case S1AP_UE_CTX_REL_INVALID_ACTION:
+        /* No release in progress — normal case, no log needed. */
+        break;
+    default:
+        /* HO completion / cancellation / failure / paging — these
+         * legitimately overlap with E-RAB setup activity and are
+         * not the Phase 3 race scenario. */
+        ogs_debug("E-RABSetupResponse during ue_ctx_rel_action=%s(%d) "
+                "(not a release race)",
+                s1ap_ue_ctx_rel_action_name(enb_ue->ue_ctx_rel_action),
+                enb_ue->ue_ctx_rel_action);
+        break;
+    }
+
     if (E_RABSetupListBearerSURes) {
         for (i = 0; i < E_RABSetupListBearerSURes->list.count; i++) {
             S1AP_E_RABSetupItemBearerSUResIEs_t *item = NULL;
@@ -1630,13 +1724,17 @@ void s1ap_handle_e_rab_setup_response(
     }
 
     if (E_RABFailedToSetupListBearerSURes) {
-        ogs_debug("E_RABFailedToSetupListBearerSURes");
+        ogs_warn("E_RABFailedToSetupListBearerSURes detected (%d failed)",
+                E_RABFailedToSetupListBearerSURes->list.count);
         for (i = 0; i < E_RABFailedToSetupListBearerSURes->list.count; i++) {
-            S1AP_E_RABItem_t *item = (S1AP_E_RABItem_t *)
+            S1AP_E_RABItemIEs_t *item_ies = (S1AP_E_RABItemIEs_t *)
                 E_RABFailedToSetupListBearerSURes->list.array[i];
+            S1AP_E_RABItem_t *e_rab = NULL;
+            mme_bearer_t *failed_bearer = NULL;
+            uint8_t cause_value;
 
-            if (!item) {
-                ogs_error("No S1AP_E_RABItem_t");
+            if (!item_ies) {
+                ogs_error("No S1AP_E_RABItemIEs_t");
                 r = s1ap_send_error_indication2(mme_ue,
                         S1AP_Cause_PR_protocol,
                         S1AP_CauseProtocol_semantic_error);
@@ -1645,9 +1743,186 @@ void s1ap_handle_e_rab_setup_response(
                 return;
             }
 
-            ogs_debug("RAB_ID: %d", (int)item->e_RAB_ID);
-            ogs_debug("    Cause[Group:%d Cause:%d]",
-                (int)item->cause.present, (int)item->cause.choice.radioNetwork);
+            e_rab = &item_ies->value.choice.E_RABItem;
+
+            ogs_warn("Failed EBI[%d] Cause[Group:%d Cause:%d]",
+                    (int)e_rab->e_RAB_ID,
+                    (int)e_rab->cause.present,
+                    (int)e_rab->cause.choice.radioNetwork);
+
+            /* Phase 4 Step 4-5: Notify SGW/SMF of E-RAB Setup failure.
+             *
+             * Without this notification, SMF waits forever for a
+             * Create Bearer Response (Phase 3 C defers DBReq until
+             * CBResp), leading to a zombie deferred state and
+             * eventual call drop only via PCRF RAR-Remove path.
+             *
+             * Map S1AP cause -> GTP2 cause and send a negative
+             * CBResp via SGW so the SMF can release the new bearer
+             * and execute any deferred DBReq immediately. */
+            failed_bearer = mme_bearer_find_by_ue_ebi(
+                    mme_ue, e_rab->e_RAB_ID);
+            if (!failed_bearer) {
+                ogs_warn("Failed bearer EBI[%d] not found - skip CBResp",
+                        (int)e_rab->e_RAB_ID);
+                continue;
+            }
+
+            /* Phase 4 PR6-B follow-up: skip failed bearers that belong
+             * to a session already being torn down (deletion_in_progress
+             * was set by the PR6-B HO rescue or by emm-sm.c bearer
+             * status mismatch handling). Such sessions have no live
+             * CREATE xact, and sending a negative CBResp would either
+             * be ignored by SGW (xact gone) or crash on the stale
+             * xact_id assert in mme_gtp_send_create_bearer_response(). */
+            {
+                mme_sess_t *failed_sess =
+                        mme_sess_find_by_id(failed_bearer->sess_id);
+                if (failed_sess && failed_sess->deletion_in_progress) {
+                    ogs_warn("Failed bearer EBI[%d] belongs to a sess "
+                            "being deleted (APN:%s) - skip negative "
+                            "CBResp",
+                            (int)e_rab->e_RAB_ID,
+                            failed_sess->session ?
+                                failed_sess->session->name : "unknown");
+                    continue;
+                }
+            }
+
+            /* B1 (latency): if the failed E-RAB is this session's DEFAULT
+             * bearer, the session setup failed and any DEDICATED bearer whose
+             * Create Bearer Request was deferred (its activation waits for the
+             * default to become active, which will now never happen) is
+             * orphaned -> the SMF waits ~9s for its CBReq GTP timeout before
+             * self-recovering. Reject those pending CBReqs now so the SMF
+             * releases them immediately. Trigger ONLY when the failed bearer
+             * is the default bearer: a dedicated E-RAB failure does not prove
+             * other deferred dedicated bearers cannot still proceed. */
+            {
+                mme_sess_t *b1_sess =
+                        mme_sess_find_by_id(failed_bearer->sess_id);
+                mme_bearer_t *b1_default = b1_sess ?
+                        mme_default_bearer_in_sess(b1_sess) : NULL;
+                if (b1_sess && !b1_sess->deletion_in_progress &&
+                        b1_default && b1_default == failed_bearer) {
+                    mme_bearer_t *ded = NULL;
+                    ogs_list_for_each(&b1_sess->bearer_list, ded) {
+                        if (ded == b1_default)
+                            continue;
+                        /* Only bearers with a live pending CBReq (a real GTP
+                         * CREATE xact to answer). Default/stale bearers have
+                         * create.xact_id == 0 and are skipped. */
+                        if (ded->create.xact_id < OGS_MIN_POOL_ID ||
+                                ded->create.xact_id > OGS_MAX_POOL_ID)
+                            continue;
+                        /* Deferred, never activated. Safe to reject because
+                         * the default bearer will not reach active state. */
+                        if (OGS_FSM_CHECK(&ded->sm, esm_state_active))
+                            continue;
+                        ogs_warn("[B1] default EBI[%d] E-RAB Setup failed; "
+                                "rejecting deferred dedicated CBReq EBI[%d]",
+                                failed_bearer->ebi, ded->ebi);
+                        if (mme_gtp_send_create_bearer_response(ded,
+                            OGS_GTP2_CAUSE_REQUEST_REJECTED_REASON_NOT_SPECIFIED)
+                                == OGS_OK)
+                            /* Idempotence: consume the xact so no later path
+                             * sends a second CBResp for the same request. */
+                            ded->create.xact_id = OGS_INVALID_POOL_ID;
+                    }
+                }
+            }
+
+            /*
+             * Default bearer E-RAB Setup rejected:
+             *
+             * If the failed E-RAB is this session's DEFAULT bearer, the PDN
+             * cannot come up on the radio side. A default bearer has no
+             * Create Bearer transaction (create.xact_id is set only for
+             * dedicated bearers via Create Bearer Request), so the negative
+             * Create Bearer Response path below cannot release it -- it would
+             * hit "Skip CBResp: no valid CREATE xact_id". The SGW/SMF
+             * session, already established via Create Session Response, must
+             * instead be torn down with a Delete Session Request.
+             *
+             * Do it proactively here rather than waiting ~T3485*max for the
+             * esm-sm.c exhaustion safety net, and stop T3485 so the MME does
+             * not keep retransmitting the now-futile Activate default EPS
+             * bearer context request over Downlink NAS Transport. The DSReq
+             * (NO_ACTION) tears down the default and every dedicated bearer
+             * of the PDN; local removal happens on the Delete Session
+             * Response (MME_SESS_CLEAR, or immediate purge on
+             * CONTEXT_NOT_FOUND).
+             */
+            {
+                mme_sess_t *def_sess =
+                        mme_sess_find_by_id(failed_bearer->sess_id);
+                if (def_sess &&
+                        failed_bearer ==
+                            mme_default_bearer_in_sess(def_sess)) {
+                    sgw_ue_t *sgw_ue = sgw_ue_find_by_id(mme_ue->sgw_ue_id);
+
+                    /* Stop the futile Activate-default retransmission. */
+                    CLEAR_BEARER_TIMER(failed_bearer->t3485);
+
+                    if (def_sess->deletion_in_progress) {
+                        ogs_warn("Default bearer EBI[%d] E-RAB Setup "
+                                "rejected - PDN[%s] delete already in "
+                                "progress; skip",
+                                failed_bearer->ebi,
+                                def_sess->session ?
+                                    def_sess->session->name : "unknown");
+                    } else if (sgw_ue && MME_HAVE_SGW_S1U_PATH(def_sess)) {
+                        ogs_warn("Default bearer EBI[%d] E-RAB Setup "
+                                "rejected - releasing PDN[%s] via Delete "
+                                "Session Request",
+                                failed_bearer->ebi,
+                                def_sess->session ?
+                                    def_sess->session->name : "unknown");
+                        def_sess->deletion_in_progress = true;
+                        ogs_expect(OGS_OK ==
+                            mme_gtp_send_delete_session_request(
+                                enb_ue, sgw_ue, def_sess,
+                                OGS_GTP_DELETE_NO_ACTION));
+                    } else {
+                        /* No SGW S1-U path (session not established at the
+                         * SGW): remove the local PDN directly. */
+                        ogs_warn("Default bearer EBI[%d] E-RAB Setup "
+                                "rejected - no SGW S1U path; removing local "
+                                "PDN[%s]",
+                                failed_bearer->ebi,
+                                def_sess->session ?
+                                    def_sess->session->name : "unknown");
+                        MME_SESS_CLEAR(def_sess);
+                    }
+                    /* Default bearer handled; do not fall through to the
+                     * dedicated-only Create Bearer Response path. */
+                    continue;
+                }
+            }
+
+            switch (e_rab->cause.present) {
+            case S1AP_Cause_PR_radioNetwork:
+                cause_value =
+                    OGS_GTP2_CAUSE_REQUEST_REJECTED_REASON_NOT_SPECIFIED;
+                break;
+            case S1AP_Cause_PR_transport:
+                cause_value = OGS_GTP2_CAUSE_NO_RESOURCES_AVAILABLE;
+                break;
+            default:
+                cause_value =
+                    OGS_GTP2_CAUSE_REQUEST_REJECTED_REASON_NOT_SPECIFIED;
+                break;
+            }
+
+            r = mme_gtp_send_create_bearer_response(
+                    failed_bearer, cause_value);
+            ogs_expect(r == OGS_OK);
+            if (r != OGS_OK) {
+                ogs_warn("mme_gtp_send_create_bearer_response() failed for "
+                        "EBI[%d] - continue with next failed E-RAB",
+                        (int)e_rab->e_RAB_ID);
+                continue;
+            }
         }
     }
 
@@ -1770,6 +2045,20 @@ void s1ap_handle_ue_context_release_request(
 
     ogs_debug("    Cause[Group:%d Cause:%d]",
             Cause->present, (int)Cause->choice.radioNetwork);
+
+    /* KPI Tier 1: UEContextReleaseRequest cause distribution.
+     * Particularly useful for spotting `radio_lost` (iPhone-style
+     * stealth radio link failure). cause_group is a high-level
+     * classification (radio / normal / mobility / nas / transport /
+     * protocol / misc / other). */
+    {
+        const char *cg, *cs;
+        mme_s1ap_release_cause_bucket(Cause->present,
+                (int)Cause->choice.radioNetwork, &cg, &cs);
+        mme_metrics_inst_by_cause_group_inc(
+                cg ? cg : "other", cs ? cs : "other",
+                MME_METR_BY_CAUSE_GROUP_UE_CONTEXT_RELEASE);
+    }
 
     switch (Cause->present) {
     case S1AP_Cause_PR_radioNetwork:
@@ -1908,6 +2197,84 @@ void s1ap_handle_ue_context_release_action(enb_ue_t *enb_ue)
          */
         CLEAR_MME_UE_ALL_TIMERS(mme_ue);
 
+        /*
+         * Phase 4 PR3b follow-up (post-test):
+         *
+         * When the S1 context is being torn down for one of the
+         * Idle-bound release actions, the UE cannot deliver the NAS
+         * "Deactivate EPS bearer context accept" that would normally
+         * complete a Delete Bearer Request the SMF has in flight.
+         * Without a proactive reply the SMF retransmits DBReq for
+         * T3 * N3 (~10 s) and ends with "Bearer has already been
+         * removed", filling the log with noise.
+         *
+         * Per TS 24.301 §6.4.4.2 the MME may locally deactivate the
+         * bearer "without peer-to-peer ESM signalling to the UE" when
+         * no NAS connection exists. Send DBResp(Request accepted)
+         * (TS 29.274 §7.2.10.2 + §8.4) on every bearer that still
+         * carries a pending delete.xact_id so the SMF can complete
+         * its transaction immediately; the local bearer cleanup is
+         * still driven by the usual Delete Session / Release Access
+         * Bearers / Phase 4 PR2 TAU mismatch deactivation paths.
+         *
+         * Scope: only the Idle-bound release actions
+         *   1) S1_CONTEXT_REMOVE      (eNB user-inactivity → ECM-IDLE)
+         *   2) S1_REMOVE_AND_UNLINK   (MME-initiated detach)
+         *   3) UE_CONTEXT_REMOVE      (full detach)
+         *   7) S1_PAGING              (paging failure release)
+         * HO-related actions 4-6 (S1_HANDOVER_COMPLETE / CANCEL /
+         * FAILURE) are intentionally excluded because the UE remains
+         * reachable on the target or source eNB and may still deliver
+         * the NAS accept — Codex MCP analysis classified an
+         * unconditional flush there as a "premature accepted" risk.
+         */
+        switch (enb_ue->ue_ctx_rel_action) {
+        case S1AP_UE_CTX_REL_S1_CONTEXT_REMOVE:
+        case S1AP_UE_CTX_REL_S1_REMOVE_AND_UNLINK:
+        case S1AP_UE_CTX_REL_UE_CONTEXT_REMOVE:
+        case S1AP_UE_CTX_REL_S1_PAGING:
+        {
+            mme_sess_t *flush_sess = NULL;
+            mme_bearer_t *flush_bearer = NULL;
+            ogs_list_for_each(&mme_ue->sess_list, flush_sess) {
+                ogs_list_for_each(&flush_sess->bearer_list,
+                        flush_bearer) {
+                    if (flush_bearer->delete.xact_id <
+                            OGS_MIN_POOL_ID ||
+                        flush_bearer->delete.xact_id >
+                            OGS_MAX_POOL_ID)
+                        continue;
+                    ogs_warn("[PR3b follow-up] Idle release with "
+                            "pending DBReq xact - flushing "
+                            "DBResp(Accepted) to SMF "
+                            "[IMSI:%s EBI:%d xact_id:%d "
+                            "action:%s "
+                            "MME_UE_S1AP_ID:%d ECM:%s]",
+                            mme_ue->imsi_bcd,
+                            flush_bearer->ebi,
+                            flush_bearer->delete.xact_id,
+                            s1ap_ue_ctx_rel_action_name(
+                                enb_ue->ue_ctx_rel_action),
+                            enb_ue->mme_ue_s1ap_id,
+                            ECM_IDLE(mme_ue) ? "IDLE" :
+                                "CONNECTED");
+                    mme_metrics_inst_global_inc(
+                        MME_METR_GLOB_CTR_DBRESP_PROACTIVE_FLUSH);
+                    (void)mme_gtp_send_delete_bearer_response(
+                            flush_bearer,
+                            OGS_GTP2_CAUSE_REQUEST_ACCEPTED);
+                    flush_bearer->delete.xact_id =
+                            OGS_INVALID_POOL_ID;
+                }
+            }
+            break;
+        }
+        default:
+            /* HO-related actions (S1_HANDOVER_COMPLETE / CANCEL /
+             * FAILURE): UE remains reachable, do not flush. */
+            break;
+        }
+
         if (OGS_FSM_CHECK(&mme_ue->sm, emm_state_registered)) {
             ogs_debug("Mobile Reachable timer started for IMSI[%s]",
                 mme_ue->imsi_bcd);
@@ -1966,6 +2333,20 @@ void s1ap_handle_ue_context_release_action(enb_ue_t *enb_ue)
             ogs_timer_start(mme_ue->t_mobile_reachable.timer,
                 ogs_time_from_sec(mme_self()->time.t3412.value + 180));
         }
+    }
+
+    /* KPI Tier 2: ECM state gauge dec + connected_state_duration on
+     * UE Context Release Complete. The UE is leaving CM-CONNECTED for
+     * CM-IDLE. */
+    if (mme_ue && mme_ue->kpi_connected_us) {
+        ogs_time_t elapsed_us = ogs_get_monotonic_time() -
+                mme_ue->kpi_connected_us;
+        mme_metrics_inst_by_state_dec("connected",
+                MME_METR_BY_STATE_UES_IN_STATE);
+        mme_metrics_inst_histogram_seconds_observe(
+                MME_METR_HIST_CONNECTED_STATE_DURATION,
+                (int)(elapsed_us / OGS_USEC_PER_SEC));
+        mme_ue->kpi_connected_us = 0;
     }
 
     switch (enb_ue->ue_ctx_rel_action) {
@@ -2237,6 +2618,55 @@ void s1ap_handle_e_rab_release_response(
                     (int)e_rab_item->e_RAB_ID,
                     (int)e_rab_item->cause.present,
                     (int)e_rab_item->cause.choice.radioNetwork);
+
+            /*
+             * E-RAB Release failed (e.g. radioNetwork cause user-inactivity:
+             * the eNB idled the radio before the release completed, so the
+             * UE will never send Deactivate EPS Bearer Context Accept). The
+             * bearer would otherwise sit in esm_state_pdn_will_disconnect
+             * until a later TAU bearer-status mismatch (~tens of seconds),
+             * long enough to drop an in-progress call.
+             *
+             * Proactively complete the local PDN teardown, but ONLY under
+             * the shared safe condition (identical to the pdn_will_disconnect
+             * retransmit path): the failed E-RAB is a session default bearer
+             * that is genuinely mid-teardown AND whose core (SGW/SMF) delete
+             * has completed:
+             *   - default bearer is in esm_state_pdn_will_disconnect
+             *   - sess->deletion_in_progress
+             *   - sess->core_delete_done  (Delete Session Response received,
+             *     ownership-guard-verified; not a timed-out xact)
+             * This site is outside the ESM FSM dispatch, so a direct
+             * MME_SESS_CLEAR() is safe here. Dedicated-only release failures
+             * do not by themselves justify PDN removal, so we key on the
+             * default bearer. The delete_xact_id guard in the Delete Session
+             * Response handler already ensures we cannot act on a session
+             * whose delete belongs to someone else.
+             */
+            {
+                mme_bearer_t *failed_bearer = mme_bearer_find_by_ue_ebi(
+                        mme_ue, (uint8_t)e_rab_item->e_RAB_ID);
+                if (failed_bearer) {
+                    mme_sess_t *rel_sess =
+                            mme_sess_find_by_id(failed_bearer->sess_id);
+                    mme_bearer_t *def = rel_sess ?
+                            mme_default_bearer_in_sess(rel_sess) : NULL;
+                    if (rel_sess && def && def == failed_bearer &&
+                            rel_sess->deletion_in_progress &&
+                            rel_sess->core_delete_done &&
+                            OGS_FSM_CHECK(&def->sm,
+                                    esm_state_pdn_will_disconnect)) {
+                        ogs_warn("[%s] E-RAB[%d] release failed with core "
+                                "delete already complete - completing local "
+                                "PDN[%s] teardown now (no Deactivate Accept "
+                                "expected)",
+                                mme_ue->imsi_bcd, (int)e_rab_item->e_RAB_ID,
+                                rel_sess->session ?
+                                    rel_sess->session->name : "unknown");
+                        MME_SESS_CLEAR(rel_sess);
+                    }
+                }
+            }
         }
     }
 }
@@ -3025,9 +3455,13 @@ static void s1ap_handle_handover_required_intralte(enb_ue_t *source_ue,
 
     source_ue->handover_type = S1AP_HandoverType_intralte;
 
-    mme_ue->nhcc++;
-    ogs_kdf_nh_enb(mme_ue->kasme, mme_ue->nh, mme_ue->nh);
-
+    /*
+     * The NH (Next Hop) key advance was moved into
+     * s1ap_send_handover_request(), right before the HandoverRequest that
+     * carries it is built, so it can be rolled back if the build fails and
+     * no HandoverRequest is sent (keeps the NH chaining count in sync with
+     * the eNB).
+     */
     r = s1ap_send_handover_request(
             source_ue, target_enb, &source_ue->handover_type, Cause,
             Source_ToTarget_TransparentContainer);

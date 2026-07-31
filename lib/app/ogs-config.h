@@ -126,6 +126,22 @@ typedef struct ogs_local_conf_s {
                 ogs_time_t association_interval;
                 ogs_time_t no_heartbeat_duration;
             } pfcp;
+
+            struct {
+                /*
+                 * How long to wait for a Diameter answer before giving up on
+                 * it and failing the procedure that is waiting.
+                 *
+                 * Derived from message.duration so the relationship survives
+                 * an operator changing that: it must stay BELOW the point
+                 * where the GTP-C peer stops retransmitting its request,
+                 * otherwise the answer we finally produce arrives after
+                 * nobody is listening. Set explicitly in configuration to
+                 * override, in which case the derivation no longer applies.
+                 */
+                ogs_time_t timeout_duration;
+                bool timeout_duration_set;
+            } diameter;
         } message;
 
         struct {

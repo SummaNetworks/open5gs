@@ -18,6 +18,7 @@
  */
 
 #include "mme-context.h"
+#include "metrics.h"
 #include "nas-path.h"
 #include "sgsap-path.h"
 #include "mme-gtp-path.h"
@@ -61,6 +62,20 @@ int esm_handle_pdn_connectivity_request(
 
     memcpy(&sess->ue_request_type,
             &req->request_type, sizeof(sess->ue_request_type));
+
+    /* KPI: bucket PDN Connectivity Request by NAS request_type and, for
+     * HANDOVER requests, record the start time used by the MBR success
+     * edge to observe the handover duration histogram. The direction is
+     * fixed to vowifi_to_volte because the MME only sees HANDOVER on
+     * the incoming E-UTRAN side; volte_to_vowifi is owned by the SMF. */
+    mme_metrics_inst_by_request_type_inc(
+            mme_request_type_bucket(sess->ue_request_type.value),
+            MME_METR_BY_REQUEST_TYPE_PDN_CONN);
+    if (sess->ue_request_type.value == OGS_NAS_EPS_REQUEST_TYPE_HANDOVER) {
+        sess->ho_start_us = ogs_get_monotonic_time();
+        mme_metrics_inst_by_direction_inc(
+                "vowifi_to_volte", MME_METR_BY_DIRECTION_HO_ATTEMPT);
+    }
 
     security_protected_required = 0;
     if (req->presencemask &

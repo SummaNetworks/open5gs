@@ -55,11 +55,21 @@ uint32_t smf_gx_handle_cca_initial_request(
         return gx_message->err ? *gx_message->err :
                                  ER_DIAMETER_AUTHENTICATION_REJECTED;
 
-
-    sess->policy.num_of_pcc_rule = gx_message->session_data.num_of_pcc_rule;
-    for (i = 0; i < gx_message->session_data.num_of_pcc_rule; i++)
-        OGS_STORE_PCC_RULE(&sess->policy.pcc_rule[i],
-                &gx_message->session_data.pcc_rule[i]);
+    /* HO CCA-U overwrite protection: if CCA-U returns no PCC rules
+     * and we already have rules copied from peer session (dedicated
+     * bearer), preserve them for bearer_binding() to issue CBReq. */
+    if (gx_message->session_data.num_of_pcc_rule == 0 &&
+        sess->policy.num_of_pcc_rule > 0 &&
+        sess->epc_handover.state == SMF_HO_STATE_TARGET_ACTIVE) {
+        ogs_info("HO: CCA-U has no PCC rules, preserving %d "
+                "copied rule(s)", sess->policy.num_of_pcc_rule);
+    } else {
+        sess->policy.num_of_pcc_rule =
+            gx_message->session_data.num_of_pcc_rule;
+        for (i = 0; i < gx_message->session_data.num_of_pcc_rule; i++)
+            OGS_STORE_PCC_RULE(&sess->policy.pcc_rule[i],
+                    &gx_message->session_data.pcc_rule[i]);
+    }
 
     /* APN-AMBR
      * if PCRF changes APN-AMBR, this should be included. */
@@ -80,10 +90,12 @@ uint32_t smf_gx_handle_cca_initial_request(
     }
 
     /* Bearer QoS
-     * if PCRF changes Bearer QoS, this should be included. */
+     * if PCRF changes Bearer QoS, this should be included.
+     * Skip QoS update if CCA-U has no QoS (HO case: QoS already
+     * restored from peer session). */
     sess->gtp.create_session_response_bearer_qos = false;
-    if ((gx_message->session_data.session.qos.index &&
-        sess->session.qos.index !=
+    if (gx_message->session_data.session.qos.index &&
+        ((sess->session.qos.index !=
             gx_message->session_data.session.qos.index) ||
         (gx_message->session_data.session.qos.arp.priority_level &&
         sess->session.qos.arp.priority_level !=
@@ -92,7 +104,7 @@ uint32_t smf_gx_handle_cca_initial_request(
             gx_message->session_data.session.qos.arp.pre_emption_capability ||
         sess->session.qos.arp.pre_emption_vulnerability !=
             gx_message->session_data.
-                session.qos.arp.pre_emption_vulnerability) {
+                session.qos.arp.pre_emption_vulnerability)) {
 
         sess->session.qos.index = gx_message->session_data.session.qos.index;
         sess->session.qos.arp.priority_level =
@@ -266,6 +278,29 @@ uint32_t smf_gx_handle_cca_termination_request(
     ogs_debug("[SMF] Delete Session Response");
     ogs_debug("    SGW_S5C_TEID[0x%x] SMF_N4_TEID[0x%x]",
             sess->sgw_s5c_teid, sess->smf_n4_teid);
+
+    /*
+     * The Gx session is finished, so drop this session's copy of the
+     * Session-Id, or a later CCR would reuse a Session-Id the PCRF has
+     * already terminated and get UNKNOWN_SESSION_ID back.
+     *
+     * Done here rather than in the caller so it applies to every state that
+     * handles a CCA-T. There are two CCR-T senders: the normal teardown,
+     * which transitions to smf_gsm_state_wait_epc_auth_release, and the
+     * failure branch of test_can_proceed() in
+     * smf_gsm_state_wait_epc_auth_initial, which sends the GTP error and
+     * stays put - so its CCA-T is dispatched to a state whose handler has no
+     * TERMINATION case at all.
+     *
+     * Also deliberately NOT done in smf_gx_cca_cb(): that runs on a
+     * freeDiameter dispatch thread, and smf_sess_remove() frees the same
+     * copy on the main thread. Keeping every write to sess->gx_sid on the
+     * main thread is what makes that safe.
+     */
+    if (sess->gx_sid) {
+        ogs_free(sess->gx_sid);
+        sess->gx_sid = NULL;
+    }
 
     return ER_DIAMETER_SUCCESS;
 }

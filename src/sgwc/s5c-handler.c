@@ -503,7 +503,46 @@ void sgwc_s5c_handle_delete_session_response(
     }
 
     if (session_cause != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
-        ogs_error("GTP Cause [VALUE:%d] - Ignored", session_cause);
+        /* Phase 4 PR6-B follow-up: Cause 64 (CONTEXT_NOT_FOUND) from
+         * the SMF on the S5C DSResp leg is the expected race outcome
+         * when a parallel cleanup at the SMF (e.g., Phase 1 HO
+         * detection in the CSReq handler) removed the session before
+         * this DSReq's PFCP cleanup completed. SGWC does not see the
+         * MME-side delete_action, so we cannot narrow the warn the
+         * way the MME handler does — but functionally any Cause 64
+         * here means the delete goal is achieved at the SMF. Other
+         * causes are still real anomalies (kept as ogs_error).
+         * Structured fields (IMSI/APN/TEIDs) are emitted so the warn
+         * can still be correlated with peer logs during post-mortem
+         * (Codex MCP recommendation). */
+        if (session_cause == OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND) {
+            ogs_warn("GTP Cause [VALUE:%d] - Ignored "
+                    "(procedure=DSResp expected: parallel deletion "
+                    "completed at SMF) "
+                    "[IMSI:%s APN:%s "
+                    "MME_S11_TEID:0x%x SGW_S11_TEID:0x%x "
+                    "SGW_S5C_TEID:0x%x PGW_S5C_TEID:0x%x]",
+                    session_cause,
+                    sgwc_ue ? sgwc_ue->imsi_bcd : "unknown",
+                    sess ? sess->session.name : "unknown",
+                    sgwc_ue ? sgwc_ue->mme_s11_teid : 0,
+                    sgwc_ue ? sgwc_ue->sgw_s11_teid : 0,
+                    sess ? sess->sgw_s5c_teid : 0,
+                    sess ? sess->pgw_s5c_teid : 0);
+        } else {
+            ogs_error("GTP Cause [VALUE:%d] - Ignored "
+                    "(procedure=DSResp) "
+                    "[IMSI:%s APN:%s "
+                    "MME_S11_TEID:0x%x SGW_S11_TEID:0x%x "
+                    "SGW_S5C_TEID:0x%x PGW_S5C_TEID:0x%x]",
+                    session_cause,
+                    sgwc_ue ? sgwc_ue->imsi_bcd : "unknown",
+                    sess ? sess->session.name : "unknown",
+                    sgwc_ue ? sgwc_ue->mme_s11_teid : 0,
+                    sgwc_ue ? sgwc_ue->sgw_s11_teid : 0,
+                    sess ? sess->sgw_s5c_teid : 0,
+                    sess ? sess->pgw_s5c_teid : 0);
+        }
     }
 
     /********************

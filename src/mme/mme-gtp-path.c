@@ -187,6 +187,20 @@ static void timeout(ogs_gtp_xact_t *xact, void *data)
         } else {
             ogs_warn("No S1 Context");
         }
+
+        /* Layer A (IMS PDN wedge fix / A5.1): the Delete Session Request got
+         * no response (SGW gave up after N3 retries). If this timeout owns a
+         * deletion_in_progress session, remove it locally so it cannot wedge
+         * the IMS PDN forever (guard D would otherwise drop the UE's PDN
+         * re-request indefinitely). Gated on ownership so we never touch a
+         * detach/Path-Switch delete or another UE's reused session. */
+        if (sess && sess->deletion_in_progress &&
+                sess->delete_xact_id == xact->id) {
+            ogs_warn("[%s] Delete Session no response; removing orphaned "
+                    "deletion_in_progress session locally",
+                    mme_ue->imsi_bcd);
+            mme_sess_remove(sess);
+        }
         break;
     case OGS_GTP2_BEARER_RESOURCE_COMMAND_TYPE:
         /* Nothing to do */
@@ -398,6 +412,19 @@ int mme_gtp_send_delete_session_request(
     rv = ogs_gtp_xact_commit(xact);
     ogs_expect(rv == OGS_OK);
 
+    /* Layer A (IMS PDN wedge fix): record the delete transaction on the
+     * session, but ONLY after a successful commit (the DSReq was actually
+     * sent and the xact is now alive waiting for the response). On xact
+     * create failure (early return above) or commit failure, delete_xact_id
+     * stays 0 (OGS_INVALID_POOL_ID), so a caller that also set
+     * deletion_in_progress leaves the session as "orphaned" and it is
+     * recovered on the UE's next PDN connectivity request. Setting the flag
+     * itself remains the caller's decision. */
+    if (rv == OGS_OK) {
+        sess->delete_xact_id = xact->id;
+        sess->delete_started_at = ogs_time_now();
+    }
+
     return rv;
 }
 
@@ -439,8 +466,30 @@ int mme_gtp_send_create_bearer_response(
     ogs_pkbuf_t *pkbuf = NULL;
 
     ogs_assert(bearer);
-    ogs_assert(bearer->create.xact_id >= OGS_MIN_POOL_ID &&
-            bearer->create.xact_id <= OGS_MAX_POOL_ID);
+    /* Phase 4 PR6-B follow-up: tolerate stale bearer contexts whose
+     * create.xact_id was never set (default bearer) or has already been
+     * torn down (e.g. PR6-B rescue marked the owning sess for deletion
+     * and the SGW xact was committed). Without this guard the assert
+     * below would crash the entire MME when the eNB rejects a new
+     * E-RAB Setup with cause "multiple-E-RAB-ID-instances" and our
+     * Phase 4 Step 4-5 negative CBResp logic looks up the failed
+     * bearer by EBI (mme_bearer_find_by_ue_ebi() may hit an old sess
+     * whose deletion is in progress).
+     *
+     * Returns OGS_OK: this is the same condition as the "transaction has
+     * already been removed" branch just below, which has always returned
+     * OGS_OK - there is nothing to answer, which is not the same as failing
+     * to answer. It used to return OGS_ERROR, and a caller wrapping this in
+     * ogs_assert(OGS_OK == ...) turned the guard straight back into the abort
+     * it was added to prevent. mme_gtp_send_delete_bearer_response() already
+     * documents that reasoning for its own guard; the two now agree. */
+    if (bearer->create.xact_id < OGS_MIN_POOL_ID ||
+            bearer->create.xact_id > OGS_MAX_POOL_ID) {
+        ogs_warn("Skip CBResp: bearer EBI[%d] has no valid CREATE xact_id "
+                "[%d] (stale rescue bearer?)",
+                bearer->ebi, bearer->create.xact_id);
+        return OGS_OK;
+    }
     xact = ogs_gtp_xact_find_by_id(bearer->create.xact_id);
     if (!xact) {
         ogs_error("GTP transaction(CREATE) has already been removed");
@@ -470,6 +519,17 @@ int mme_gtp_send_create_bearer_response(
 
     rv = ogs_gtp_xact_commit(xact);
     ogs_expect(rv == OGS_OK);
+    if (rv != OGS_OK)
+        return rv;
+
+    /*
+     * Answered. Drop the reference so a second call becomes the no-op above
+     * instead of handing an already-committed transaction to
+     * ogs_gtp_xact_update_tx(), which requires step == 1 for a remote
+     * originator and fails otherwise. The transaction itself is left alone -
+     * it keeps the response and replays it if the peer retransmits.
+     */
+    bearer->create.xact_id = OGS_INVALID_POOL_ID;
 
     return rv;
 }
@@ -506,23 +566,22 @@ int mme_gtp_send_update_bearer_response(
      *
      * After sending the Update Bearer Response, remove the corresponding
      * Transaction Node from the list managed by the Bearer Context.
+     *
+     * Pick the node here but do NOT unlink it yet, and leave the peer timer
+     * running. Both used to happen before the response was built, so any
+     * failure below - build, update_tx, commit - lost the node AND the timer
+     * that would otherwise have expired and cleaned up
+     * (mme_s11_handle_update_bearer_request()'s peer-timeout path). The
+     * response then never went out and nothing was left to notice.
      */
     ogs_list_for_each_entry_safe(
             &bearer->update.xact_list, next_xact, xact, to_update_node) {
-        ogs_list_remove(&bearer->update.xact_list, &xact->to_update_node);
         break;
     }
     if (!xact) {
         ogs_warn("GTP transaction(UPDATE) has already been removed");
         return OGS_OK;
     }
-
-    /*
-     * eNB sends Modify EPS Bearer Accept to the MME
-     * MME can send Update Bearer Response to the SGW-C,
-     * so stop the peer waiting timer
-     */
-    ogs_timer_stop(xact->tm_peer);
 
     memset(&h, 0, sizeof(ogs_gtp2_header_t));
     h.type = OGS_GTP2_UPDATE_BEARER_RESPONSE_TYPE;
@@ -542,6 +601,17 @@ int mme_gtp_send_update_bearer_response(
 
     rv = ogs_gtp_xact_commit(xact);
     ogs_expect(rv == OGS_OK);
+    if (rv != OGS_OK)
+        return rv;
+
+    /*
+     * The response is out. Only now give up the node and the peer timer:
+     * eNB sent Modify EPS Bearer Accept, the MME has answered the SGW-C, so
+     * nothing is waiting on this transaction any more. On any failure above
+     * both are left in place, so the peer timeout still fires and cleans up.
+     */
+    ogs_list_remove(&bearer->update.xact_list, &xact->to_update_node);
+    ogs_timer_stop(xact->tm_peer);
 
     return rv;
 }
@@ -559,8 +629,23 @@ int mme_gtp_send_delete_bearer_response(
     ogs_pkbuf_t *pkbuf = NULL;
 
     ogs_assert(bearer);
-    ogs_assert(bearer->delete.xact_id >= OGS_MIN_POOL_ID &&
-            bearer->delete.xact_id <= OGS_MAX_POOL_ID);
+    /* Phase 4 PR6-B follow-up: tolerate UE-driven Deactivate accepts
+     * for bearers that were torn down via paths that never registered
+     * a SGW Delete Bearer xact (e.g., PR6-B HO rescue routing the
+     * teardown through OGS_GTP_DELETE_SEND_DEACTIVATE_BEARER_CONTEXT_
+     * REQUEST). In those flows the SGW DSResp has already arrived and
+     * the SMF session is gone, so there is no S11 transaction to
+     * reply to. Returning OGS_OK lets esm-sm.c:367 (which wraps the
+     * call in ogs_assert(OGS_OK == ...)) continue the FSM transition
+     * to esm_state_bearer_deactivated without aborting the MME. */
+    if (bearer->delete.xact_id < OGS_MIN_POOL_ID ||
+            bearer->delete.xact_id > OGS_MAX_POOL_ID) {
+        ogs_warn("Skip DBResp: bearer EBI[%d] has no valid DELETE "
+                "xact_id [%d] (UE accept for locally-torn-down "
+                "bearer; PR6-B rescue or similar)",
+                bearer->ebi, bearer->delete.xact_id);
+        return OGS_OK;
+    }
     xact = ogs_gtp_xact_find_by_id(bearer->delete.xact_id);
     if (!xact) {
         ogs_error("GTP transaction(DELETE) has already been removed");
@@ -590,6 +675,17 @@ int mme_gtp_send_delete_bearer_response(
 
     rv = ogs_gtp_xact_commit(xact);
     ogs_expect(rv == OGS_OK);
+    if (rv != OGS_OK)
+        return rv;
+
+    /*
+     * Answered. Drop the reference so a second call becomes the no-op above
+     * instead of handing an already-committed transaction to
+     * ogs_gtp_xact_update_tx(), which requires step == 1 for a remote
+     * originator and fails otherwise. The transaction itself is left alone -
+     * it keeps the response and replays it if the peer retransmits.
+     */
+    bearer->delete.xact_id = OGS_INVALID_POOL_ID;
 
     return rv;
 }
@@ -699,8 +795,19 @@ int mme_gtp_send_downlink_data_notification_ack(
     ogs_pkbuf_t *s11buf = NULL;
 
     ogs_assert(bearer);
-    ogs_assert(bearer->notify.xact_id >= OGS_MIN_POOL_ID &&
-            bearer->notify.xact_id <= OGS_MAX_POOL_ID);
+    /*
+     * Cleared once the Ack has been committed (below), so an invalid id means
+     * this notification has already been answered - or never carried one.
+     * Nothing to answer is not a failure; asserting here would abort the MME
+     * for a duplicate call.
+     */
+    if (bearer->notify.xact_id < OGS_MIN_POOL_ID ||
+            bearer->notify.xact_id > OGS_MAX_POOL_ID) {
+        ogs_warn("Skip DDN Ack: bearer EBI[%d] has no valid NOTIFY xact_id "
+                "[%d] (already acknowledged?)",
+                bearer->ebi, bearer->notify.xact_id);
+        return OGS_OK;
+    }
     xact = ogs_gtp_xact_find_by_id(bearer->notify.xact_id);
     if (!xact) {
         ogs_error("GTP transaction(NOTIFY) has already been removed");
@@ -731,6 +838,17 @@ int mme_gtp_send_downlink_data_notification_ack(
 
     rv = ogs_gtp_xact_commit(xact);
     ogs_expect(rv == OGS_OK);
+    if (rv != OGS_OK)
+        return rv;
+
+    /*
+     * Answered. Drop the reference so a second call becomes the no-op above
+     * instead of handing an already-committed transaction to
+     * ogs_gtp_xact_update_tx(), which requires step == 1 for a remote
+     * originator and fails otherwise. The transaction itself is left alone -
+     * it keeps the response and replays it if the peer retransmits.
+     */
+    bearer->notify.xact_id = OGS_INVALID_POOL_ID;
 
     return rv;
 }

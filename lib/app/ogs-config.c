@@ -391,6 +391,23 @@ static void regenerate_all_timer_duration(void)
             local_conf.time.message.sbi.client_wait_duration +
             ogs_time_from_sec(1));
 
+    /*
+     * Diameter answer timeout. Leave an explicit configuration value alone -
+     * this runs again whenever message.duration is parsed, and the two keys
+     * may appear in either order.
+     *
+     * The default sits two seconds under message.duration, which is where the
+     * GTP-C peer gives up (t3_response_duration * (n3_response_rcount + 1)).
+     * Those two seconds are the budget for converging the state machine and
+     * getting a Create/Delete Session Response out while the peer is still
+     * waiting for one. The floor keeps it positive for very small
+     * message.duration values.
+     */
+    if (local_conf.time.message.diameter.timeout_duration_set == false)
+        local_conf.time.message.diameter.timeout_duration =
+            ogs_max(ogs_time_from_sec(3),
+                local_conf.time.message.duration - ogs_time_from_sec(2));
+
 #define GTP_N3_RESPONSE_RETRY_COUNT  3
     local_conf.time.message.gtp.n3_response_rcount =
         GTP_N3_RESPONSE_RETRY_COUNT;
@@ -614,6 +631,36 @@ int ogs_app_parse_local_conf(const char *local)
                                             ogs_time_from_msec(atoll(v));
                                         regenerate_all_timer_duration();
                                     }
+                                } else if (!strcmp(msg_key, "diameter")) {
+                                    ogs_yaml_iter_t diam_iter;
+                                    ogs_yaml_iter_recurse(
+                                            &msg_iter, &diam_iter);
+
+                                    while (ogs_yaml_iter_next(&diam_iter)) {
+                                        const char *diam_key =
+                                            ogs_yaml_iter_key(&diam_iter);
+                                        ogs_assert(diam_key);
+
+                                        if (!strcmp(diam_key,
+                                                    "timeout_duration")) {
+                                            const char *v =
+                                                ogs_yaml_iter_value(
+                                                    &diam_iter);
+                                            if (v) {
+                                                local_conf.time.message.
+                                                    diameter.
+                                                    timeout_duration =
+                                                    ogs_time_from_msec(
+                                                        atoll(v));
+                                                local_conf.time.message.
+                                                    diameter.
+                                                    timeout_duration_set =
+                                                    true;
+                                            }
+                                        } else
+                                            ogs_warn("unknown key `%s`",
+                                                    diam_key);
+                                    }
                                 } else
                                     ogs_warn("unknown key `%s`", msg_key);
                             }
@@ -645,6 +692,8 @@ int ogs_app_parse_local_conf(const char *local)
                         } else if (!strcmp(time_key, "t3412")) {
                             /* handle config in mme */
                         } else if (!strcmp(time_key, "t3423")) {
+                            /* handle config in mme */
+                        } else if (!strcmp(time_key, "t3413")) {
                             /* handle config in mme */
                         } else
                             ogs_warn("unknown key `%s`", time_key);

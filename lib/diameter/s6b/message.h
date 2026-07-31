@@ -34,11 +34,34 @@ extern struct dict_object *ogs_diam_s6b_application;
 
 extern struct dict_object *ogs_diam_s6b_mip6_feature_vector;
 
+/* TS 29.273 §9.1.2.1.4 / TS 29.272 §7.4.3 Experimental-Result-Code
+ * values used in AAA responses on S6b. Phase 4 PR8 (Step 4-7) maps
+ * these to GTP-C v2 Causes so that the failure semantics survive
+ * the S6b→ePDG→UE hop instead of being collapsed onto a single
+ * generic Cause. */
+#define OGS_DIAM_S6B_ERROR_USER_UNKNOWN                     5001
+#define OGS_DIAM_S6B_ERROR_USER_NO_APN_SUBSCRIPTION         5450
+#define OGS_DIAM_S6B_ERROR_RAT_TYPE_NOT_ALLOWED             5451
+
 typedef struct ogs_diam_s6b_message_s {
 #define OGS_DIAM_S6B_CMD_AUTHENTICATION_AUTHORIZATION               1
 #define OGS_DIAM_S6B_CMD_SESSION_TERMINATION                        2
     uint16_t            cmd_code;
-    uint32_t            result_code;
+
+    /* Raw values from the AAA/STA response. Either may be 0 if the
+     * corresponding AVP was absent in the message. Phase 4 PR8 keeps
+     * the IETF Result-Code and 3GPP Experimental-Result-Code in
+     * separate fields (per RFC 6733 §7.1.3 / TS 29.230) so that the
+     * value 5001 — IETF AVP_UNSUPPORTED vs 3GPP USER_UNKNOWN — can be
+     * disambiguated by the GTP-C v2 Cause mapper in src/smf/gsm-sm.c.
+     */
+    uint32_t            result_code;             /* IETF Result-Code (268) */
+    uint32_t            experimental_result_code;/* 3GPP Experimental-Result-Code */
+    uint32_t            experimental_vendor_id;  /* Vendor-Id (10415 for 3GPP) */
+
+    /* Legacy "which AVP carried the result" markers used by the STA
+     * callback. New code should consult result_code /
+     * experimental_result_code directly. */
     uint32_t            *err;
     uint32_t            *exp_err;
 } ogs_diam_s6b_message_t;

@@ -246,6 +246,24 @@ typedef struct ogs_pfcp_far_s {
     uint32_t                num_of_buffered_packet;
     ogs_pkbuf_t             *buffered_packet[OGS_MAX_NUM_OF_PACKET_BUFFER];
 
+    /*
+     * Downlink Data Report suppression, tracked independently of how many
+     * packets are currently buffered.
+     *
+     * Gating the report on "num_of_buffered_packet == 0" wedges permanently:
+     * the counter is only cleared by ogs_pfcp_send_buffered_packet(), which
+     * needs the FAR back in FORW - i.e. the UE has to become CONNECTED - but
+     * the UE can only become CONNECTED if a report was raised in the first
+     * place. One packet stranded in the buffer (e.g. a DDN answered with
+     * "UE already re-attached" during an S1 release) therefore silences the
+     * FAR for good, and no MT call can be delivered again.
+     *
+     * Keeping the suppression in its own flag breaks that loop: it is
+     * re-armed whenever the CP re-requests buffering (Update FAR carrying
+     * BUFF), and a full buffer can still raise a report.
+     */
+    bool                    dl_data_report_sent;
+
     struct {
         bool prepared;
     } handover; /* Saved from N2-Handover Request Acknowledge */

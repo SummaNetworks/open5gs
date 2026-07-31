@@ -106,6 +106,14 @@ typedef struct smf_context_s {
 #define SMF_UE_IS_LAST_SESSION(__sMF) \
      ((__sMF) && (ogs_list_count(&(__sMF)->sess_list)) == 1)
     ogs_list_t      smf_ue_list;
+
+    /* EPC Handover configuration (Feature Flags) */
+    struct {
+        bool enable_ip_preservation;    /* Phase 1: HI=1 IP continuity */
+        bool enable_sgw_cleanup;        /* Phase 2: Hold Timer + DBReq */
+        int hold_duration_sec;          /* Phase 2: Hold Timer value */
+        bool enable_reverse_direction;  /* Phase 3: VoWiFi→VoLTE */
+    } handover_config;
 } smf_context_t;
 
 typedef struct smf_gtp_node_s {
@@ -154,6 +162,29 @@ typedef struct smf_ue_s {
 
 typedef struct smf_bearer_s smf_bearer_t;
 typedef struct smf_sess_s smf_sess_t;
+
+/* Handover state management (③-A) */
+typedef enum {
+    SMF_HO_STATE_NONE = 0,
+    SMF_HO_STATE_SOURCE_HOLD,       /* Old sess: DL DROP, hold_timer running */
+    SMF_HO_STATE_SOURCE_DBREQ_TX,   /* Old sess: DBReq sent, waiting DBResp */
+    SMF_HO_STATE_TARGET_ACTIVE,     /* New sess: established, peer has timer */
+} smf_ho_state_e;
+
+/*
+ * Phase 4 (case A): true while the session is being released as the
+ * source-access side of a VoLTE↔VoWiFi handover. In both
+ * SOURCE_HOLD (UE-initiated PDN Disconnect path) and
+ * SOURCE_DBREQ_TX (SMF-initiated PR3b active cleanup) the Gx session
+ * has already been transferred to the new (target) access, so the
+ * old-side session removal MUST NOT send Gx/Gy/S6b CCR-T -- it would
+ * either tear down the new side's Rx/IMS via PCRF, or (when gx_sid
+ * has been reset) allocate a brand-new throwaway Gx session and emit
+ * a spurious CCR-T to PCRF.
+ */
+#define SMF_HO_IS_SOURCE_RELEASE_STATE(__sESS) \
+    ((__sESS)->epc_handover.state == SMF_HO_STATE_SOURCE_HOLD || \
+     (__sESS)->epc_handover.state == SMF_HO_STATE_SOURCE_DBREQ_TX)
 
 typedef struct smf_pf_s {
     ogs_lnode_t     lnode;
@@ -243,13 +274,17 @@ typedef struct smf_sess_s {
         bool gy_ccr_init_in_flight; /* Waiting for Gy CCA */
         uint32_t gy_cca_init_err; /* Gy CCA RXed error code */
         bool s6b_aar_in_flight; /* Waiting for S6B AAR */
-        uint32_t s6b_aaa_err; /* S6B AAA RXed error code */
+        uint32_t s6b_aaa_err; /* S6B AAA RXed IETF Result-Code */
+        uint32_t s6b_aaa_exp_err; /* S6B AAA RXed 3GPP Experimental-Result-Code */
+        uint32_t s6b_aaa_exp_vendor_id; /* Phase 4.2b #3: Experimental-Result Vendor-Id (RFC 6733 §7.6) */
         bool gx_ccr_term_in_flight; /* Waiting for Gx CCA */
         uint32_t gx_cca_term_err; /* Gx CCA RXed error code */
         bool gy_ccr_term_in_flight; /* Waiting for Gy CCA */
         uint32_t gy_cca_term_err; /* Gy CCA RXed error code */
         bool s6b_str_in_flight; /* Waiting for S6B CCA */
-        uint32_t s6b_sta_err; /* S6B CCA RXed error code */
+        uint32_t s6b_sta_err; /* S6B STA RXed IETF Result-Code */
+        uint32_t s6b_sta_exp_err; /* S6B STA RXed 3GPP Experimental-Result-Code */
+        uint32_t s6b_sta_exp_vendor_id; /* Phase 4.2b #3: Experimental-Result Vendor-Id (RFC 6733 §7.6) */
     } sm_data;
 
     bool            epc;            /**< EPC or 5GC */
@@ -426,7 +461,6 @@ typedef struct smf_sess_s {
             ogs_gtp1_qos_profile_decoded_t qos_pdec;
             bool peer_supports_apn_ambr;
         } v1;  /* GTPv1C specific fields */
-        ogs_gtp_xact_t *stored_xact; /* Stored GTP transaction for delayed responses */
     } gtp; /* Saved from S5-C/Gn */
 
     struct {
@@ -515,6 +549,35 @@ typedef struct smf_sess_s {
 
     bool n1_released;
     bool n2_released;
+
+    /* EPC Handover state for VoLTE/VoWiFi (③-A) */
+    struct {
+        smf_ho_state_e state;
+        ogs_timer_t *hold_timer;
+        ogs_pool_id_t peer_sess_id;
+        bool deferred_deactivation;
+        /*
+         * Phase 4 PR3a (Step 4-3a):
+         * Generation counter for the source-release hold timer.
+         * Incremented every time the timer is (re)started so that a
+         * stale firing of a previously-cancelled or restarted timer
+         * can be detected and aborted by the callback (race guard #4
+         * in the PR3b design). Also bumped in smf_sess_remove() so
+         * that any callback that races with session removal sees a
+         * stale generation and bails out (race guard #5).
+         */
+        uint32_t hold_generation;
+
+        /* KPI: HO start time (microseconds, monotonic) and direction.
+         * Set when SMF observes a new HO (S2b CSReq with rat=WLAN, or
+         * S5C CSReq with request_type=HANDOVER), consumed by the MBR
+         * success path to compute the HO duration histogram. */
+        ogs_time_t kpi_start_us;
+        /* "volte_to_vowifi" or "vowifi_to_volte" — the direction
+         * recorded at HO start so the success-edge metric stays
+         * consistent across the cascade. */
+        const char *kpi_direction;
+    } epc_handover;
 } smf_sess_t;
 
 void smf_context_init(void);
@@ -555,12 +618,26 @@ smf_sess_t *smf_sess_find_by_teid(uint32_t teid);
 smf_sess_t *smf_sess_find_by_seid(uint64_t seid);
 smf_sess_t *smf_sess_find_by_apn(smf_ue_t *smf_ue, char *apn, uint8_t rat_type);
 smf_sess_t *smf_sess_find_by_psi(smf_ue_t *smf_ue, uint8_t psi);
+smf_sess_t *smf_sess_find_by_gx_sid(const char *gx_sid);
+bool smf_sess_is_ho_source_release(smf_sess_t *sess);
 smf_sess_t *smf_sess_find_by_charging_id(uint32_t charging_id);
 smf_sess_t *smf_sess_find_by_sm_context_ref(char *sm_context_ref);
 smf_sess_t *smf_sess_find_by_ipv4(uint32_t addr);
 smf_sess_t *smf_sess_find_by_ipv6(uint32_t *addr6);
 smf_sess_t *smf_sess_find_by_paging_n1n2message_location(
         char *n1n2message_location);
+
+/*
+ * Phase 4.2a (CR-1 / Case Y): true iff sess_a and sess_b are bound to
+ * the same UE IP. Compares actually-allocated IPs (sess->ipv4/ipv6
+ * addresses) rather than session.ue_ip — the latter holds 0 for
+ * Initial-Attach sessions where PAA was requested as 0.0.0.0 and the
+ * real address is only kept inside sess->ipv4. Returns false if either
+ * side lacks an IP entirely or if the address families don't overlap
+ * (e.g. one side IPv4-only, the other IPv6-only).
+ */
+bool smf_sess_match_ue_ip(
+        const smf_sess_t *sess_a, const smf_sess_t *sess_b);
 
 void smf_sess_create_indirect_data_forwarding(smf_sess_t *sess);
 bool smf_sess_have_indirect_data_forwarding(smf_sess_t *sess);

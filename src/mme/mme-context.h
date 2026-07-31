@@ -543,6 +543,25 @@ struct mme_ue_s {
     ogs_list_t      sess_list;
 
 #define MIN_EPS_BEARER_ID           5
+/*
+ * TS 24.301 allows 5-15, but some eNBs in this network are configured to
+ * accept only 5-12 and cannot be changed, so the MME must never allocate an
+ * EBI above 12.
+ *
+ * This is a global cap on purpose. A UE that took EBI 13-15 while on a
+ * permissive eNB would break the moment it handed over into a restricted one,
+ * so capping per eNB does not work.
+ *
+ * The cap governs what the MME ALLOCATES. Receiving and interpreting EBIs
+ * 13-15 is deliberately left alone - the NAS bearer-status bitfields still
+ * cover them, because a peer may refer to them and we must parse what we are
+ * sent.
+ *
+ * Cost: 8 identities per UE instead of 11, against a theoretical demand of
+ * OGS_MAX_NUM_OF_SESS(4) * OGS_MAX_NUM_OF_BEARER(4) = 16. Exhaustion is
+ * therefore easier to reach than before; it is reported and refused rather
+ * than fatal - see mme_bearer_add().
+ */
 #define MAX_EPS_BEARER_ID           12
 
 #define CLEAR_EPS_BEARER_ID(__mME) \
@@ -747,6 +766,20 @@ struct mme_ue_s {
 
     mme_csmap_t     *csmap;
     mme_hssmap_t    *hssmap;
+
+    /* KPI Tier 1 / Tier 2 (next batch) — per-UE timestamps used by:
+     *   - epc_mme_connected_state_duration_seconds (histogram)
+     *   - epc_mme_paging_response_duration_seconds (histogram)
+     *
+     * connected_us is set when the UE enters CM-CONNECTED (Initial
+     * Context Setup Response) and observed on Context Release. 0 when
+     * the UE is in CM-IDLE.
+     *
+     * paging_sent_us is set when the MME emits a Paging Request and
+     * observed when the UE responds with a Service Request. 0 when no
+     * paging is pending. */
+    ogs_time_t      kpi_connected_us;
+    ogs_time_t      kpi_paging_sent_us;
 };
 
 #define SESSION_CONTEXT_IS_AVAILABLE(__mME) \
@@ -828,6 +861,34 @@ typedef struct mme_sess_s {
 
     /* TAU: PDN deletion in progress flag (DSReq sent, DSResp not yet received) */
     bool deletion_in_progress;
+
+    /* Layer A (IMS PDN wedge fix): id of the S11 Delete Session GTP
+     * transaction that set deletion_in_progress. Recorded (only on a
+     * successful commit) by mme_gtp_send_delete_session_request().
+     * 0 (OGS_INVALID_POOL_ID) = no live delete for this session, so a
+     * lingering deletion_in_progress sess is orphaned and may be recreated.
+     * Used to (a) detect a truly in-flight delete vs a stale/orphaned one
+     * on a UE PDN re-request, and (b) reject a late Delete Session Response
+     * that no longer owns this session. */
+    ogs_pool_id_t   delete_xact_id;
+    ogs_time_t      delete_started_at;
+
+    /* Set true in mme_s11_handle_delete_session_response() (only after the
+     * delete_xact_id ownership guard passes) when the core S11 Delete
+     * Session Response has been received for this session -- accepted or
+     * CONTEXT_NOT_FOUND. Latches "the SGW/SMF-side delete is complete", as
+     * opposed to "the delete xact merely disappeared / timed out". Used as
+     * the proof-of-core-deletion gate for proactively completing a PDN
+     * disconnect that is stuck in esm_state_pdn_will_disconnect (UE never
+     * sent Deactivate Accept, e.g. eNB idled the radio with user-inactivity)
+     * and for the E-RAB Release Response failure cleanup path. */
+    bool            core_delete_done;
+
+    /* KPI: monotonic timestamp (microseconds) of the most recent PDN
+     * Connectivity Request whose request_type == HANDOVER. Set in
+     * esm-handler.c on HO start and consumed by mme-s11-handler.c on
+     * the MBR success edge to observe the HO duration histogram. */
+    ogs_time_t ho_start_us;
 } mme_sess_t;
 
 #define MME_HAVE_ENB_S1U_PATH(__bEARER) \

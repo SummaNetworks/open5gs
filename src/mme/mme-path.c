@@ -234,19 +234,29 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
         }
 
         if (failed == true) {
-            ogs_assert(OGS_OK ==
-                mme_gtp_send_downlink_data_notification_ack(
-                    bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE));
+            r = mme_gtp_send_downlink_data_notification_ack(
+                    bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE);
+            if (r != OGS_OK)
+                ogs_error("Downlink Data Notification Ack not sent "
+                        "[EBI:%d]", bearer->ebi);
 
+            /*
+             * Run the configured policy whether or not the response went out.
+             * Paging failed either way; the response is a courtesy to the SGW,
+             * not a precondition. It used to sit behind an ogs_assert() on the
+             * send, so a failed send skipped it by aborting the process.
+             */
             /* Check paging failure policy */
             if (mme_self()->paging_failure_policy ==
                 MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS) {
                 mme_send_delete_all_sessions_on_paging_failure(mme_ue);
             }
         } else {
-            ogs_assert(OGS_OK ==
-                mme_gtp_send_downlink_data_notification_ack(
-                    bearer, OGS_GTP2_CAUSE_REQUEST_ACCEPTED));
+            r = mme_gtp_send_downlink_data_notification_ack(
+                    bearer, OGS_GTP2_CAUSE_REQUEST_ACCEPTED);
+            if (r != OGS_OK)
+                ogs_error("Downlink Data Notification Ack not sent "
+                        "[EBI:%d]", bearer->ebi);
         }
         break;
     case MME_PAGING_TYPE_CREATE_BEARER:
@@ -258,10 +268,18 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
         }
 
         if (failed == true) {
-            ogs_assert(OGS_OK ==
-                mme_gtp_send_create_bearer_response(
-                    bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE));
+            r = mme_gtp_send_create_bearer_response(
+                    bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE);
+            if (r != OGS_OK)
+                ogs_error("Create Bearer Response not sent [EBI:%d]",
+                        bearer->ebi);
 
+            /*
+             * Run the configured policy whether or not the response went out.
+             * Paging failed either way; the response is a courtesy to the SGW,
+             * not a precondition. It used to sit behind an ogs_assert() on the
+             * send, so a failed send skipped it by aborting the process.
+             */
             /* Check paging failure policy */
             if (mme_self()->paging_failure_policy ==
                 MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS) {
@@ -269,8 +287,9 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
             }
         } else {
             r = nas_eps_send_activate_dedicated_bearer_context_request(bearer);
-            ogs_expect(r == OGS_OK);
-            ogs_assert(r != OGS_ERROR);
+            if (r != OGS_OK)
+                ogs_error("Activate Dedicated Bearer Context Request not sent "
+                        "[EBI:%d]", bearer->ebi);
         }
         break;
     case MME_PAGING_TYPE_UPDATE_BEARER:
@@ -282,10 +301,18 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
         }
 
         if (failed == true) {
-            ogs_assert(OGS_OK ==
-                mme_gtp_send_update_bearer_response(
-                    bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE));
+            r = mme_gtp_send_update_bearer_response(
+                    bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE);
+            if (r != OGS_OK)
+                ogs_error("Update Bearer Response not sent [EBI:%d]",
+                        bearer->ebi);
 
+            /*
+             * Run the configured policy whether or not the response went out.
+             * Paging failed either way; the response is a courtesy to the SGW,
+             * not a precondition. It used to sit behind an ogs_assert() on the
+             * send, so a failed send skipped it by aborting the process.
+             */
             /* Check paging failure policy */
             if (mme_self()->paging_failure_policy ==
                 MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS) {
@@ -317,8 +344,10 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
                         OGS_GTP_MODIFY_QOS_UPDATE) ? 1 : 0,
                     (xact->update_flags &
                         OGS_GTP_MODIFY_TFT_UPDATE) ? 1 : 0);
-            ogs_expect(r == OGS_OK);
-            ogs_assert(r != OGS_ERROR);
+            if (r != OGS_OK)
+                ogs_error("Modify Bearer Context Request not sent [EBI:%d] - "
+                        "the peer timer started above will clean up",
+                        bearer->ebi);
         }
         break;
     case MME_PAGING_TYPE_DELETE_BEARER:
@@ -330,10 +359,18 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
         }
 
         if (failed == true) {
-            ogs_assert(OGS_OK ==
-                mme_gtp_send_delete_bearer_response(
-                    bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE));
+            r = mme_gtp_send_delete_bearer_response(
+                    bearer, OGS_GTP2_CAUSE_UNABLE_TO_PAGE_UE);
+            if (r != OGS_OK)
+                ogs_error("Delete Bearer Response not sent [EBI:%d]",
+                        bearer->ebi);
 
+            /*
+             * Run the configured policy whether or not the response went out.
+             * Paging failed either way; the response is a courtesy to the SGW,
+             * not a precondition. It used to sit behind an ogs_assert() on the
+             * send, so a failed send skipped it by aborting the process.
+             */
             /* Check paging failure policy */
             if (mme_self()->paging_failure_policy ==
                 MME_PAGING_FAILURE_POLICY_DELETE_SESSIONS) {
@@ -341,28 +378,32 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
             }
         } else {
             r = nas_eps_send_deactivate_bearer_context_request(bearer);
-            ogs_expect(r == OGS_OK);
-            ogs_assert(r != OGS_ERROR);
+            if (r != OGS_OK)
+                ogs_error("Deactivate Bearer Context Request not sent "
+                        "[EBI:%d]", bearer->ebi);
         }
         break;
     case MME_PAGING_TYPE_CS_CALL_SERVICE:
         if (failed == true) {
-            ogs_assert(OGS_OK ==
-                sgsap_send_paging_reject(
-                    mme_ue, SGSAP_SGS_CAUSE_UE_UNREACHABLE));
+            if (sgsap_send_paging_reject(
+                    mme_ue, SGSAP_SGS_CAUSE_UE_UNREACHABLE) != OGS_OK)
+                ogs_error("SGsAP Paging Reject not sent [IMSI:%s]",
+                        mme_ue->imsi_bcd);
         } else {
             /* Nothing */
         }
         break;
     case MME_PAGING_TYPE_SMS_SERVICE:
         if (failed == true) {
-            ogs_assert(OGS_OK ==
-                sgsap_send_paging_reject(
-                    mme_ue, SGSAP_SGS_CAUSE_UE_UNREACHABLE));
+            if (sgsap_send_paging_reject(
+                    mme_ue, SGSAP_SGS_CAUSE_UE_UNREACHABLE) != OGS_OK)
+                ogs_error("SGsAP Paging Reject not sent [IMSI:%s]",
+                        mme_ue->imsi_bcd);
         } else {
-            ogs_assert(OGS_OK ==
-                sgsap_send_service_request(
-                    mme_ue, SGSAP_EMM_CONNECTED_MODE));
+            if (sgsap_send_service_request(
+                    mme_ue, SGSAP_EMM_CONNECTED_MODE) != OGS_OK)
+                ogs_error("SGsAP Service Request not sent [IMSI:%s]",
+                        mme_ue->imsi_bcd);
         }
         break;
     case MME_PAGING_TYPE_DETACH_TO_UE:
@@ -371,10 +412,13 @@ void mme_send_after_paging(mme_ue_t *mme_ue, bool failed)
             ogs_warn("MME-initiated Detach cannot be invoked");
         } else {
             r = nas_eps_send_detach_request(mme_ue);
-            ogs_expect(r == OGS_OK);
-            ogs_assert(r != OGS_ERROR);
+            if (r != OGS_OK)
+                ogs_error("Detach Request not sent [IMSI:%s]",
+                        mme_ue->imsi_bcd);
             if (MME_P_TMSI_IS_AVAILABLE(mme_ue)) {
-                ogs_assert(OGS_OK == sgsap_send_detach_indication(mme_ue));
+                if (sgsap_send_detach_indication(mme_ue) != OGS_OK)
+                    ogs_error("SGsAP Detach Indication not sent [IMSI:%s]",
+                            mme_ue->imsi_bcd);
             } else {
                 enb_ue_t *enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
                 if (enb_ue)

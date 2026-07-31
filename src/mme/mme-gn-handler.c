@@ -218,7 +218,11 @@ void mme_gn_handle_sgsn_context_request(
     mme_gtp1_send_sgsn_context_response(mme_ue, OGS_GTP1_CAUSE_REQUEST_ACCEPTED, xact);
 }
 
-static mme_sess_t *mme_ue_session_from_gtp1_pdp_ctx(mme_ue_t *mme_ue, const ogs_gtp1_pdp_context_decoded_t *gtp1_pdp_ctx)
+/*
+ * Returns NULL on failure. *cause is left alone unless a more specific GTPv1
+ * cause than the caller's default applies - resource exhaustion, currently.
+ */
+static mme_sess_t *mme_ue_session_from_gtp1_pdp_ctx(mme_ue_t *mme_ue, const ogs_gtp1_pdp_context_decoded_t *gtp1_pdp_ctx, uint8_t *cause)
 {
     mme_sess_t *sess = NULL;
     mme_bearer_t *bearer = NULL;
@@ -226,14 +230,20 @@ static mme_sess_t *mme_ue_session_from_gtp1_pdp_ctx(mme_ue_t *mme_ue, const ogs_
     uint8_t pti = 1; /* Default PTI : 1 */
     uint8_t qci = 0;
     ogs_session_t *ogs_sess;
-    bool created_sess = false;
+    bool ogs_sess_is_new = false;
 
     ogs_sess = mme_session_find_by_apn(mme_ue, gtp1_pdp_ctx->apn);
     if (!ogs_sess) {
-        ogs_assert(mme_ue->num_of_session < OGS_MAX_NUM_OF_SESS);
+        if (mme_ue->num_of_session >= OGS_MAX_NUM_OF_SESS) {
+            ogs_error("No room for APN[%s] [IMSI:%s]",
+                    gtp1_pdp_ctx->apn, mme_ue->imsi_bcd);
+            *cause = OGS_GTP1_CAUSE_NO_RESOURCES_AVAILABLE;
+            return NULL;
+        }
         ogs_sess = &mme_ue->session[mme_ue->num_of_session];
         mme_ue->num_of_session++;
         ogs_sess->name = ogs_strdup(gtp1_pdp_ctx->apn);
+        ogs_sess_is_new = true;
     }
     ogs_sess->smf_ip = gtp1_pdp_ctx->ggsn_address_c;
     ogs_sess->context_identifier = gtp1_pdp_ctx->pdp_ctx_id;
@@ -255,10 +265,22 @@ static mme_sess_t *mme_ue_session_from_gtp1_pdp_ctx(mme_ue_t *mme_ue, const ogs_
     if (!sess) {
         sess = mme_sess_add(mme_ue, pti);
         if (!sess) {
-            ogs_error("[%s] mme_sess_add() failed", mme_ue->imsi_bcd);
+            /*
+             * Nothing references ogs_sess yet, so give the slot back - the
+             * caller rejects this SGSN Context Response but keeps the UE, and
+             * a leaked slot would eventually fill mme_ue->session[].
+             */
+            ogs_error("mme_sess_add() failed [IMSI:%s]", mme_ue->imsi_bcd);
+            *cause = OGS_GTP1_CAUSE_NO_RESOURCES_AVAILABLE;
+            if (ogs_sess_is_new) {
+                mme_ue->num_of_session--;
+                if (ogs_sess->name) {
+                    ogs_free(ogs_sess->name);
+                    ogs_sess->name = NULL;
+                }
+            }
             return NULL;
         }
-        created_sess = true;
     }
 
     sess->session = ogs_sess;
@@ -285,9 +307,15 @@ static mme_sess_t *mme_ue_session_from_gtp1_pdp_ctx(mme_ue_t *mme_ue, const ogs_
         if (!bearer) {
             bearer = mme_bearer_add(sess);
             if (!bearer) {
-                ogs_error("[%s] mme_bearer_add() failed", mme_ue->imsi_bcd);
-                if (created_sess)
-                    mme_sess_remove(sess);
+                /*
+                 * sess->session already points at ogs_sess and sess is on
+                 * mme_ue->sess_list, so the APN slot is legitimately owned
+                 * now - do NOT reclaim it here, or a later APN would take
+                 * the slot and silently alias sess->session.
+                 */
+                ogs_error("mme_bearer_add() failed [IMSI:%s NSAPI:%d]",
+                        mme_ue->imsi_bcd, gtp1_pdp_ctx->nsapi);
+                *cause = OGS_GTP1_CAUSE_NO_RESOURCES_AVAILABLE;
                 return NULL;
             }
         }
@@ -319,6 +347,7 @@ int mme_gn_handle_sgsn_context_response(
     enb_ue_t *enb_ue = NULL;
     mme_sess_t *sess = NULL;
     uint8_t ret_cause = OGS_GTP1_CAUSE_REQUEST_ACCEPTED;
+    uint8_t sess_cause;
 
     ogs_debug("[Gn] Rx SGSN Context Response");
 
@@ -434,9 +463,10 @@ int mme_gn_handle_sgsn_context_response(
         memcpy(mme_ue->autn, gtp1_mm_ctx.auth_quintuplets[0].autn, OGS_AUTN_LEN);
     }
 
-    sess = mme_ue_session_from_gtp1_pdp_ctx(mme_ue, &gtp1_pdp_ctx);
+    sess_cause = OGS_GTP1_CAUSE_SYSTEM_FAILURE;
+    sess = mme_ue_session_from_gtp1_pdp_ctx(mme_ue, &gtp1_pdp_ctx, &sess_cause);
     if (!sess) {
-        gtp1_cause = OGS_GTP1_CAUSE_SYSTEM_FAILURE;
+        gtp1_cause = sess_cause;
         goto nack_and_reject;
     }
     /* Store sess id to be able to retrieve it later on from xact: */

@@ -28,6 +28,13 @@ extern "C" {
 
 ogs_pkbuf_t *smf_s5c_build_create_session_response(
         uint8_t type, smf_sess_t *sess);
+/* Phase 4 PR8 (Step 4-7): Build a Create Session Response carrying a
+ * non-success Cause (e.g., S6b AAA rejection). The body is intentionally
+ * minimal (Cause IE only) per TS 29.274 §11.1.1 application reject
+ * handling; the local SMF session is left intact so the source EUTRAN
+ * path can still serve as fallback during VoLTE↔VoWiFi HO failures. */
+ogs_pkbuf_t *smf_s5c_build_create_session_response_with_cause(
+        uint8_t type, smf_sess_t *sess, uint8_t cause_value);
 ogs_pkbuf_t *smf_s5c_build_delete_session_response(
         uint8_t type, smf_sess_t *sess);
 

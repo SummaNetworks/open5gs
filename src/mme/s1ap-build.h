@@ -52,6 +52,25 @@ ogs_pkbuf_t *s1ap_build_e_rab_modify_request(
 ogs_pkbuf_t *s1ap_build_e_rab_release_command(
     mme_bearer_t *bearer, ogs_pkbuf_t *esmbuf, S1AP_Cause_PR group, long cause);
 
+/*
+ * Phase 4 Step 4-8: E-RAB Release Command with multiple E-RABs.
+ *
+ * Builds an E-RAB Release Command that lists ALL active bearers in the
+ * given session's PDN connection. The NAS PDU (Deactivate Bearer Context
+ * Request for default bearer) is attached as in the single-bearer variant.
+ *
+ * This works around eNB implementations that fail to cascade the implicit
+ * release of dedicated bearers when only the default bearer is released
+ * (TS 24.301 6.4.4.3 expects UE-side implicit release, but some eNB do not
+ * update internal state, leading to zombie E-RABs on repeated HOs).
+ *
+ * Standards reference:
+ * - TS 36.413 8.2.3.2.1: E-RAB Release Command may carry multiple E-RABs.
+ */
+ogs_pkbuf_t *s1ap_build_e_rab_release_command_with_dedicated(
+    mme_bearer_t *default_bearer, ogs_pkbuf_t *esmbuf,
+    S1AP_Cause_PR group, long cause);
+
 ogs_pkbuf_t *s1ap_build_e_rab_modification_confirm(mme_ue_t *mme_ue);
 
 ogs_pkbuf_t *s1ap_build_paging(

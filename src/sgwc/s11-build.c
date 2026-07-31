@@ -178,3 +178,43 @@ ogs_pkbuf_t *sgwc_s11_build_downlink_data_notification(
     message.h.type = OGS_GTP2_DOWNLINK_DATA_NOTIFICATION_TYPE;
     return ogs_gtp2_build_msg(&message);
 }
+
+ogs_pkbuf_t *sgwc_s11_build_create_bearer_response_failure(
+        uint8_t type, uint8_t cause_value,
+        uint8_t ebi, uint8_t bearer_cause_value)
+{
+    ogs_gtp2_message_t gtp_message;
+    ogs_gtp2_create_bearer_response_t *rsp = NULL;
+    ogs_gtp2_cause_t cause;
+    ogs_gtp2_cause_t bearer_cause;
+
+    ogs_debug("[SGWC] Build Create Bearer Response (failure)");
+
+    memset(&gtp_message, 0, sizeof(ogs_gtp2_message_t));
+    rsp = &gtp_message.create_bearer_response;
+
+    /* Top-level Cause */
+    memset(&cause, 0, sizeof(cause));
+    cause.value = cause_value;
+    rsp->cause.presence = 1;
+    rsp->cause.len = sizeof(cause);
+    rsp->cause.data = &cause;
+
+    /* Bearer Context (Mandatory per TS 29.274 7.2.4) */
+    rsp->bearer_contexts.presence = 1;
+    rsp->bearer_contexts.eps_bearer_id.presence = 1;
+    rsp->bearer_contexts.eps_bearer_id.u8 = ebi;
+
+    /* Bearer-level Cause */
+    memset(&bearer_cause, 0, sizeof(bearer_cause));
+    bearer_cause.value = bearer_cause_value;
+    rsp->bearer_contexts.cause.presence = 1;
+    rsp->bearer_contexts.cause.len = sizeof(bearer_cause);
+    rsp->bearer_contexts.cause.data = &bearer_cause;
+
+    /* Note: F-TEIDs in Bearer Context are Conditional and not present
+     * on failure (TS 29.274 7.2.4). */
+
+    gtp_message.h.type = type;
+    return ogs_gtp2_build_msg(&gtp_message);
+}

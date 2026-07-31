@@ -230,12 +230,25 @@ int upf_sess_remove(upf_sess_t *sess)
             sizeof(sess->smf_n4_f_seid), NULL);
 
     if (sess->ipv4) {
-        ogs_hash_set(self.ipv4_hash, sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+        /* Only clear hash if this session owns the entry.
+         * During HO, two sessions share the same UE IP.
+         * Without this check, removing the old session would
+         * delete the new session's hash entry, breaking DL routing. */
+        if (ogs_hash_get(self.ipv4_hash,
+                    sess->ipv4->addr, OGS_IPV4_LEN) == sess) {
+            ogs_hash_set(self.ipv4_hash,
+                    sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+        }
         ogs_pfcp_ue_ip_free(sess->ipv4);
     }
     if (sess->ipv6) {
-        ogs_hash_set(self.ipv6_hash,
-                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        if (ogs_hash_get(self.ipv6_hash,
+                    sess->ipv6->addr,
+                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3) == sess) {
+            ogs_hash_set(self.ipv6_hash,
+                    sess->ipv6->addr,
+                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        }
         ogs_pfcp_ue_ip_free(sess->ipv6);
     }
 

@@ -40,6 +40,14 @@ int smf_gtp1_send_update_pdp_context_response(
 
 int smf_gtp2_send_create_session_response(
         smf_sess_t *sess, ogs_gtp_xact_t *xact);
+/* Phase 4 PR8 (Step 4-7): Send Create Session Response with a
+ * non-success Cause. Used by the S6b AAA failure path so that the
+ * specific failure reason (USER_AUTHENTICATION_FAILED / APN_ACCESS_
+ * DENIED_NO_SUBSCRIPTION / REMOTE_PEER_NOT_RESPONDING / ...) is
+ * preserved to the ePDG instead of being collapsed onto
+ * UE_NOT_AUTHORISED_BY_OCS (125). */
+int smf_gtp2_send_create_session_response_with_cause(
+        smf_sess_t *sess, ogs_gtp_xact_t *xact, uint8_t cause_value);
 int smf_gtp2_send_modify_bearer_response(
         smf_sess_t *sess, ogs_gtp_xact_t *xact,
         ogs_gtp2_modify_bearer_request_t *req, bool sgw_relocation);

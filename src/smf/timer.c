@@ -18,6 +18,8 @@
  */
 
 #include "context.h"
+#include "gtp-path.h"
+#include "metrics.h"
 
 const char *smf_timer_get_name(int timer_id)
 {
@@ -46,7 +48,9 @@ const char *smf_timer_get_name(int timer_id)
         return "SMF_TIMER_PFCP_NO_DELETION_RESPONSE";
     case SMF_TIMER_GTP_NODE_CLEANUP:
         return "SMF_TIMER_GTP_NODE_CLEANUP";
-    default: 
+    case SMF_TIMER_HANDOVER_HOLD:
+        return "SMF_TIMER_HANDOVER_HOLD";
+    default:
        break;
     }
 
@@ -165,4 +169,134 @@ void smf_timer_gtp_node_cleanup(void *data)
     
     /* Restart the timer for next cleanup cycle (reduced from 60s to 30s) */
     ogs_timer_start(smf_self()->t_gtp_node_cleanup, ogs_time_from_sec(30));
+}
+
+void smf_timer_handover_hold(void *data)
+{
+    ogs_pool_id_t sess_id = (ogs_pool_id_t)(uintptr_t)data;
+    smf_sess_t *sess = NULL;
+    smf_sess_t *peer = NULL;
+    smf_bearer_t *bearer = NULL;
+
+    /*
+     * Phase 4 PR3b (Step 4-3b): hold timer fired on a SOURCE_HOLD
+     * (old-access, EUTRAN) session that the SMF was holding open
+     * while waiting for a UE-initiated PDN Disconnect after a
+     * VoLTE→VoWiFi handover. If we get here the UE has not torn the
+     * old session down within `hold_duration_sec`, so the SMF
+     * proactively releases the old access by sending a Delete Bearer
+     * Request to the old SGW (TS 23.402 8.6.1.1, TS 29.274 7.2.9.2).
+     *
+     * Race guards (kept narrow on purpose - open5gs is single
+     * threaded so the heavy lifting is done in smf_sess_remove() via
+     * the cleanup order in context.c and the generation bump):
+     *
+     *   #5  re-fetch sess by pool id; if it has been freed since the
+     *       timer was queued, bail out (dangling-pointer guard).
+     *   #1  sess must still be in SOURCE_HOLD.
+     *   #2  peer link must still point at us; if a fresh HI=1 came
+     *       in and swapped the peer pointer to a different new
+     *       session we abort to avoid stomping on it.
+     *
+     * Race guard #4 (per-arming generation snapshot) is intentionally
+     * deferred; with the single-threaded event loop a stale firing
+     * after ogs_timer_stop() would only happen if expire() and stop()
+     * land in the same tick, in which case guards #1-#2 already
+     * cover us.
+     *
+     * A former guard #3 (dbreq_xact_id != OGS_INVALID_POOL_ID) was
+     * removed: the xact id was never assigned, so the guard was
+     * structurally dead code. GTP-C retransmit semantics plus Phase 4
+     * PR2 (CBResp failure handling) already cover the recovery path.
+     */
+    sess = smf_sess_find_by_id(sess_id);
+    if (!sess) {
+        ogs_warn("HO: hold timer expired but session id[%d] gone - "
+                "abort (race guard #5)", sess_id);
+        smf_metrics_inst_by_outcome_inc("no_op",
+                SMF_METR_BY_OUTCOME_CTR_HOLD_TIMER);
+        return;
+    }
+
+    if (sess->epc_handover.state != SMF_HO_STATE_SOURCE_HOLD) {
+        ogs_info("HO: hold timer fired on sess[0x%x] but state=%d "
+                "(not SOURCE_HOLD) - abort (race guard #1)",
+                (int)sess->smf_n4_teid, sess->epc_handover.state);
+        smf_metrics_inst_by_outcome_inc("no_op",
+                SMF_METR_BY_OUTCOME_CTR_HOLD_TIMER);
+        return;
+    }
+
+    if (sess->epc_handover.peer_sess_id == OGS_INVALID_POOL_ID) {
+        ogs_info("HO: hold timer fired on sess[0x%x] but peer link "
+                "cleared - abort (race guard #2)",
+                (int)sess->smf_n4_teid);
+        smf_metrics_inst_by_outcome_inc("no_op",
+                SMF_METR_BY_OUTCOME_CTR_HOLD_TIMER);
+        return;
+    }
+    peer = smf_sess_find_by_id(sess->epc_handover.peer_sess_id);
+    if (!peer) {
+        ogs_info("HO: hold timer fired on sess[0x%x] but peer "
+                "session gone - abort (race guard #2)",
+                (int)sess->smf_n4_teid);
+        smf_metrics_inst_by_outcome_inc("no_op",
+                SMF_METR_BY_OUTCOME_CTR_HOLD_TIMER);
+        return;
+    }
+    if (peer->epc_handover.peer_sess_id != sess->id) {
+        ogs_info("HO: hold timer fired on sess[0x%x] but peer's "
+                "peer_sess_id no longer points back at us "
+                "(new HI=1 in flight?) - abort (race guard #2)",
+                (int)sess->smf_n4_teid);
+        smf_metrics_inst_by_outcome_inc("no_op",
+                SMF_METR_BY_OUTCOME_CTR_HOLD_TIMER);
+        return;
+    }
+
+    /*
+     * Feature flag: keep PR3b dormant in production until the
+     * operator explicitly opts in. With the flag OFF we still want
+     * the guards above to run so the no-op path is exercised in
+     * regression tests (= a sanity check that Phase 1-3 are not
+     * regressing).
+     */
+    if (!smf_self()->handover_config.enable_sgw_cleanup) {
+        ogs_info("HO: hold timer expired (sess[0x%x], gen=%u) - "
+                "active cleanup disabled by feature flag, no-op",
+                (int)sess->smf_n4_teid,
+                sess->epc_handover.hold_generation);
+        smf_metrics_inst_by_outcome_inc("no_op",
+                SMF_METR_BY_OUTCOME_CTR_HOLD_TIMER);
+        return;
+    }
+
+    bearer = smf_default_bearer_in_sess(sess);
+    if (!bearer) {
+        ogs_error("HO: hold timer fired on sess[0x%x] but no default "
+                "bearer - abort", (int)sess->smf_n4_teid);
+        return;
+    }
+
+    /*
+     * State transition: SOURCE_HOLD -> SOURCE_DBREQ_TX so that any
+     * UE-initiated Delete Session arriving after we send DBReq is
+     * handled as a duplicate by the existing idempotent path in
+     * s5c-handler.c (returns OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND once
+     * the bearer has been removed).
+     */
+    sess->epc_handover.state = SMF_HO_STATE_SOURCE_DBREQ_TX;
+
+    ogs_warn("HO: hold timer fired - SMF-initiated cleanup of old "
+            "LTE session [sess:0x%x, EBI:%d, gen:%u] via Delete "
+            "Bearer Request to SGW",
+            (int)sess->smf_n4_teid, bearer->ebi,
+            sess->epc_handover.hold_generation);
+    smf_metrics_inst_by_outcome_inc("expired",
+            SMF_METR_BY_OUTCOME_CTR_HOLD_TIMER);
+
+    smf_gtp2_send_delete_bearer_request(
+            bearer,
+            OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
+            OGS_GTP2_CAUSE_ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP);
 }

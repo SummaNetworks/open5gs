@@ -22,6 +22,47 @@
 
 #include "ipfw/ipfw2.h"
 
+/* Phase 4 PR8 (Step 4-7): minimal failure-response builder.
+ *
+ * TS 29.274 §11.1.1 allows a Create Session Response with a non-success
+ * Cause to omit all conditional IEs (F-TEID, PAA, AMBR, Bearer Context,
+ * etc.) and carry only the Cause IE. The companion sender
+ * smf_gtp2_send_create_session_response_with_cause() in gtp-path.c is
+ * the only caller; it is used by the S6b AAA failure path in
+ * src/smf/gsm-sm.c so the ePDG receives the actual failure reason
+ * (USER_AUTHENTICATION_FAILED / APN_ACCESS_DENIED_NO_SUBSCRIPTION /
+ * REMOTE_PEER_NOT_RESPONDING / ...) instead of the legacy generic
+ * UE_NOT_AUTHORISED_BY_OCS.
+ *
+ * The local SMF session is NOT freed here — the source EUTRAN session
+ * (if any) is needed as a fallback path during VoLTE↔VoWiFi HO failures.
+ */
+ogs_pkbuf_t *smf_s5c_build_create_session_response_with_cause(
+        uint8_t type, smf_sess_t *sess, uint8_t cause_value)
+{
+    ogs_pkbuf_t *pkbuf = NULL;
+    ogs_gtp2_message_t gtp_message;
+    ogs_gtp2_create_session_response_t *rsp = NULL;
+    ogs_gtp2_cause_t cause;
+
+    ogs_assert(sess);
+
+    rsp = &gtp_message.create_session_response;
+    memset(&gtp_message, 0, sizeof(ogs_gtp2_message_t));
+
+    memset(&cause, 0, sizeof(cause));
+    cause.value = cause_value;
+    rsp->cause.presence = 1;
+    rsp->cause.len = sizeof(cause);
+    rsp->cause.data = &cause;
+
+    gtp_message.h.type = type;
+    pkbuf = ogs_gtp2_build_msg(&gtp_message);
+    ogs_expect(pkbuf);
+
+    return pkbuf;
+}
+
 ogs_pkbuf_t *smf_s5c_build_create_session_response(
         uint8_t type, smf_sess_t *sess)
 {

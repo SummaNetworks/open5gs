@@ -20,6 +20,7 @@
 #include "context.h"
 #include "gtp-path.h"
 #include "pfcp-path.h"
+#include "fd-path.h"
 
 static smf_context_t self;
 static ogs_diam_config_t g_diam_conf;
@@ -41,6 +42,7 @@ static int num_of_smf_sess = 0;
 
 static void stats_add_smf_session(void);
 static void stats_remove_smf_session(smf_sess_t *sess);
+static void smf_sess_terminate_diameter_before_removal(smf_sess_t *sess);
 
 int smf_ctf_config_init(smf_ctf_config_t *ctf_config)
 {
@@ -105,6 +107,12 @@ void smf_context_init(void)
     ogs_assert(self.ipv6_hash);
     self.n1n2message_hash = ogs_hash_make();
     ogs_assert(self.n1n2message_hash);
+
+    /* Initialize EPC handover config (all disabled by default) */
+    self.handover_config.enable_ip_preservation = false;
+    self.handover_config.enable_sgw_cleanup = false;
+    self.handover_config.hold_duration_sec = 30;
+    self.handover_config.enable_reverse_direction = false;
 
     /* Initialize GTP node cleanup (disabled by default) */
     self.gtp_node_cleanup_enabled = false;
@@ -613,6 +621,39 @@ int smf_context_parse_config(void)
                         ogs_info("GTP node cleanup timer: %s", 
                                 self.gtp_node_cleanup_enabled ? "enabled" : "disabled");
                     }
+                } else if (!strcmp(smf_key, "handover")) {
+                    ogs_yaml_iter_t ho_iter;
+                    ogs_yaml_iter_recurse(&smf_iter, &ho_iter);
+                    while (ogs_yaml_iter_next(&ho_iter)) {
+                        const char *ho_key =
+                            ogs_yaml_iter_key(&ho_iter);
+                        ogs_assert(ho_key);
+
+                        if (!strcmp(ho_key, "enable_ip_preservation")) {
+                            self.handover_config.enable_ip_preservation =
+                                ogs_yaml_iter_bool(&ho_iter);
+                        } else if (!strcmp(ho_key, "enable_sgw_cleanup")) {
+                            self.handover_config.enable_sgw_cleanup =
+                                ogs_yaml_iter_bool(&ho_iter);
+                        } else if (!strcmp(ho_key, "hold_duration_sec")) {
+                            const char *v = ogs_yaml_iter_value(&ho_iter);
+                            if (v)
+                                self.handover_config.hold_duration_sec =
+                                    atoi(v);
+                        } else if (!strcmp(ho_key,
+                                    "enable_reverse_direction")) {
+                            self.handover_config.enable_reverse_direction =
+                                ogs_yaml_iter_bool(&ho_iter);
+                        } else
+                            ogs_warn("unknown key `%s`", ho_key);
+                    }
+                    ogs_info("Handover config: "
+                            "ip_preservation=%d, sgw_cleanup=%d, "
+                            "hold_sec=%d, reverse=%d",
+                            self.handover_config.enable_ip_preservation,
+                            self.handover_config.enable_sgw_cleanup,
+                            self.handover_config.hold_duration_sec,
+                            self.handover_config.enable_reverse_direction);
                 } else if (!strcmp(smf_key, "info")) {
                     ogs_sbi_nf_instance_t *nf_instance = NULL;
 
@@ -1285,7 +1326,14 @@ smf_sess_t *smf_sess_add_by_apn(smf_ue_t *smf_ue, char *apn, uint8_t rat_type)
     /* Set RAT-Type */
     sess->gtp_rat_type = rat_type;
     ogs_assert(sess->gtp_rat_type);
-    
+
+    /* KPI: per-RAT active session gauge. The gauge is decremented in
+     * smf_sess_remove() to maintain accuracy across the lifetime of
+     * the session. */
+    smf_metrics_inst_by_rat_inc(
+            smf_rat_label(sess->gtp_rat_type),
+            SMF_METR_BY_RAT_GAUGE_SESSION_ACTIVE);
+
     /* Initialize UE capabilities flags */
     sess->gtp.ue_local_addr_in_tft = false;  /* Default: UE doesn't support local address in TFT */
 
@@ -1297,6 +1345,25 @@ smf_sess_t *smf_sess_add_by_apn(smf_ue_t *smf_ue, char *apn, uint8_t rat_type)
     ogs_fsm_init(&sess->sm, smf_gsm_state_initial, smf_gsm_state_final, &e);
 
     sess->smf_ue_id = smf_ue->id;
+
+    /* Initialize EPC handover state (③-A) */
+    sess->epc_handover.state = SMF_HO_STATE_NONE;
+    /*
+     * Phase 4 PR3b (Step 4-3b):
+     * Pass the session's pool id (not the sess pointer) as the
+     * timer's user data so that the callback can safely re-fetch
+     * the session via smf_sess_find_by_id() and abort cleanly if the
+     * session has been freed between timer queueing and firing
+     * (race guard #5 in the PR3b design).
+     */
+    sess->epc_handover.hold_timer = ogs_timer_add(
+            ogs_app()->timer_mgr, smf_timer_handover_hold,
+            (void *)(uintptr_t)sess->id);
+    ogs_assert(sess->epc_handover.hold_timer);
+    sess->epc_handover.peer_sess_id = OGS_INVALID_POOL_ID;
+    /* Phase 4 PR3a (Step 4-3a): start with generation 0; bumped on
+     * each (re)start of the hold timer and on smf_sess_remove(). */
+    sess->epc_handover.hold_generation = 0;
 
     ogs_list_add(&smf_ue->sess_list, sess);
 
@@ -1376,6 +1443,7 @@ smf_sess_t *smf_sess_add_by_gtp1_message(ogs_gtp1_message_t *message)
     if (sess) {
         ogs_warn("OLD Session Will Release [IMSI:%s,APN:%s]",
                 smf_ue->imsi_bcd, sess->session.name);
+        smf_sess_terminate_diameter_before_removal(sess);
         smf_sess_remove(sess);
     }
 
@@ -1444,6 +1512,7 @@ smf_sess_t *smf_sess_add_by_gtp2_message(ogs_gtp2_message_t *message)
     if (sess) {
         ogs_info("OLD Session Will Release [IMSI:%s,APN:%s]",
                 smf_ue->imsi_bcd, sess->session.name);
+        smf_sess_terminate_diameter_before_removal(sess);
         smf_sess_remove(sess);
     }
 
@@ -1615,14 +1684,29 @@ uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
     sess->paa.session_type = sess->session.session_type;
     ogs_assert(sess->session.session_type);
 
+    /*
+     * Phase 4.2a (CR-6): only clear hash entries this session owns.
+     * During HO, two sessions can briefly share the same UE IP; an
+     * unconditional NULL set would erase the other session's entry
+     * and break downlink lookup. Same idiom as smf_sess_remove() ③-E
+     * (Phase 0, context.c:1882).
+     */
     if (sess->ipv4) {
-        ogs_hash_set(smf_self()->ipv4_hash,
-                sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+        if (ogs_hash_get(smf_self()->ipv4_hash,
+                    sess->ipv4->addr, OGS_IPV4_LEN) == sess) {
+            ogs_hash_set(smf_self()->ipv4_hash,
+                    sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+        }
         ogs_pfcp_ue_ip_free(sess->ipv4);
     }
     if (sess->ipv6) {
-        ogs_hash_set(smf_self()->ipv6_hash,
-                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        if (ogs_hash_get(smf_self()->ipv6_hash,
+                    sess->ipv6->addr,
+                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3) == sess) {
+            ogs_hash_set(smf_self()->ipv6_hash,
+                    sess->ipv6->addr,
+                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        }
         ogs_pfcp_ue_ip_free(sess->ipv6);
     }
 
@@ -1664,8 +1748,12 @@ uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
             ogs_error("ogs_pfcp_ue_ip_alloc() failed[%d]", cause_value);
             ogs_assert(cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED);
             if (sess->ipv4) {
-                ogs_hash_set(smf_self()->ipv4_hash,
-                        sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+                /* Phase 4.2a (CR-6): in this IPV4V6 alloc-failure
+                 * rollback path, the ipv4 entry was not yet inserted
+                 * into ipv4_hash (the insert at the bottom of the
+                 * IPV4V6 branch is unreached when ipv6 alloc fails),
+                 * so no hash cleanup is needed — drop the redundant
+                 * unconditional NULL set. */
                 ogs_pfcp_ue_ip_free(sess->ipv4);
                 sess->ipv4 = NULL;
             }
@@ -1733,6 +1821,15 @@ void smf_sess_remove(smf_sess_t *sess)
             sess->ipv4 ? OGS_INET_NTOP(&sess->ipv4->addr, buf1) : "",
             sess->ipv6 ? OGS_INET6_NTOP(&sess->ipv6->addr, buf2) : "");
 
+    /* KPI: decrement the per-RAT active session gauge mirroring the
+     * inc in smf_sess_add_by_apn(). EPC sessions always have a valid
+     * gtp_rat_type; non-EPC (5G) paths set it to 0 and end up in the
+     * "other" bucket which keeps the gauge balanced. */
+    if (sess->epc)
+        smf_metrics_inst_by_rat_dec(
+                smf_rat_label(sess->gtp_rat_type),
+                SMF_METR_BY_RAT_GAUGE_SESSION_ACTIVE);
+
     /* Let the session state machine handle PFCP session deletion properly */
     ogs_debug("Session removal - letting FSM handle PFCP cleanup [SEID:0x%lx]", sess->smf_n4_seid);
 
@@ -1759,13 +1856,67 @@ void smf_sess_remove(smf_sess_t *sess)
     ogs_hash_set(self.smf_n4_seid_hash, &sess->smf_n4_seid,
             sizeof(sess->smf_n4_seid), NULL);
 
+    /*
+     * Phase 4 PR3a (Step 4-3a): cleanup order matters here to avoid
+     * dangling pointers when the hold timer fires in parallel with
+     * session removal (Codex MCP 2026-05-14 recommendation):
+     *
+     *   1. ogs_timer_delete()        - stop and free the timer
+     *   2. hold_timer = NULL         - belt-and-suspenders for any
+     *                                  callback that might still be
+     *                                  in flight on the event queue
+     *   3. hold_generation++         - invalidate any in-flight
+     *                                  callback snapshot (race guard
+     *                                  #4 / #5 in the PR3b design)
+     *   4. peer_sess_id clear        - now safe to drop the peer link
+     *   5. fall through to the rest of the free path
+     */
+    if (sess->epc_handover.hold_timer) {
+        ogs_timer_delete(sess->epc_handover.hold_timer);
+        sess->epc_handover.hold_timer = NULL;
+    }
+    sess->epc_handover.hold_generation++;
+
+    /* Clear peer link on removal (Step 1-1) */
+    if (sess->epc_handover.peer_sess_id != OGS_INVALID_POOL_ID) {
+        smf_sess_t *peer_sess = smf_sess_find_by_id(
+                sess->epc_handover.peer_sess_id);
+        if (peer_sess) {
+            ogs_debug("Clearing peer HO link: peer[0x%x] state=%d",
+                    (int)peer_sess->smf_n4_teid,
+                    peer_sess->epc_handover.state);
+            peer_sess->epc_handover.peer_sess_id = OGS_INVALID_POOL_ID;
+            /* If peer was TARGET_ACTIVE and source is being removed,
+             * peer becomes standalone (HO completed) */
+            if (peer_sess->epc_handover.state ==
+                    SMF_HO_STATE_TARGET_ACTIVE) {
+                peer_sess->epc_handover.state = SMF_HO_STATE_NONE;
+            }
+        }
+        sess->epc_handover.peer_sess_id = OGS_INVALID_POOL_ID;
+        sess->epc_handover.state = SMF_HO_STATE_NONE;
+    }
+
     if (sess->ipv4) {
-        ogs_hash_set(self.ipv4_hash, sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+        /* Only clear hash if this session owns the entry (③-E)
+         * During HO, two sessions share the same UE IP.
+         * Without this check, removing the old session would
+         * delete the new session's hash entry. */
+        if (ogs_hash_get(self.ipv4_hash,
+                    sess->ipv4->addr, OGS_IPV4_LEN) == sess) {
+            ogs_hash_set(self.ipv4_hash,
+                    sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+        }
         ogs_pfcp_ue_ip_free(sess->ipv4);
     }
     if (sess->ipv6) {
-        ogs_hash_set(self.ipv6_hash,
-                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        if (ogs_hash_get(self.ipv6_hash,
+                    sess->ipv6->addr,
+                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3) == sess) {
+            ogs_hash_set(self.ipv6_hash,
+                    sess->ipv6->addr,
+                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        }
         ogs_pfcp_ue_ip_free(sess->ipv6);
     }
 
@@ -1829,10 +1980,26 @@ void smf_sess_remove(smf_sess_t *sess)
     /* Free SBI object memory */
     ogs_sbi_object_free(&sess->sbi);
 
-    /* Clean up Diameter session state to prevent "No Session Data" errors */
+    /*
+     * Release this session's own copies of the Diameter Session-Ids.
+     *
+     * The strings are owned here, separately from the freeDiameter
+     * per-session sess_state, which keeps its own copy and frees it in its
+     * state_cleanup(). Freeing ours therefore cannot dangle anything on the
+     * Diameter side, and vice versa.
+     *
+     * A non-NULL gx_sid at this point means the Gx session was never
+     * terminated by CCA-T. The Diameter state is then reclaimed by whichever
+     * callback next finds no owner for the Session-Id, or by the
+     * freeDiameter expiry thread.
+     */
     if (sess->gx_sid) {
+        /* Sole owner: the CCA-T handler in gsm-sm.c releases it on this same
+         * thread when the Gx session terminates normally, and nothing on a
+         * freeDiameter thread touches it. */
         ogs_warn("Diameter Gx session state not cleaned up by CCA-T: %s",
                 sess->gx_sid);
+        ogs_free(sess->gx_sid);
         sess->gx_sid = NULL;
     }
     if (sess->gy_sid) {
@@ -1840,8 +2007,18 @@ void smf_sess_remove(smf_sess_t *sess)
         sess->gy_sid = NULL;
     }
     if (sess->s6b_sid) {
-        ogs_debug("Cleaning up Diameter S6b session state: %s", sess->s6b_sid);
+        /*
+         * Only this session's own copy is released here; the freeDiameter
+         * S6b state keeps its own and is reclaimed by its callbacks or by
+         * the expiry thread. A non-NULL s6b_sid means no STA completed for
+         * it - the old wording claimed the Diameter state was being cleaned
+         * up, which it never was.
+         */
+        char *sid = sess->s6b_sid;
+
         sess->s6b_sid = NULL;
+        ogs_debug("Releasing local S6b Session-Id copy: %s", sid);
+        ogs_free(sid);
     }
 
     smf_bearer_remove_all(sess);
@@ -1905,6 +2082,138 @@ smf_sess_t *smf_sess_find_by_apn(smf_ue_t *smf_ue, char *apn, uint8_t rat_type)
     return NULL;
 }
 
+/*
+ * Terminate the Diameter sessions of a session that is about to be removed
+ * locally, without waiting for the answers.
+ *
+ * The TS 29.274 7.2.1 collision path tears the old same-APN session down
+ * directly, so no CCR-T is ever sent for it and its freeDiameter state is
+ * left attached with nobody using it. Measured on the deployed node, every
+ * such removal orphaned one Gx sess_state, and only the 31-day expiry
+ * reclaimed them.
+ *
+ * Fire-and-forget: the request goes out while sess is still alive, the
+ * session is removed immediately afterwards, and the answer is reclaimed by
+ * the callback, which finds no owner for the Session-Id and releases the
+ * state. sm_data in-flight flags are deliberately NOT set - nothing is
+ * waiting for these answers, and the session will not exist to converge.
+ *
+ * Skipped for a validated handover source release: there the Session-Id has
+ * been handed to a live target and terminating it would pull the Gx session
+ * out from under it.
+ */
+static void smf_sess_terminate_diameter_before_removal(smf_sess_t *sess)
+{
+    ogs_assert(sess);
+
+    if (smf_sess_is_ho_source_release(sess)) {
+        ogs_info("Local release of HO source session - "
+                "keeping Diameter sessions for the target [%s]",
+                sess->gx_sid ? sess->gx_sid : "(no gx_sid)");
+        return;
+    }
+
+    /*
+     * Only when this session still owns a Session-Id. Calling the sender
+     * without one would make it allocate a brand-new Diameter session and
+     * emit a CCR-T for something that never existed.
+     */
+    if (sess->gx_sid) {
+        ogs_info("Local release: terminating Gx session [%s]", sess->gx_sid);
+        smf_gx_send_ccr(sess, OGS_INVALID_POOL_ID,
+                OGS_DIAM_GX_CC_REQUEST_TYPE_TERMINATION_REQUEST);
+    }
+
+    /*
+     * S6b, for a WLAN session only - that is the access it authenticates.
+     *
+     * The handover skip above does not apply: S6b has no equivalent of the
+     * Gx Session-Id transfer, so a WLAN session's S6b session is always its
+     * own and should be terminated whenever that session is really removed.
+     * (VoLTE->VoWiFi has no S6b on the EUTRAN source at all.)
+     */
+    if (sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_WLAN && sess->s6b_sid) {
+        ogs_info("Local release: terminating S6b session [%s]",
+                sess->s6b_sid);
+        smf_s6b_send_str(sess, NULL,
+                OGS_DIAM_TERMINATION_CAUSE_DIAMETER_LOGOUT);
+    }
+}
+
+/*
+ * True when this session is the SOURCE side of a handover that is genuinely
+ * in progress, i.e. its Diameter state has been handed to a live target and
+ * must not be torn down on its behalf.
+ *
+ * The incoming Create Session Request's Handover Indication is deliberately
+ * NOT used: it describes the request being processed, not whether THIS
+ * session's Session-Id is still in use. The peer link is validated in both
+ * directions so a stale one-sided link cannot suppress a legitimate
+ * termination.
+ */
+bool smf_sess_is_ho_source_release(smf_sess_t *sess)
+{
+    smf_sess_t *peer = NULL;
+
+    ogs_assert(sess);
+
+    if (!SMF_HO_IS_SOURCE_RELEASE_STATE(sess))
+        return false;
+
+    if (sess->epc_handover.peer_sess_id == OGS_INVALID_POOL_ID)
+        return false;
+
+    peer = smf_sess_find_by_id(sess->epc_handover.peer_sess_id);
+    if (!peer)
+        return false;
+
+    return peer->epc_handover.state == SMF_HO_STATE_TARGET_ACTIVE &&
+           peer->epc_handover.peer_sess_id == sess->id;
+}
+
+/*
+ * Find the session that currently owns a Gx Session-Id.
+ *
+ * The Diameter callbacks cannot trust sess_data->sess_id: a VoLTE<->VoWiFi
+ * handover moves the Gx Session-Id to the target session, and that
+ * back-reference is only refreshed when the next CCR goes out. Before a
+ * callback disposes of a sess_state it therefore has to ask "is anybody
+ * still using this Session-Id?" rather than "does the session named in the
+ * state still exist?".
+ *
+ * Compared by string, not by pointer: smf_sess_t.gx_sid owns its own copy,
+ * so the two are never the same allocation.
+ *
+ * A linear walk is deliberate. This runs only on the abnormal Diameter
+ * paths (a callback whose session has vanished, and the CCA-T reclaim), so
+ * the worst case of max.ue * OGS_MAX_NUM_OF_SESS comparisons costs nothing
+ * in practice, and it keeps the Session-Id free of an index that every
+ * assignment, clear and handover transfer would have to maintain in step.
+ *
+ * Known residual risk: callers include the freeDiameter dispatch threads,
+ * while the main thread can add to or remove from these lists. Walking them
+ * is more exposed than the pool-id lookups those callbacks already do. The
+ * whole "Diameter callbacks touch smf_sess_t unsynchronised" problem is
+ * pre-existing and wants a single solution rather than a local one here.
+ */
+smf_sess_t *smf_sess_find_by_gx_sid(const char *gx_sid)
+{
+    smf_ue_t *smf_ue = NULL;
+    smf_sess_t *sess = NULL;
+
+    if (!gx_sid)
+        return NULL;
+
+    ogs_list_for_each(&self.smf_ue_list, smf_ue) {
+        ogs_list_for_each(&smf_ue->sess_list, sess) {
+            if (sess->gx_sid && strcmp(sess->gx_sid, gx_sid) == 0)
+                return sess;
+        }
+    }
+
+    return NULL;
+}
+
 smf_sess_t *smf_sess_find_by_psi(smf_ue_t *smf_ue, uint8_t psi)
 {
     smf_sess_t *sess = NULL;
@@ -1958,6 +2267,25 @@ smf_sess_t *smf_sess_find_by_paging_n1n2message_location(
     ogs_assert(n1n2message_location);
     return (smf_sess_t *)ogs_hash_get(self.n1n2message_hash,
             n1n2message_location, strlen(n1n2message_location));
+}
+
+bool smf_sess_match_ue_ip(
+        const smf_sess_t *sess_a, const smf_sess_t *sess_b)
+{
+    ogs_assert(sess_a);
+    ogs_assert(sess_b);
+
+    if (sess_a->ipv4 && sess_b->ipv4) {
+        if (memcmp(sess_a->ipv4->addr, sess_b->ipv4->addr,
+                OGS_IPV4_LEN) == 0)
+            return true;
+    }
+    if (sess_a->ipv6 && sess_b->ipv6) {
+        if (memcmp(sess_a->ipv6->addr, sess_b->ipv6->addr,
+                OGS_IPV6_LEN) == 0)
+            return true;
+    }
+    return false;
 }
 
 ogs_pcc_rule_t *smf_pcc_rule_find_by_id(smf_sess_t *sess, char *pcc_rule_id)
@@ -2094,6 +2422,16 @@ smf_bearer_t *smf_qos_flow_add(smf_sess_t *sess)
     smf_metrics_inst_by_5qi_add(&sess->serving_plmn_id, &sess->s_nssai,
             sess->session.qos.index, SMF_METR_GAUGE_SM_QOSFLOWNBR, 1);
     smf_metrics_inst_global_inc(SMF_METR_GLOB_GAUGE_BEARERS_ACTIVE);
+    /* KPI: per-RAT bearer counters. Mirrors the existing
+     * bearers_active gauge but split on the session RAT. */
+    if (sess->epc) {
+        smf_metrics_inst_by_rat_inc(
+                smf_rat_label(sess->gtp_rat_type),
+                SMF_METR_BY_RAT_CTR_BEARER_CREATE);
+        smf_metrics_inst_by_rat_inc(
+                smf_rat_label(sess->gtp_rat_type),
+                SMF_METR_BY_RAT_GAUGE_BEARER_ACTIVE);
+    }
 
     return qos_flow;
 }
@@ -2537,6 +2875,14 @@ smf_bearer_t *smf_bearer_add(smf_sess_t *sess)
     ogs_list_add(&sess->bearer_list, bearer);
 
     smf_metrics_inst_global_inc(SMF_METR_GLOB_GAUGE_BEARERS_ACTIVE);
+    if (sess->epc) {
+        smf_metrics_inst_by_rat_inc(
+                smf_rat_label(sess->gtp_rat_type),
+                SMF_METR_BY_RAT_CTR_BEARER_CREATE);
+        smf_metrics_inst_by_rat_inc(
+                smf_rat_label(sess->gtp_rat_type),
+                SMF_METR_BY_RAT_GAUGE_BEARER_ACTIVE);
+    }
     return bearer;
 
 error:
@@ -2571,6 +2917,14 @@ int smf_bearer_remove(smf_bearer_t *bearer)
     ogs_assert(bearer);
     sess = smf_sess_find_by_id(bearer->sess_id);
     ogs_assert(sess);
+
+    /* KPI: decrement the per-RAT active bearer gauge before any
+     * teardown so the value cannot drift even if the function returns
+     * early on a downstream failure. */
+    if (sess->epc)
+        smf_metrics_inst_by_rat_dec(
+                smf_rat_label(sess->gtp_rat_type),
+                SMF_METR_BY_RAT_GAUGE_BEARER_ACTIVE);
 
     ogs_list_remove(&sess->bearer_list, bearer);
 

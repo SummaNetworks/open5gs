@@ -19,6 +19,7 @@
 
 #include "sbi-path.h"
 #include "pfcp-path.h"
+#include "metrics.h"
 
 /* Converts PFCP "Usage Report" "Report Trigger" bitmask to Gy "Reporting-Reason" AVP enum value.
  * PFCP: 3GPP TS 29.244 sec 8.2.41
@@ -747,20 +748,19 @@ static smf_sess_t *smf_find_s2b_session_for_ue(smf_sess_t *current_sess)
     smf_ue = smf_ue_find_by_id(current_sess->smf_ue_id);
     ogs_assert(smf_ue);
 
-    /* Find session with WLAN RAT type and same IP address */
+    /* Find session with WLAN RAT type and same UE IP.
+     *
+     * Phase 4.2a (CR-1): use the smf_sess_match_ue_ip() helper instead
+     * of memcmp(&sess->session.ue_ip, ...) so Initial-Attach sessions
+     * (PAA=0.0.0.0, real IP only in sess->ipv4) are matched correctly.
+     * The helper is shared with smf_sess_find_by_ip_and_different_rat()
+     * in s5c-handler.c. */
     ogs_list_for_each(&smf_ue->sess_list, sess) {
-        if (sess == current_sess) {
+        if (sess == current_sess)
             continue;
-        }
-
-        /* We're looking for a WLAN session */
-        if (sess->gtp_rat_type != OGS_GTP2_RAT_TYPE_WLAN) {
+        if (sess->gtp_rat_type != OGS_GTP2_RAT_TYPE_WLAN)
             continue;
-        }
-
-        /* Check if IP addresses match */
-        if (memcmp(&sess->session.ue_ip, &current_sess->session.ue_ip,
-                sizeof(sess->session.ue_ip)) == 0) {
+        if (smf_sess_match_ue_ip(sess, current_sess)) {
             ogs_debug("    Found S2b session with same IP address during bearer modification");
             return sess;
         }
@@ -791,10 +791,18 @@ int smf_epc_pfcp_send_one_bearer_modification_request(
         if (s2b_sess) {
             ogs_debug("    VoLTE to VoWiFi handover detected during bearer modification");
             ogs_debug("    Ensuring packet forwarding via S2b interface");
-            
+
             /* For VoLTE to VoWiFi handover, we want to keep the forwarding rule
              * active through the S2b interface, so only remove the S5/S8 path */
             flags |= OGS_PFCP_MODIFY_HANDOVER;
+            /* KPI: explicit data-plane path switch event. The label is
+             * the canonical direction set on the target session when
+             * the HO was detected in smf_s5c_handle_create_session_request. */
+            smf_metrics_inst_by_direction_inc(
+                    s2b_sess->epc_handover.kpi_direction ?
+                        s2b_sess->epc_handover.kpi_direction :
+                        "volte_to_vowifi",
+                    SMF_METR_BY_DIRECTION_CTR_DATA_PLANE_PATH_SWITCH);
         }
     }
 
@@ -912,7 +920,8 @@ int smf_epc_pfcp_send_deactivation(smf_sess_t *sess, uint8_t gtp_cause)
         /* Deactivate WLAN Session - Even if no bearers, we should clean up */
         rv = smf_epc_pfcp_send_all_pdr_modification_request(
                 wlan_sess, OGS_INVALID_POOL_ID, NULL,
-                OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE,
+                OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE|
+                OGS_PFCP_MODIFY_HANDOVER,
                 OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
                 OGS_GTP2_CAUSE_ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP);
         if (rv != OGS_OK) {
@@ -924,8 +933,15 @@ int smf_epc_pfcp_send_deactivation(smf_sess_t *sess, uint8_t gtp_cause)
 
     case OGS_GTP2_CAUSE_RAT_CHANGED_FROM_3GPP_TO_NON_3GPP:
         /* Handover from 3GPP to Non-3GPP */
-        eutran_sess = smf_sess_find_by_apn(
-                smf_ue, sess->session.name, OGS_GTP2_RAT_TYPE_EUTRAN);
+        /* Try peer_sess_id first (Step 1-1), fallback to APN+RAT search */
+        if (sess->epc_handover.peer_sess_id != OGS_INVALID_POOL_ID) {
+            eutran_sess = smf_sess_find_by_id(
+                    sess->epc_handover.peer_sess_id);
+        }
+        if (!eutran_sess) {
+            eutran_sess = smf_sess_find_by_apn(
+                    smf_ue, sess->session.name, OGS_GTP2_RAT_TYPE_EUTRAN);
+        }
         if (!eutran_sess) {
             ogs_warn("E-UTRAN session not found during non-3GPP handover");
             return OGS_OK; /* Session might already be cleaned up */
@@ -934,7 +950,8 @@ int smf_epc_pfcp_send_deactivation(smf_sess_t *sess, uint8_t gtp_cause)
         /* Deactivate EUTRAN Session - Even if no bearers, we should clean up */
         rv = smf_epc_pfcp_send_all_pdr_modification_request(
                 eutran_sess, OGS_INVALID_POOL_ID, NULL,
-                OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE,
+                OGS_PFCP_MODIFY_DL_ONLY|OGS_PFCP_MODIFY_DEACTIVATE|
+                OGS_PFCP_MODIFY_HANDOVER,
                 OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED,
                 OGS_GTP2_CAUSE_RAT_CHANGED_FROM_3GPP_TO_NON_3GPP);
         if (rv != OGS_OK) {

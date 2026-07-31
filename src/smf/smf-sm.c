@@ -172,6 +172,13 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
                 if (sess)
                     OGS_SETUP_GTP_NODE(sess, smf_gnode->gnode);
             }
+            /* KPI: per-RAT CSReq split. sess->gtp_rat_type is set by
+             * smf_sess_add_by_gtp2_message() above, so it is safe to
+             * read here even for newly-allocated sessions. */
+            if (sess)
+                smf_metrics_inst_by_rat_inc(
+                        smf_rat_label(sess->gtp_rat_type),
+                        SMF_METR_BY_RAT_CTR_SESSION_CREATE);
             if (!sess) {
                 ogs_error("No Session");
                 ogs_gtp2_send_error_message(gtp_xact,
@@ -196,6 +203,10 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
             if (!gtp2_message.h.teid_presence) ogs_error("No TEID");
             smf_metrics_inst_global_inc(SMF_METR_GLOB_CTR_S5C_RX_DELETESESSIONREQ);
             smf_metrics_inst_gtp_node_inc(smf_gnode->metrics, SMF_METR_GTP_NODE_CTR_S5C_RX_DELETESESSIONREQ);
+            if (sess)
+                smf_metrics_inst_by_rat_inc(
+                        smf_rat_label(sess->gtp_rat_type),
+                        SMF_METR_BY_RAT_CTR_SESSION_DELETE);
             if (!sess) {
                 ogs_error("No Session");
                 ogs_gtp2_send_error_message(gtp_xact,
@@ -439,12 +450,29 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
         ogs_assert(gx_message);
 
         sess = smf_sess_find_by_id(e->sess_id);
-        ogs_assert(sess);
+        if (!sess) {
+            /*
+             * A freeDiameter thread queued this before the main thread
+             * removed the session - the TS 29.274 7.2.1 collision path does
+             * exactly that. Losing the race must not abort the process.
+             *
+             * ogs_diam_gx_message_t embeds an ogs_session_data_t holding the
+             * parsed PCC rules, so freeing the struct alone would leak them.
+             */
+            ogs_debug("Session not found for Gx message "
+                    "(session may have been deleted)");
+            OGS_SESSION_DATA_FREE(&gx_message->session_data);
+            ogs_free(gx_message);
+            break;
+        }
 
         switch(gx_message->cmd_code) {
         case OGS_DIAM_GX_CMD_CODE_CREDIT_CONTROL:
             switch(gx_message->cc_request_type) {
             case OGS_DIAM_GX_CC_REQUEST_TYPE_INITIAL_REQUEST:
+                ogs_fsm_dispatch(&sess->sm, e);
+                break;
+            case OGS_DIAM_GX_CC_REQUEST_TYPE_UPDATE_REQUEST:
                 ogs_fsm_dispatch(&sess->sm, e);
                 break;
             case OGS_DIAM_GX_CC_REQUEST_TYPE_TERMINATION_REQUEST:
@@ -474,7 +502,15 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
         ogs_assert(gy_message);
 
         sess = smf_sess_find_by_id(e->sess_id);
-        ogs_assert(sess);
+        if (!sess) {
+            /* Same race as the Gx case above. ogs_diam_gy_message_t has no
+             * embedded session data, so the struct itself is all there is to
+             * free. */
+            ogs_debug("Session not found for Gy message "
+                    "(session may have been deleted)");
+            ogs_free(gy_message);
+            break;
+        }
 
         switch(gy_message->cmd_code) {
         case OGS_DIAM_GY_CMD_CODE_CREDIT_CONTROL:
@@ -507,15 +543,8 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
         ogs_fsm_handler_t current_state = sess->sm.state;
         if (current_state == (ogs_fsm_handler_t)smf_gsm_state_epc_session_will_release ||
             current_state == (ogs_fsm_handler_t)smf_gsm_state_exception) {
-            /* If this is a termination answer and we have a stored transaction, send DSResp */
-            if (s6b_message->cmd_code == OGS_DIAM_S6B_CMD_SESSION_TERMINATION &&
-                sess->gtp.stored_xact) {
-                ogs_debug("Session[%d] in release state - sending delayed DSResp", e->sess_id);
-                smf_gtp2_send_delete_session_response(sess, sess->gtp.stored_xact);
-                sess->gtp.stored_xact = NULL;
-            } else {
-                ogs_debug("Session[%d] in release/exception state - ignoring S6B message", e->sess_id);
-            }
+            ogs_debug("Session[%d] in release/exception state - ignoring "
+                    "S6B message", e->sess_id);
             ogs_free(s6b_message);
             break;
         }

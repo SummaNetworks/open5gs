@@ -32,6 +32,23 @@ ogs_pkbuf_t *sgwc_s11_build_create_session_response(
 ogs_pkbuf_t *sgwc_s11_build_downlink_data_notification(
         uint8_t cause_value, sgwc_bearer_t *bearer);
 
+/*
+ * Phase 4 Step 4-5: Build a Create Bearer Response for failure cases.
+ *
+ * TS 29.274 7.2.4 marks Bearer Context as Mandatory in CBResp.
+ * For failure relays (MME rejected E-RAB Setup), the SGW must forward
+ * a proper CBResp with at least:
+ *   - Cause (top-level) = failure cause
+ *   - Bearer Context = { EBI, bearer-level Cause }
+ * The previous use of ogs_gtp_send_error_message() omitted Bearer
+ * Context, which is non-compliant and causes the receiving SMF to log
+ * "No Bearer / No EPS Bearer ID / No Bearer Cause" before falling back
+ * to xact-based cleanup.
+ */
+ogs_pkbuf_t *sgwc_s11_build_create_bearer_response_failure(
+        uint8_t type, uint8_t cause_value,
+        uint8_t ebi, uint8_t bearer_cause_value);
+
 #ifdef __cplusplus
 }
 #endif

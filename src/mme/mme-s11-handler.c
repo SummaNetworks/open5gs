@@ -21,6 +21,7 @@
 #include "mme-sm.h"
 #include "mme-context.h"
 #include "mme-timer.h"
+#include "metrics.h"
 
 #include "s1ap-path.h"
 #include "mme-gtp-path.h"
@@ -250,6 +251,11 @@ void mme_s11_handle_create_session_response(
         ogs_assert(cause);
         session_cause = cause->value;
     }
+
+    /* KPI: record CSResp Cause distribution (concern #5 noise included). */
+    mme_metrics_inst_by_cause_inc("gtpv2",
+            mme_gtpv2_cause_bucket(session_cause),
+            MME_METR_BY_CAUSE_GTPV2_RESPONSE);
 
     /************************
      * Check MME-UE Context
@@ -615,6 +621,13 @@ void mme_s11_handle_modify_bearer_response(
         session_cause = cause->value;
     }
 
+    /* KPI: record the GTPv2 response Cause distribution. Done once per
+     * MBR response so that Cause 64 noise (Phase 4 concern #5) and
+     * legitimate failures both end up in the same time series. */
+    mme_metrics_inst_by_cause_inc("gtpv2",
+            mme_gtpv2_cause_bucket(session_cause),
+            MME_METR_BY_CAUSE_GTPV2_RESPONSE);
+
     /************************
      * Check MME-UE Context
      ************************/
@@ -675,6 +688,61 @@ void mme_s11_handle_modify_bearer_response(
     ogs_debug("    MME_S11_TEID[%d] SGW_S11_TEID[%d]",
             mme_ue->mme_s11_teid, sgw_ue->sgw_s11_teid);
 
+    /* Phase 4.1 hotfix (concern #8): clear the per-session "HANDOVER"
+     * request type after a successful Modify Bearer Response.
+     *
+     * Per TS 29.274 §5.10.1 the Handover Indication flag is only valid
+     * for the actual non-3GPP -> 3GPP handover MBR.
+     * esm_handle_pdn_connectivity_request() stores REQUEST_TYPE_HANDOVER
+     * in sess->ue_request_type but never clears it, so every later MBR
+     * (Service Request return, TAU, regular bearer modification) ends
+     * up with HI=1 by mistake — confirmed in PCAP MBReq-inSR.pcapng
+     * (2026-05-17, 7/7 MBRs HI=True after a single VoWiFi->VoLTE HO).
+     *
+     * Clear the flag here, on the MBResp success edge, so subsequent
+     * MBRs build with HI=0. The reset is scoped to sessions that
+     * actually participated in this MBR (bearer_to_modify_list mirrors
+     * the MBR builder's HI-decision scope in mme-s11-build.c) so that
+     * unrelated PDNs in mid-flight HO are not affected. The
+     * `if (HANDOVER)` guard makes the operation idempotent across
+     * retransmits and bearers sharing the same session. */
+    {
+        mme_bearer_t *bearer_iter = NULL;
+        ogs_list_for_each_entry(
+                &mme_ue->bearer_to_modify_list,
+                bearer_iter, to_modify_node) {
+            mme_sess_t *target_sess =
+                    mme_sess_find_by_id(bearer_iter->sess_id);
+            if (target_sess &&
+                    target_sess->ue_request_type.value ==
+                            OGS_NAS_EPS_REQUEST_TYPE_HANDOVER) {
+                ogs_info("[HI-reset] sess cleared "
+                        "(HANDOVER -> INITIAL) "
+                        "[IMSI:%s EBI:%d modify_action:%d]",
+                        mme_ue->imsi_bcd, bearer_iter->ebi,
+                        modify_action);
+                target_sess->ue_request_type.value =
+                        OGS_NAS_EPS_REQUEST_TYPE_INITIAL;
+                /* KPI: HI-reset per session, HO control-plane success,
+                 * and HO duration observation (per HO, deduplicated by
+                 * checking ho_start_us != 0). */
+                mme_metrics_inst_global_inc(MME_METR_GLOB_CTR_HI_RESET);
+                if (target_sess->ho_start_us) {
+                    ogs_time_t elapsed_us = ogs_get_monotonic_time() -
+                            target_sess->ho_start_us;
+                    mme_metrics_inst_by_direction_inc(
+                            "vowifi_to_volte",
+                            MME_METR_BY_DIRECTION_HO_SUCCESS);
+                    mme_metrics_inst_histogram_observe(
+                            "vowifi_to_volte",
+                            MME_METR_HISTOGRAM_HO_DURATION,
+                            (int)(elapsed_us / 1000));
+                    target_sess->ho_start_us = 0;
+                }
+            }
+        }
+    }
+
     switch (modify_action) {
     case OGS_GTP_MODIFY_IN_PATH_SWITCH_REQUEST:
         r = s1ap_send_path_switch_ack(mme_ue, false);
@@ -702,6 +770,9 @@ void mme_s11_handle_delete_session_response(
     mme_sess_t *sess = NULL;
     mme_ue_t *mme_ue = NULL;
     enb_ue_t *enb_ue = NULL;
+    /* Layer A (IMS PDN wedge fix): id of this responding delete xact,
+     * snapshotted before commit frees it (LOCAL FINAL stage). */
+    ogs_pool_id_t delete_xact_id = OGS_INVALID_POOL_ID;
 
     ogs_assert(rsp);
 
@@ -717,6 +788,7 @@ void mme_s11_handle_delete_session_response(
     if (sess)
         mme_ue = mme_ue_find_by_id(sess->mme_ue_id);
     enb_ue = enb_ue_find_by_id(xact->enb_ue_id);
+    delete_xact_id = xact->id;   /* snapshot before commit frees the xact */
 
     rv = ogs_gtp_xact_commit(xact);
     if (rv != OGS_OK) {
@@ -729,6 +801,25 @@ void mme_s11_handle_delete_session_response(
         return;
     }
 
+    /* Layer A (IMS PDN wedge fix / A4): if the found session no longer owns
+     * this delete transaction, the response is stale — the original session
+     * was removed and its pool-id was reused by a fresh same-APN session.
+     * Ignore it so a late response cannot remove/corrupt the new session. */
+    if (sess->delete_xact_id != delete_xact_id) {
+        ogs_warn("[%s] stale Delete Session Response (xact no longer owns "
+                "session); ignore",
+                mme_ue ? mme_ue->imsi_bcd : "unknown");
+        return;
+    }
+
+    /* Ownership guard (A4) passed: this response genuinely belongs to
+     * sess, so the SGW/SMF-side delete for it is now complete (regardless
+     * of accepted vs CONTEXT_NOT_FOUND cause). Latch it as proof that the
+     * core delete finished -- distinct from "the delete xact merely
+     * disappeared / timed out". The pdn_will_disconnect stuck-recovery and
+     * the E-RAB Release Response failure cleanup use this as their gate. */
+    sess->core_delete_done = true;
+
     if (!enb_ue) {
         /* For OGS_GTP_DELETE_NO_ACTION (local deactivation during TAU),
          * enb_ue might already be NULL because UE Context Release
@@ -736,6 +827,21 @@ void mme_s11_handle_delete_session_response(
          * We still need to clean up the session to prevent zombie sessions.
          * For other actions, enb_ue is required for signaling. */
         if (action != OGS_GTP_DELETE_NO_ACTION) {
+            /* Layer A (IMS PDN wedge fix / A5.2): SEND_DEACTIVATE delete
+             * whose S1/eNB is already gone before this response. The UE-side
+             * Deactivate Accept can never arrive (no S1), yet the SGW/SMF-
+             * side delete is complete (this IS its response). Leaving the
+             * deletion_in_progress session would wedge the IMS PDN until the
+             * UE's next PDN request. Remove it locally now for immediate
+             * recovery. (A4 above guarantees we own this session here.) */
+            if (sess->deletion_in_progress) {
+                ogs_warn("[%s] ENB-S1 gone; removing orphaned "
+                        "deletion_in_progress session locally "
+                        "(immediate wedge recovery)",
+                        mme_ue ? mme_ue->imsi_bcd : "unknown");
+                mme_sess_remove(sess);
+                return;
+            }
             ogs_error("ENB-S1 Context has already been removed");
             return;
         }
@@ -788,8 +894,55 @@ void mme_s11_handle_delete_session_response(
         ogs_assert(cause);
 
         cause_value = cause->value;
-        if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED)
-            ogs_error("GTP Cause [VALUE:%d] - Ignored", cause_value);
+        if (cause_value != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
+            /* Phase 4 PR6-B follow-up: a DSResp carrying Cause 64
+             * (CONTEXT_NOT_FOUND) is the expected race outcome on
+             * deactivation/local-deactivation paths — the SMF already
+             * removed the session through a parallel cleanup path
+             * before our DSReq's PFCP cleanup completed. Two known
+             * triggers:
+             *   1) PR6-B: the SMF CSReq handler ran Phase 1
+             *      VoLTE↔VoWiFi HO detection and removed the old
+             *      session ("OLD Session Will Release") before this
+             *      DSReq's PFCP response arrived
+             *      (action = SEND_DEACTIVATE_BEARER_CONTEXT_REQUEST).
+             *   2) PR4: emm-sm.c TAU bearer-status-mismatch issued a
+             *      local-deactivation DSReq that overlaps with a
+             *      regular detach (action = NO_ACTION).
+             * Both are functionally correct (the session is gone, which
+             * is exactly what we wanted); downgrade to a warning so
+             * other Cause values (real anomalies) keep the ogs_error
+             * loudness. Structured fields (action/IMSI/APN/TEIDs) are
+             * emitted so the warn can still be correlated with peer
+             * logs during post-mortem (Codex MCP recommendation). */
+            if (cause_value == OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND &&
+                    (action ==
+                      OGS_GTP_DELETE_SEND_DEACTIVATE_BEARER_CONTEXT_REQUEST ||
+                     action == OGS_GTP_DELETE_NO_ACTION)) {
+                ogs_warn("GTP Cause [VALUE:%d] - Ignored "
+                        "(action=%d procedure=DSResp expected: "
+                        "parallel deletion completed) "
+                        "[IMSI:%s APN:%s "
+                        "MME_S11_TEID:0x%x SGW_S11_TEID:0x%x]",
+                        cause_value, action,
+                        mme_ue ? mme_ue->imsi_bcd : "unknown",
+                        (sess && sess->session) ?
+                            sess->session->name : "unknown",
+                        mme_ue ? mme_ue->mme_s11_teid : 0,
+                        source_ue ? source_ue->sgw_s11_teid : 0);
+            } else {
+                ogs_error("GTP Cause [VALUE:%d] - Ignored "
+                        "(action=%d procedure=DSResp) "
+                        "[IMSI:%s APN:%s "
+                        "MME_S11_TEID:0x%x SGW_S11_TEID:0x%x]",
+                        cause_value, action,
+                        mme_ue ? mme_ue->imsi_bcd : "unknown",
+                        (sess && sess->session) ?
+                            sess->session->name : "unknown",
+                        mme_ue ? mme_ue->mme_s11_teid : 0,
+                        source_ue ? source_ue->sgw_s11_teid : 0);
+            }
+        }
     }
 
     /********************
@@ -827,9 +980,44 @@ void mme_s11_handle_delete_session_response(
             return;
         }
 
-        r = nas_eps_send_deactivate_bearer_context_request(bearer);
+        /* Phase 4 Step 4-8: include all active dedicated EBIs in the
+         * S1AP E-RAB Release Command so that eNB clears internal state
+         * for every bearer (workaround for vendors that don't cascade
+         * implicit release of dedicated bearers per TS 24.301 6.4.4.3).
+         * NAS PDU is still built only for the default bearer. */
+        r = nas_eps_send_deactivate_pdn_with_dedicated(bearer);
         ogs_expect(r == OGS_OK);
         ogs_assert(r != OGS_ERROR);
+
+        /*
+         * Normally the session is kept until the UE's Deactivate EPS
+         * Bearer Context Accept removes it, so mme_sess_remove() is not
+         * called here.
+         *
+         * EXCEPTION: when the SGW/SMF returned CONTEXT_NOT_FOUND the core
+         * session is already gone. Waiting for a UE Deactivate Accept
+         * that may never complete (handover churn / radio loss) leaves a
+         * zombie PDN whose default *and* dedicated bearers only get
+         * reconciled at the next periodic TAU bearer-status mismatch
+         * (observed to linger ~13 min). Since the core teardown is moot,
+         * purge the local session now. The Deactivate above was still
+         * sent as a best-effort eNB/UE notification (E-RAB Release
+         * Command covers the dedicated bearers); MME_SESS_CLEAR() ->
+         * mme_bearer_remove_all() then frees the default and every
+         * dedicated bearer, stopping their T3485/T3489/T3495 timers via
+         * CLEAR_BEARER_ALL_TIMERS(). The delete_xact_id guard above
+         * (A4) has already proven this response owns the session, so we
+         * cannot remove a freshly-recreated same-APN session by mistake.
+         */
+        if (cause_value == OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND) {
+            ogs_warn("[%s] core session gone (CONTEXT_NOT_FOUND); purging "
+                    "local PDN[%s] now instead of waiting for UE "
+                    "Deactivate Accept",
+                    mme_ue->imsi_bcd,
+                    sess->session ? sess->session->name : "unknown");
+            MME_SESS_CLEAR(sess);
+            return;
+        }
 
         /* mme_sess_remove() should not be called here. */
         return;
@@ -994,9 +1182,13 @@ void mme_s11_handle_create_bearer_request(
     ogs_assert(sess);
     bearer = mme_bearer_add(sess);
     if (!bearer) {
-        ogs_error("[%s] mme_bearer_add() failed - "
-                "EPS Bearer ID pool exhausted", mme_ue->imsi_bcd);
-        ogs_gtp2_send_error_message(xact, sgw_ue ? sgw_ue->sgw_s11_teid : 0,
+        /*
+         * No bearer or no free EPS Bearer ID for this UE. Refusing the
+         * dedicated bearer is the correct answer - the SGW/SMF can retry or
+         * tear the rule down - whereas asserting takes the whole MME with it.
+         */
+        ogs_error("mme_bearer_add() failed [IMSI:%s]", mme_ue->imsi_bcd);
+        ogs_gtp2_send_error_message(xact, sgw_ue->sgw_s11_teid,
                 OGS_GTP2_CREATE_BEARER_RESPONSE_TYPE,
                 OGS_GTP2_CAUSE_NO_RESOURCES_AVAILABLE);
         return;
@@ -1431,7 +1623,29 @@ void mme_s11_handle_delete_bearer_request(
         }
     } else {
         MME_CLEAR_PAGING_INFO(mme_ue);
-        r = nas_eps_send_deactivate_bearer_context_request(bearer);
+        /*
+         * Phase 4 PR3c (Step 4-3c):
+         * When the Delete Bearer Request carries a Linked EPS Bearer
+         * ID (i.e. the SMF/PGW is deleting a PDN connection from the
+         * default-bearer side), include every active dedicated bearer
+         * of that PDN in the S1AP E-RAB Release Command via the
+         * Step 4-8 wrapper. This is necessary for the SMF-initiated
+         * cleanup path introduced by Phase 4 PR3b (active Delete
+         * Bearer Request after the hold timer expires when the UE
+         * does not send an NAS PDN Disconnect itself): without it the
+         * eNB only releases the default DRB and the QCI=1 dedicated
+         * DRX configuration accumulates on UE_INDEX across repeated
+         * VoLTE↔VoWiFi handovers, eventually triggering FGI REJECT
+         * / invalid-qos-combination on the next dedicated setup.
+         *
+         * For dedicated-only deletions (req->eps_bearer_ids), the
+         * legacy single-bearer path is still correct.
+         */
+        if (req->linked_eps_bearer_id.presence == 1) {
+            r = nas_eps_send_deactivate_pdn_with_dedicated(bearer);
+        } else {
+            r = nas_eps_send_deactivate_bearer_context_request(bearer);
+        }
         ogs_expect(r == OGS_OK);
         ogs_assert(r != OGS_ERROR);
     }
@@ -1723,6 +1937,78 @@ void mme_s11_handle_downlink_data_notification(
             ogs_assert(r != OGS_ERROR);
         }
     } else if (ECM_CONNECTED(mme_ue)) {
+        enb_ue_t *releasing_enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
+
+        /*
+         * ECM_CONNECTED() only asks whether the enb_ue context still
+         * resolves, but the S1 release procedure is multi-stage:
+         *
+         *   UEContextReleaseRequest -> Release Access Bearers Request
+         *   -> Release Access Bearers Response  (SGW-U FAR -> BUFF|NOCP)
+         *   -> UEContextReleaseCommand
+         *   -> UEContextReleaseComplete         (only now is enb_ue removed)
+         *
+         * A DDN arriving inside that window - typical when the radio is
+         * lost mid-call, since SIP INVITEs are retransmitted every ~2 s -
+         * therefore lands here, gets answered with "UE already re-attached"
+         * and is dropped, while the SGW can no longer forward it. The
+         * packet is stranded in the SGW-U buffer and (before the companion
+         * lib/pfcp fix) silenced every further Downlink Data Report for
+         * that FAR, leaving the UE permanently unpageable.
+         *
+         * The UE is in fact on its way to ECM-IDLE, so the right answer is
+         * to page it once the release finishes. Rather than issuing a
+         * second UE Context Release Command - the Error-Indication branch
+         * below can do that because no release is in flight there, but one
+         * has already been sent here - convert the pending release action:
+         * s1ap_handle_ue_context_release_action()'s S1_PAGING case does
+         * enb_ue_remove() + enb_ue_unlink() + s1ap_send_paging(), which is
+         * exactly the deferred action needed. If the eNB never answers,
+         * the t_s1_holding guard timer runs the same action.
+         *
+         * Only the idle-bound releases are converted. Handover actions must
+         * not be, since the UE stays reachable on the target/source eNB,
+         * and UE_CONTEXT_REMOVE is a detach, not a transition to idle.
+         */
+        if (releasing_enb_ue &&
+                (releasing_enb_ue->ue_ctx_rel_action ==
+                     S1AP_UE_CTX_REL_S1_REMOVE_AND_UNLINK ||
+                 releasing_enb_ue->ue_ctx_rel_action ==
+                     S1AP_UE_CTX_REL_S1_CONTEXT_REMOVE ||
+                 releasing_enb_ue->ue_ctx_rel_action ==
+                     S1AP_UE_CTX_REL_S1_PAGING)) {
+            ogs_warn("[%s] DDN during S1 release [action:%d EBI:%d] - "
+                    "deferring paging until release completes",
+                    mme_ue->imsi_bcd,
+                    (int)releasing_enb_ue->ue_ctx_rel_action,
+                    bearer->ebi);
+
+            /*
+             * Storing the paging info hands the Ack to mme_send_after_paging(),
+             * which sends it once paging resolves - REQUEST_ACCEPTED when the
+             * UE answers, UNABLE_TO_PAGE_UE when it does not. Do NOT also
+             * acknowledge here.
+             *
+             * The Error-Indication branch below does acknowledge immediately,
+             * but only because it calls MME_CLEAR_PAGING_INFO() first: it
+             * answers INSTEAD of paging. Doing both leaves the DDN transaction
+             * at step 2, so the Ack from mme_send_after_paging() fails
+             * ogs_gtp_xact_update_tx()'s "step must be 1" rule for a remote
+             * originator (lib/gtp/xact.c:398-409) and trips the ogs_assert()
+             * around it - an MME abort on the first UE that answers paging.
+             *
+             * The cost is that the SGW may retransmit the DDN while the
+             * release finishes. That window is short (67 ms when this was
+             * observed) and it is exactly what the ECM-IDLE paging path a few
+             * lines above already accepts.
+             */
+            MME_STORE_PAGING_INFO(mme_ue,
+                    MME_PAGING_TYPE_DOWNLINK_DATA_NOTIFICATION, bearer->id);
+
+            releasing_enb_ue->ue_ctx_rel_action = S1AP_UE_CTX_REL_S1_PAGING;
+            return;
+        }
+
         MME_CLEAR_PAGING_INFO(mme_ue);
         ogs_assert(OGS_OK ==
             mme_gtp_send_downlink_data_notification_ack(

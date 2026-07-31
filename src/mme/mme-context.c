@@ -25,6 +25,7 @@
 #include "mme-event.h"
 #include "mme-timer.h"
 #include "mme-sm.h"
+#include "metrics.h"
 #include "nas-path.h"
 #include "s1ap-path.h"
 #include "s1ap-handler.h"
@@ -66,6 +67,8 @@ static void stats_add_enb_ue(void);
 static void stats_remove_enb_ue(void);
 static void stats_add_mme_session(void);
 static void stats_remove_mme_session(void);
+
+static uint8_t *mme_ebi_pool_reserve(mme_ue_t *mme_ue, uint8_t ebi);
 
 static bool compare_ue_info(mme_sgw_t *node, enb_ue_t *enb_ue);
 static mme_sgw_t *selected_sgw_node(mme_sgw_t *current, enb_ue_t *enb_ue);
@@ -4080,7 +4083,22 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd)
                     if (old_bearer->ebi_node)
                         ogs_pool_free(
                                 &old_mme_ue->ebi_pool, old_bearer->ebi_node);
-                    old_bearer->ebi_node = NULL;
+
+                    /*
+                     * The bearer keeps its EBI across the move, so claim that
+                     * EBI in the NEW UE's pool as well. Returning the node to
+                     * the old pool without taking one from the new pool left
+                     * the new pool reporting every ID free while inherited
+                     * bearers were using some of them - the next
+                     * mme_bearer_add() on this UE would then hand out an EBI
+                     * that is already in use.
+                     */
+                    old_bearer->ebi_node =
+                        mme_ebi_pool_reserve(mme_ue, old_bearer->ebi);
+                    if (!old_bearer->ebi_node)
+                        ogs_error("Cannot reserve inherited EBI[%d] "
+                                "[IMSI:%s] - out of range or already taken",
+                                old_bearer->ebi, mme_ue->imsi_bcd);
                 }
                 old_sess->mme_ue_id = mme_ue->id;
             }
@@ -4445,7 +4463,10 @@ mme_sess_t *mme_sess_add(mme_ue_t *mme_ue, uint8_t pti)
     ogs_assert(pti != OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED);
 
     ogs_pool_id_calloc(&mme_sess_pool, &sess);
-    ogs_assert(sess);
+    if (!sess) {
+        ogs_error("mme_sess_pool() exhausted [IMSI:%s]", mme_ue->imsi_bcd);
+        return NULL;
+    }
 
     ogs_list_init(&sess->bearer_list);
 
@@ -4454,7 +4475,13 @@ mme_sess_t *mme_sess_add(mme_ue_t *mme_ue, uint8_t pti)
 
     bearer = mme_bearer_add(sess);
     if (!bearer) {
-        ogs_error("[%s] mme_bearer_add() failed", mme_ue->imsi_bcd);
+        /*
+         * A session without its default bearer is not usable, so undo the
+         * allocation. Nothing else needs unwinding: sess is not on
+         * mme_ue->sess_list and stats_add_mme_session() has not run yet -
+         * both happen below.
+         */
+        ogs_error("mme_bearer_add() failed [IMSI:%s]", mme_ue->imsi_bcd);
         ogs_pool_id_free(&mme_sess_pool, sess);
         return NULL;
     }
@@ -4590,17 +4617,29 @@ mme_bearer_t *mme_bearer_add(mme_sess_t *sess)
     ogs_assert(mme_ue);
 
     ogs_pool_id_calloc(&mme_bearer_pool, &bearer);
-    ogs_assert(bearer);
+    if (!bearer) {
+        ogs_error("mme_bearer_pool() exhausted [IMSI:%s]", mme_ue->imsi_bcd);
+        return NULL;
+    }
 
     ogs_list_init(&bearer->update.xact_list);
 
+    /*
+     * The per-UE EBI pool holds MIN_EPS_BEARER_ID..MAX_EPS_BEARER_ID, which is
+     * fewer identities than OGS_MAX_NUM_OF_SESS * OGS_MAX_NUM_OF_BEARER
+     * bearers can ask for, so exhaustion is reachable by configuration alone.
+     * ogs_pool_alloc() only yields NULL for it, and every caller of this
+     * function handles NULL, so report and refuse instead of aborting.
+     */
     ogs_pool_alloc(&mme_ue->ebi_pool, &bearer->ebi_node);
     if (!bearer->ebi_node) {
-        ogs_error("[%s] EPS Bearer ID pool exhausted "
-                "(max %d bearers per UE, EBI %d-%d)",
-                mme_ue->imsi_bcd,
-                MAX_EPS_BEARER_ID-MIN_EPS_BEARER_ID+1,
-                MIN_EPS_BEARER_ID, MAX_EPS_BEARER_ID);
+        ogs_error("No free EPS Bearer ID [%d-%d] left [IMSI:%s]",
+                MIN_EPS_BEARER_ID, MAX_EPS_BEARER_ID, mme_ue->imsi_bcd);
+        /*
+         * Only the pool entry and the list head above exist at this point -
+         * the timers, the FSM and the insertion into sess->bearer_list are
+         * all below - so returning the pool entry is the whole rollback.
+         */
         ogs_pool_id_free(&mme_bearer_pool, bearer);
         return NULL;
     }
@@ -4741,6 +4780,12 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
 
     mme_bearer_t *bearer = NULL;
     mme_sess_t *sess = NULL;
+    /* PR6-B HO-type rescue marks the old same-APN session deletion_in_progress
+     * and clears the local `sess` to fall through to fresh-session creation.
+     * Remember that just-rescued session so the June "delete in progress"
+     * guard below (D) does NOT drop the intended HANDOVER create.
+     * (Regression found by codex on the wlan-handover x gx-rar merge.) */
+    mme_sess_t *rescued_sess = NULL;
     mme_ue_t *sess_mme_ue = NULL;
     enb_ue_t *enb_ue = NULL;
 
@@ -4896,7 +4941,22 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
                                 esm_state_inactive) &&
                             MME_HAVE_SGW_S1U_PATH(sess) &&
                             !sess->deletion_in_progress &&
-                            sgw_ue) {
+                            sgw_ue &&
+                            /* R1: if the PR6-B HO-type rescue (B) can fire for
+                             * this request (HANDOVER + ims + S11 TEID present),
+                             * defer to it. (B) routes teardown through
+                             * SEND_DEACTIVATE_BEARER_CONTEXT_REQUEST (E-RAB
+                             * Release to the eNB), whereas (A)'s NO_ACTION
+                             * leaves eNB E-RAB state — a stuck+HANDOVER re-
+                             * request would otherwise take (A) first and risk
+                             * an eNB zombie bearer. When (B) cannot fire
+                             * (no S11 TEID), (A) still catches it, avoiding a
+                             * regression back to the cause#55 loop. */
+                            !(pdn_connectivity_request->request_type.value ==
+                                    OGS_NAS_EPS_REQUEST_TYPE_HANDOVER &&
+                              ogs_strcasecmp(pdn_connectivity_request->
+                                    access_point_name.apn, "ims") == 0 &&
+                              sgw_ue->sgw_s11_teid != 0)) {
                         enb_ue_t *enb_ue =
                             enb_ue_find_by_id(mme_ue->enb_ue_id);
                         ogs_warn("[%s] releasing stuck PDN [%s] (EBI[%d]) on UE "
@@ -4917,17 +4977,136 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
                     }
                 }
 
-                sess->pti = pti;
+                /* Phase 4 PR6-B (Step 4-9 B):
+                 * TS 24.301 6.5.1.6(a) item (2) HO-type rescue.
+                 *
+                 * If the UE retries VoLTE attach for the IMS APN while
+                 * the SMF Hold Timer (Phase 4 PR3b) is still running
+                 * for the previous HO direction, the MME may still see
+                 * the previous session as active because no Delete
+                 * Session Request has been issued from this MME. Per
+                 * TS 24.301 6.5.1.6(a)(2), the MME may deactivate the
+                 * existing PDN connection and proceed with the new
+                 * request instead of rejecting it. Without this rescue
+                 * the UE would be stuck until the local Hold Timer
+                 * expires (~10s).
+                 *
+                 * Strict guards keep the blast radius narrow:
+                 *   1) request_type == HANDOVER (UE explicitly retries)
+                 *   2) APN == "ims" (IMS PDN only)
+                 *   3) the SGW S11 control-plane TEID is present
+                 *      (the only thing we actually need to send a
+                 *      Delete Session Request — S1U path is
+                 *      data-plane only and gets cleared when the UE
+                 *      goes ECM-IDLE between the VoWiFi attach and
+                 *      the HANDOVER retry, which previously caused
+                 *      this rescue to mis-fire and the legacy
+                 *      "APN duplicated" reject to drop the call).
+                 */
+                if (pdn_connectivity_request->request_type.value ==
+                        OGS_NAS_EPS_REQUEST_TYPE_HANDOVER &&
+                    ogs_strcasecmp(
+                        pdn_connectivity_request->
+                            access_point_name.apn,
+                        "ims") == 0) {
 
-                r = nas_eps_send_pdn_connectivity_reject(
-                        sess,
-                        OGS_NAS_ESM_CAUSE_MULTIPLE_PDN_CONNECTIONS_FOR_A_GIVEN_APN_NOT_ALLOWED,
-                        create_action);
-                ogs_expect(r == OGS_OK);
-                ogs_assert(r != OGS_ERROR);
-                ogs_warn("APN duplicated [%s]",
-                    pdn_connectivity_request->access_point_name.apn);
-                return NULL;
+                    sgw_ue_t *sgw_ue =
+                        sgw_ue_find_by_id(mme_ue->sgw_ue_id);
+
+                    /* Phase 4.1 hotfix (concern #6): guard against
+                     * multi-retry. If the UE retries the HANDOVER PDN
+                     * Connectivity Request a second (or N-th) time
+                     * before the previous PR6-B teardown has finished,
+                     * mme_sess_find_by_apn() may still return a sess
+                     * whose teardown is already in flight
+                     * (deletion_in_progress == true). Re-entering the
+                     * rescue path would issue a second Delete Session
+                     * Request for the same sess and risk a double-free
+                     * race on stale xact ids. Skip the rescue in that
+                     * window and let the legacy reject path take
+                     * over — the UE is expected to wait for the
+                     * deactivation cascade to finish before retrying. */
+                    if (sgw_ue && sgw_ue->sgw_s11_teid != 0 &&
+                            !sess->deletion_in_progress) {
+                        ogs_warn("[PR6-B] HO-type rescue: deactivate "
+                                "stale APN [%s] and accept new "
+                                "HANDOVER request [IMSI:%s]",
+                                pdn_connectivity_request->
+                                    access_point_name.apn,
+                                mme_ue->imsi_bcd);
+                        mme_metrics_inst_global_inc(
+                                MME_METR_GLOB_CTR_HO_TYPE_RESCUE_FIRED);
+
+                        sess->deletion_in_progress = true;
+                        /* Phase 4 PR6-B v2 (post-crash fix): route the
+                         * teardown through OGS_GTP_DELETE_SEND_
+                         * DEACTIVATE_BEARER_CONTEXT_REQUEST instead of
+                         * OGS_GTP_DELETE_NO_ACTION.
+                         *
+                         * The NO_ACTION variant only cleaned up the
+                         * SGW/PGW side, leaving the previous bearers
+                         * alive on the eNB. When the new HANDOVER
+                         * session subsequently tried to allocate the
+                         * same EBI on the eNB, S1AP returned cause 31
+                         * (multiple-E-RAB-ID-instances) and Phase 4
+                         * Step 4-5 negative-CBResp handling crashed
+                         * the MME on a stale create.xact_id assert.
+                         *
+                         * SEND_DEACTIVATE_BEARER_CONTEXT_REQUEST routes
+                         * the deletion through Phase 4 Step 4-8's
+                         * nas_eps_send_deactivate_pdn_with_dedicated()
+                         * wrapper after DSResp, which emits a single
+                         * S1AP E-RAB Release Command listing every
+                         * active EBI (default + dedicated) plus a NAS
+                         * Deactivate request to the UE. eNB and UE
+                         * states are wiped in lockstep with the SGW
+                         * cleanup, so the new HANDOVER session lands
+                         * on a clean slate (TS 24.301 §6.5.1.6(a)(2)
+                         * existing-PDN deactivation + §6.4.4.3 default
+                         * deactivation cascading to dedicated). */
+                        mme_gtp_send_delete_session_request(
+                                enb_ue, sgw_ue, sess,
+                            OGS_GTP_DELETE_SEND_DEACTIVATE_BEARER_CONTEXT_REQUEST);
+
+                        /* Clear sess so the code below falls through
+                         * to mme_sess_add() and creates a fresh
+                         * session for the new HANDOVER request.
+                         * Remember it so the (D) delete-in-progress guard
+                         * does not drop this intended create. */
+                        rescued_sess = sess;
+                        sess = NULL;
+                    } else if (sgw_ue && sgw_ue->sgw_s11_teid != 0 &&
+                            sess->deletion_in_progress) {
+                        /* Phase 4.1 hotfix (concern #6): rescue skip
+                         * observability. Fall through to the legacy
+                         * "APN duplicated" reject path below so the UE
+                         * waits and retries after the in-flight
+                         * teardown completes. */
+                        ogs_warn("[PR6-B] skip rescue: sess already in "
+                                "deletion_in_progress [IMSI:%s APN:%s] "
+                                "- fall through to reject",
+                                mme_ue->imsi_bcd,
+                                pdn_connectivity_request->
+                                    access_point_name.apn);
+                        mme_metrics_inst_global_inc(
+                                MME_METR_GLOB_CTR_HO_TYPE_RESCUE_SKIPPED);
+                    }
+                }
+
+                if (sess) {
+                    sess->pti = pti;
+
+                    r = nas_eps_send_pdn_connectivity_reject(
+                            sess,
+                            OGS_NAS_ESM_CAUSE_MULTIPLE_PDN_CONNECTIONS_FOR_A_GIVEN_APN_NOT_ALLOWED,
+                            create_action);
+                    ogs_expect(r == OGS_OK);
+                    ogs_assert(r != OGS_ERROR);
+                    ogs_warn("APN duplicated [%s]",
+                        pdn_connectivity_request->
+                            access_point_name.apn);
+                    return NULL;
+                }
             }
 
             /*
@@ -4939,21 +5118,49 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
              * Session is still in flight (S11 TEID race).
              */
             if (create_action != OGS_GTP_CREATE_IN_ATTACH_REQUEST) {
-                mme_sess_t *it = NULL;
+                mme_sess_t *it = NULL, *orphan = NULL;
                 ogs_list_for_each(&mme_ue->sess_list, it) {
+                    /* Do not drop the session PR6-B just rescued: it was
+                     * deliberately marked deletion_in_progress so the UE's
+                     * HANDOVER request creates a fresh replacement now. */
+                    if (it == rescued_sess)
+                        continue;
                     if (it->session && it->session->name &&
                             it->deletion_in_progress &&
                             ogs_strcasecmp(it->session->name,
                                 pdn_connectivity_request->
                                     access_point_name.apn) == 0) {
-                        ogs_warn("[%s] APN [%s] delete in progress; "
-                                "drop re-request (UE will retransmit)",
+                        /* Layer A (IMS PDN wedge fix): only drop while the
+                         * Delete Session is TRULY still in flight, i.e. its
+                         * GTP transaction still exists AND still owns this
+                         * session (delete_action set, data == this sess id;
+                         * guards against xact-id reuse). Otherwise the delete
+                         * failed / never completed and the session is
+                         * orphaned; remove it (outside the loop) and fall
+                         * through to create a fresh session, instead of
+                         * dropping the UE's re-request forever. */
+                        ogs_gtp_xact_t *dx = it->delete_xact_id ?
+                            ogs_gtp_xact_find_by_id(it->delete_xact_id) : NULL;
+                        if (dx && dx->delete_action &&
+                                OGS_POINTER_TO_UINT(dx->data) == it->id) {
+                            ogs_warn("[%s] APN [%s] delete in progress; "
+                                    "drop re-request (UE will retransmit)",
+                                    mme_ue->imsi_bcd,
+                                    pdn_connectivity_request->
+                                        access_point_name.apn);
+                            return NULL;
+                        }
+                        ogs_warn("[%s] APN [%s] stale/orphaned delete; "
+                                "clearing and recreating",
                                 mme_ue->imsi_bcd,
                                 pdn_connectivity_request->
                                     access_point_name.apn);
-                        return NULL;
+                        orphan = it;
+                        break;
                     }
                 }
+                if (orphan)
+                    mme_sess_remove(orphan);
             }
         } else {
             sess = mme_sess_first(mme_ue);
@@ -4973,12 +5180,13 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
         if (!sess) {
             sess = mme_sess_add(mme_ue, pti);
             if (!sess) {
-                ogs_error("[%s] mme_sess_add() failed", mme_ue->imsi_bcd);
-                r = nas_eps_send_attach_reject(enb_ue, mme_ue,
-                        OGS_NAS_EMM_CAUSE_CONGESTION,
-                        OGS_NAS_ESM_CAUSE_INSUFFICIENT_RESOURCES);
-                ogs_expect(r == OGS_OK);
-                ogs_assert(r != OGS_ERROR);
+                /*
+                 * Out of sessions, bearers or EPS Bearer Identities. The
+                 * caller in mme-sm.c already drops the NAS message on NULL,
+                 * which is how every other failure in this function ends.
+                 */
+                ogs_error("mme_sess_add() failed [IMSI:%s PTI:%d]",
+                        mme_ue->imsi_bcd, pti);
                 return NULL;
             }
 
@@ -5020,9 +5228,16 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
 
     bearer = mme_default_bearer_in_sess(sess);
     if (!bearer) {
+        /*
+         * A session with no default bearer is corrupt local state, not a
+         * protocol error, so there is nothing to tell the UE. Returning NULL
+         * joins the four other failure exits of this function: mme-sm.c drops
+         * the NAS message and the UE retries the procedure. Aborting here
+         * would take every other UE down over one bad context.
+         */
         ogs_error("No Bearer(%d) : ESM message type:%d, PTI:%d, EBI:%d",
                 mme_sess_count(mme_ue), message->esm.h.message_type, pti, ebi);
-        ogs_assert_if_reached();
+        return NULL;
     }
 
     return bearer;
@@ -5261,6 +5476,45 @@ void mme_ebi_pool_init(mme_ue_t *mme_ue)
     }
 }
 
+/*
+ * Take one specific EPS Bearer ID out of the UE's pool.
+ *
+ * ogs_pool has no "allocate this one" primitive, so find the value in the
+ * free ring, swap it to the head and pop it the normal way - that keeps
+ * avail, head and index[] consistent with ogs_pool_alloc()/ogs_pool_free().
+ *
+ * Returns NULL when the ID is outside MIN..MAX_EPS_BEARER_ID or is already
+ * taken. Callers treat that as "this EBI is not tracked" rather than a fatal
+ * condition, since mme_bearer_remove() already tolerates a NULL ebi_node.
+ */
+static uint8_t *mme_ebi_pool_reserve(mme_ue_t *mme_ue, uint8_t ebi)
+{
+    uint8_t *node = NULL;
+    int i;
+
+    ogs_assert(mme_ue);
+
+    if (ebi < MIN_EPS_BEARER_ID || ebi > MAX_EPS_BEARER_ID)
+        return NULL;
+
+    for (i = 0; i < mme_ue->ebi_pool.avail; i++) {
+        int pos = (mme_ue->ebi_pool.head + i) % mme_ue->ebi_pool.size;
+        uint8_t *found = mme_ue->ebi_pool.free[pos];
+
+        if (!found || *found != ebi)
+            continue;
+
+        mme_ue->ebi_pool.free[pos] =
+            mme_ue->ebi_pool.free[mme_ue->ebi_pool.head];
+        mme_ue->ebi_pool.free[mme_ue->ebi_pool.head] = found;
+
+        ogs_pool_alloc(&mme_ue->ebi_pool, &node);
+        return node;
+    }
+
+    return NULL;
+}
+
 void mme_ebi_pool_final(mme_ue_t *mme_ue)
 {
     ogs_assert(mme_ue);
@@ -5270,13 +5524,42 @@ void mme_ebi_pool_final(mme_ue_t *mme_ue)
 
 void mme_ebi_pool_clear(mme_ue_t *mme_ue)
 {
+    mme_sess_t *sess = NULL;
+    mme_bearer_t *bearer = NULL;
+
     ogs_assert(mme_ue);
+
+    /*
+     * This is reached from emm_handle_attach_request() while the UE may still
+     * have sessions, and it frees the pool's backing array. Every ebi_node
+     * points into that array, so drop the references before they dangle:
+     * ogs_pool_free() derives its index from (node - pool->array), and a node
+     * from the freed array would make that index arbitrary and write outside
+     * index[].
+     */
+    ogs_list_for_each(&mme_ue->sess_list, sess)
+        ogs_list_for_each(&sess->bearer_list, bearer)
+            bearer->ebi_node = NULL;
 
     /* Suppress log message (mme_ue->ebi_pool.avail != mme_ue->ebi_pool.size) */
     mme_ue->ebi_pool.avail = mme_ue->ebi_pool.size;
 
     mme_ebi_pool_final(mme_ue);
     mme_ebi_pool_init(mme_ue);
+
+    /*
+     * Bearers that survived keep their EBI, so take those IDs back out of the
+     * fresh pool - otherwise it would report them free and the next
+     * mme_bearer_add() would hand out a duplicate.
+     */
+    ogs_list_for_each(&mme_ue->sess_list, sess)
+        ogs_list_for_each(&sess->bearer_list, bearer) {
+            bearer->ebi_node = mme_ebi_pool_reserve(mme_ue, bearer->ebi);
+            if (!bearer->ebi_node)
+                ogs_error("Cannot re-reserve EBI[%d] [IMSI:%s] - "
+                        "out of range or already taken",
+                        bearer->ebi, mme_ue->imsi_bcd);
+        }
 }
 
 uint8_t mme_selected_int_algorithm(mme_ue_t *mme_ue)

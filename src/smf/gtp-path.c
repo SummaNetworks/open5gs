@@ -506,6 +506,40 @@ int smf_gtp2_send_create_session_response(
     return rv;
 }
 
+int smf_gtp2_send_create_session_response_with_cause(
+        smf_sess_t *sess, ogs_gtp_xact_t *xact, uint8_t cause_value)
+{
+    int rv;
+    ogs_gtp2_header_t h;
+    ogs_pkbuf_t *pkbuf = NULL;
+
+    ogs_assert(sess);
+    ogs_assert(xact);
+
+    memset(&h, 0, sizeof(ogs_gtp2_header_t));
+    h.type = OGS_GTP2_CREATE_SESSION_RESPONSE_TYPE;
+    h.teid = sess->sgw_s5c_teid;
+
+    pkbuf = smf_s5c_build_create_session_response_with_cause(
+            h.type, sess, cause_value);
+    if (!pkbuf) {
+        ogs_error("smf_s5c_build_create_session_response_with_cause() "
+                "failed");
+        return OGS_ERROR;
+    }
+
+    rv = ogs_gtp_xact_update_tx(xact, &h, pkbuf);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_gtp_xact_update_tx() failed");
+        return OGS_ERROR;
+    }
+
+    rv = ogs_gtp_xact_commit(xact);
+    ogs_expect(rv == OGS_OK);
+
+    return rv;
+}
+
 int smf_gtp2_send_modify_bearer_response(
         smf_sess_t *sess, ogs_gtp_xact_t *xact,
         ogs_gtp2_modify_bearer_request_t *req, bool sgw_relocation)

@@ -1029,7 +1029,16 @@ void smf_epc_n4_handle_session_modification_response(
             ogs_expect(rv == OGS_OK);
 
         } else {
-            if (flags & OGS_PFCP_MODIFY_SESSION) {
+            if (flags & OGS_PFCP_MODIFY_HANDOVER) {
+        /*
+         * VoLTE/VoWiFi Handover deactivation:
+         * DL DROP only, do NOT send Delete Bearer Request.
+         * Old session will be released later by Hold Timer (Phase 2)
+         * or by MME-initiated Delete Session.
+         */
+                ogs_info("HO deactivation completed - "
+                        "skip Delete Bearer Request");
+            } else if (flags & OGS_PFCP_MODIFY_SESSION) {
         /*
          * 1. SMF sends Delete Bearer Request(DEFAULT BEARER) to SGW/MME.
          * 2. MME sends Delete Bearer Response to SGW/SMF.

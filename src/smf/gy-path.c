@@ -19,6 +19,27 @@
  */
 
 #include "fd-path.h"
+#include "metrics.h"
+
+/* KPI helper: map Gy CC-Request-Type and result_code to a Diameter
+ * lifecycle event label. Mirrors the helper in gx-path.c but stays
+ * local so each TU can keep its own enum constants. */
+static inline const char *smf_gy_event_label(
+        uint32_t cc_request_type, uint32_t result_code)
+{
+    if (result_code != ER_DIAMETER_SUCCESS)
+        return "error";
+    switch (cc_request_type) {
+    case OGS_DIAM_GY_CC_REQUEST_TYPE_INITIAL_REQUEST:
+        return "init";
+    case OGS_DIAM_GY_CC_REQUEST_TYPE_UPDATE_REQUEST:
+        return "update";
+    case OGS_DIAM_GY_CC_REQUEST_TYPE_TERMINATION_REQUEST:
+        return "term";
+    default:
+        return "other";
+    }
+}
 
 static struct session_handler *smf_gy_reg = NULL;
 static struct disp_hdl *hdl_gy_fb = NULL;
@@ -1007,9 +1028,27 @@ static void smf_gy_cca_cb(void *data, struct msg **msg)
     ogs_assert(ret == 0);
     if (!sess_data) {
         ogs_error("No Session Data");
+        fd_msg_free(*msg);
+        *msg = NULL;
         return;
     }
-    ogs_assert((void *)sess_data == data);
+    if ((void *)sess_data != data) {
+        /*
+         * The state this request was sent with is no longer the one attached
+         * to the Session-Id. The answer belongs to the old request, so put
+         * the current state back and drop it rather than acting on the wrong
+         * transaction. `data` is only compared, never dereferenced: it may
+         * already have been returned to the pool.
+         */
+        ogs_warn("Gy answer for a stale sess_state - dropping [%s]",
+                sess_data->gy_sid ? (char *)sess_data->gy_sid : "(null)");
+        ret = fd_sess_state_store(smf_gy_reg, session, &sess_data);
+        if (ret != 0 && sess_data)
+            state_cleanup(sess_data, NULL, NULL);
+        fd_msg_free(*msg);
+        *msg = NULL;
+        return;
+    }
 
     ogs_debug("    Retrieve its data: [%s]", sess_data->gy_sid);
 
@@ -1024,8 +1063,19 @@ static void smf_gy_cca_cb(void *data, struct msg **msg)
         ogs_assert(ret == 0);
     }
     if (!avp) {
-        ogs_error("no_CC-Request-Number");
-        ogs_assert_if_reached();
+        /*
+         * Nothing identifies which request this answers, so it cannot be
+         * attributed - reporting it against the latest request could fail a
+         * CCR that is still in flight. Put the state back and drop it.
+         */
+        ogs_error("no_CC-Request-Number - dropping the Gy answer [%s]",
+                sess_data->gy_sid ? (char *)sess_data->gy_sid : "(null)");
+        ret = fd_sess_state_store(smf_gy_reg, session, &sess_data);
+        if (ret != 0 && sess_data)
+            state_cleanup(sess_data, NULL, NULL);
+        fd_msg_free(*msg);
+        *msg = NULL;
+        return;
     }
     ret = fd_msg_avp_hdr(avp, &hdr);
     ogs_assert(ret == 0);
@@ -1034,9 +1084,33 @@ static void smf_gy_cca_cb(void *data, struct msg **msg)
 
     ogs_debug("    CC-Request-Number[%d]", cc_request_number);
 
-    ogs_assert(sess_data->xact_data[req_slot].cc_req_no == cc_request_number);
+    if (sess_data->xact_data[req_slot].cc_req_no != cc_request_number) {
+        ogs_error("Gy answer for CC-Request-Number[%d] does not match the "
+                "recorded request[%d] - dropping",
+                cc_request_number, sess_data->xact_data[req_slot].cc_req_no);
+        ret = fd_sess_state_store(smf_gy_reg, session, &sess_data);
+        if (ret != 0 && sess_data)
+            state_cleanup(sess_data, NULL, NULL);
+        fd_msg_free(*msg);
+        *msg = NULL;
+        return;
+    }
+
     sess = smf_sess_find_by_id(sess_data->sess_id);
-    ogs_assert(sess);
+    if (!sess) {
+        /*
+         * The session was removed while this request was outstanding - the
+         * TS 29.274 7.2.1 collision path does exactly that. Release the state
+         * rather than re-attaching it to a Session-Id nobody owns.
+         */
+        ogs_warn("Gy Session-Id [%s] no longer has a session - releasing "
+                "state", sess_data->gy_sid ?
+                    (char *)sess_data->gy_sid : "(null)");
+        state_cleanup(sess_data, NULL, NULL);
+        fd_msg_free(*msg);
+        *msg = NULL;
+        return;
+    }
 
     gy_message = ogs_calloc(1, sizeof(ogs_diam_gy_message_t));
     ogs_assert(gy_message);
@@ -1120,6 +1194,12 @@ static void smf_gy_cca_cb(void *data, struct msg **msg)
     ret = fd_msg_avp_hdr(avp, &hdr);
     ogs_assert(ret == 0);
     gy_message->cc_request_type = hdr->avp_value->i32;
+
+    /* KPI: Gy CCA lifecycle. */
+    smf_metrics_inst_by_app_event_inc("gy",
+            smf_gy_event_label(gy_message->cc_request_type,
+                    gy_message->result_code),
+            SMF_METR_BY_APP_EVENT_CTR_DIAMETER_LIFECYCLE);
 
     if (gy_message->result_code != ER_DIAMETER_SUCCESS) {
         ogs_warn("ERROR DIAMETER Result Code(%d)", gy_message->result_code);

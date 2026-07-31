@@ -463,6 +463,8 @@ void ogs_pfcp_send_buffered_packet(ogs_pfcp_pdr_t *pdr)
                         pdr, &sendhdr, far->buffered_packet[i]);
             }
             far->num_of_buffered_packet = 0;
+            /* The buffering episode is over: let the next one report. */
+            far->dl_data_report_sent = false;
         }
     }
 }

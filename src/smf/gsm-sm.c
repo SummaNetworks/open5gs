@@ -37,8 +37,68 @@
 #include "fd-path.h"
 
 static uint8_t gtp_cause_from_diameter(uint8_t gtp_version,
-        const uint32_t dia_err, const uint32_t *dia_exp_err)
+        const uint32_t dia_err, const uint32_t dia_exp_err,
+        const uint32_t dia_exp_vendor_id,
+        bool from_s6b)
 {
+    /* Phase 4 PR8 (Step 4-7): S6b-specific Diameter → GTP-C v2 Cause
+     * mapping (TS 29.273 §9.1.2.1.4 + TS 29.274 §8.4). Applied only
+     * when the failure originated from the S6b AAA/STA path so
+     * Gx/Gy/Gn callers retain their historic behavior below.
+     *
+     * 3GPP Experimental-Result-Code (vendor 10415) takes precedence
+     * when present so that the value 5001 — IETF AVP_UNSUPPORTED vs
+     * 3GPP USER_UNKNOWN — cannot be misinterpreted.
+     *
+     * Phase 4.2b #3: RFC 6733 §7.6 defines Experimental-Result as the
+     * tuple (Experimental-Result-Code, Vendor-Id). Only honor the
+     * 3GPP code mapping when Vendor-Id == OGS_3GPP_VENDOR_ID (10415);
+     * fall through to the IETF Result-Code branch otherwise so a
+     * non-3GPP vendor cannot accidentally hit 5001/5450/5451 mappings.
+     */
+    if (from_s6b && gtp_version == 2) {
+        if (dia_exp_err && dia_exp_vendor_id == OGS_3GPP_VENDOR_ID) {
+            switch (dia_exp_err) {
+            case OGS_DIAM_S6B_ERROR_USER_UNKNOWN:   /* 5001 */
+                return OGS_GTP2_CAUSE_USER_AUTHENTICATION_FAILED;
+            case OGS_DIAM_S6B_ERROR_USER_NO_APN_SUBSCRIPTION:   /* 5450 */
+                return
+                OGS_GTP2_CAUSE_APN_ACCESS_DENIED_NO_SUBSCRIPTION;
+            case OGS_DIAM_S6B_ERROR_RAT_TYPE_NOT_ALLOWED:   /* 5451 */
+                /* 5451 is "RAT type not allowed", semantically closer
+                 * to "service denied" than to "no APN subscription".
+                 */
+                return OGS_GTP2_CAUSE_SERVICE_DENIED;
+            default:
+                ogs_warn("[PR8] S6b Experimental-Result-Code=%u "
+                        "(unmapped) → UE_NOT_AUTHORISED_BY_OCS (125)",
+                        dia_exp_err);
+                return
+            OGS_GTP2_CAUSE_UE_NOT_AUTHORISED_BY_OCS_OR_EXTERNAL_AAA_SERVER;
+            }
+        }
+
+        switch (dia_err) {
+        case OGS_DIAM_AUTHORIZATION_REJECTED:   /* 5003 (IETF) */
+            return
+            OGS_GTP2_CAUSE_UE_NOT_AUTHORISED_BY_OCS_OR_EXTERNAL_AAA_SERVER;
+        case ER_DIAMETER_UNABLE_TO_DELIVER:     /* 3002 */
+        case ER_DIAMETER_TOO_BUSY:              /* 3004 */
+        case ER_DIAMETER_LOOP_DETECTED:         /* 3005 */
+            /* Transport-class failures only. Surface them as
+             * REMOTE_PEER_NOT_RESPONDING so the ePDG (and UE) can
+             * back off and retry. */
+            ogs_warn("[PR8] S6b transport failure IETF Result-Code=%u "
+                    "→ REMOTE_PEER_NOT_RESPONDING (100)", dia_err);
+            return OGS_GTP2_CAUSE_REMOTE_PEER_NOT_RESPONDING;
+        default:
+            ogs_warn("[PR8] S6b IETF Result-Code=%u (unmapped) → "
+                    "UE_NOT_AUTHORISED_BY_OCS (125)", dia_err);
+            return
+            OGS_GTP2_CAUSE_UE_NOT_AUTHORISED_BY_OCS_OR_EXTERNAL_AAA_SERVER;
+        }
+    }
+
     switch (gtp_version) {
     case 1:
         switch (dia_err) {
@@ -54,9 +114,8 @@ static uint8_t gtp_cause_from_diameter(uint8_t gtp_version,
         break;
     }
 
-    ogs_error("Unexpected Diameter Result Code %d/%d, defaulting to severe "
-              "network failure",
-              dia_err, dia_exp_err ? *dia_exp_err : -1);
+    ogs_error("Unexpected Diameter Result Code %u/%u, defaulting to severe "
+              "network failure", dia_err, dia_exp_err);
     switch (gtp_version) {
     case 1:
         return OGS_GTP1_CAUSE_USER_AUTHENTICATION_FAILED;
@@ -103,10 +162,24 @@ static bool send_ccr_init_req_gx_gy(smf_sess_t *sess, ogs_gtp_xact_t *gtp_xact)
         return false;
     }
 
-    sess->sm_data.gx_ccr_init_in_flight = true;
-    smf_gx_send_ccr(
-            sess, gtp_xact ? gtp_xact->id : OGS_INVALID_POOL_ID,
-            OGS_DIAM_GX_CC_REQUEST_TYPE_INITIAL_REQUEST);
+    if (sess->epc_handover.state == SMF_HO_STATE_TARGET_ACTIVE &&
+        sess->gx_sid) {
+        /* HO: Gx session inherited from old EUTRAN.
+         * Send CCR-U to update RAT type, not CCR-I.
+         * This keeps the same Gx Session-Id so PCRF does not
+         * terminate the associated Rx session (IMS call). */
+        ogs_info("HO: sending Gx CCR-U (inherited session [%s])",
+                sess->gx_sid);
+        sess->sm_data.gx_ccr_init_in_flight = true;
+        smf_gx_send_ccr(
+                sess, gtp_xact ? gtp_xact->id : OGS_INVALID_POOL_ID,
+                OGS_DIAM_GX_CC_REQUEST_TYPE_UPDATE_REQUEST);
+    } else {
+        sess->sm_data.gx_ccr_init_in_flight = true;
+        smf_gx_send_ccr(
+                sess, gtp_xact ? gtp_xact->id : OGS_INVALID_POOL_ID,
+                OGS_DIAM_GX_CC_REQUEST_TYPE_INITIAL_REQUEST);
+    }
 
     if (use_gy == 1) {
         /* Gy is available,
@@ -192,6 +265,8 @@ void smf_gsm_state_initial(ogs_fsm_t *s, smf_event_t *e)
         sess->sm_data.gx_ccr_init_in_flight = false;
         sess->sm_data.gy_ccr_init_in_flight = false;
         sess->sm_data.s6b_aaa_err = ER_DIAMETER_SUCCESS;
+        sess->sm_data.s6b_aaa_exp_err = 0;
+        sess->sm_data.s6b_aaa_exp_vendor_id = 0;
         sess->sm_data.gx_cca_init_err = ER_DIAMETER_SUCCESS;
         sess->sm_data.gy_cca_init_err = ER_DIAMETER_SUCCESS;
         break;
@@ -238,8 +313,15 @@ void smf_gsm_state_initial(ogs_fsm_t *s, smf_event_t *e)
                     OGS_FSM_TRAN(s, smf_gsm_state_wait_epc_auth_initial);
                 break;
             case OGS_GTP2_RAT_TYPE_WLAN:
-                smf_s6b_send_aar(sess, gtp_xact);
+                /*
+                 * Set the flag BEFORE sending, as the Gx senders do. If the
+                 * send fails it reports the failure itself, and on the
+                 * branch where it has no GTP transaction to report on it
+                 * clears this flag synchronously - setting it afterwards
+                 * would put it straight back and wedge the session.
+                 */
                 sess->sm_data.s6b_aar_in_flight = true;
+                smf_s6b_send_aar(sess, gtp_xact);
                 OGS_FSM_TRAN(s, smf_gsm_state_wait_epc_auth_initial);
                 /* Gx/Gy Init Req is done after s6b AAR + AAA */
                 break;
@@ -383,7 +465,16 @@ void smf_gsm_state_wait_epc_auth_initial(ogs_fsm_t *s, smf_event_t *e)
         case OGS_DIAM_S6B_CMD_AUTHENTICATION_AUTHORIZATION:
             sess->sm_data.s6b_aar_in_flight = false;
             sess->sm_data.s6b_aaa_err = s6b_message->result_code;
-            if (s6b_message->result_code == ER_DIAMETER_SUCCESS) {
+            /* Phase 4 PR8: keep IETF and 3GPP Experimental codes
+             * separate so the GTP-C v2 Cause mapper can disambiguate
+             * the value 5001 (IETF AVP_UNSUPPORTED vs 3GPP USER_UNKNOWN).
+             */
+            sess->sm_data.s6b_aaa_exp_err =
+                    s6b_message->experimental_result_code;
+            sess->sm_data.s6b_aaa_exp_vendor_id =
+                    s6b_message->experimental_vendor_id;
+            if (s6b_message->result_code == ER_DIAMETER_SUCCESS &&
+                    !s6b_message->experimental_result_code) {
                 send_ccr_init_req_gx_gy(sess, gtp_xact);
                 return;
             }
@@ -406,6 +497,36 @@ void smf_gsm_state_wait_epc_auth_initial(ogs_fsm_t *s, smf_event_t *e)
                 sess->sm_data.gx_ccr_init_in_flight = false;
                 sess->sm_data.gx_cca_init_err = diam_err;
                 goto test_can_proceed;
+            case OGS_DIAM_GX_CC_REQUEST_TYPE_UPDATE_REQUEST:
+                /* HO: CCA-U response for inherited Gx session.
+                 * Process PCC rules and set up PFCP/PDR/FAR/F-TEID
+                 * same as CCA-I to enable PFCP Establishment. */
+                ogs_info("HO: Gx CCA-U received (Result: %d)",
+                        gx_message->result_code);
+                ogs_assert(gtp_xact);
+                diam_err = smf_gx_handle_cca_initial_request(sess,
+                                gx_message, gtp_xact);
+                sess->sm_data.gx_ccr_init_in_flight = false;
+                sess->sm_data.gx_cca_init_err = diam_err;
+                goto test_can_proceed;
+            case OGS_DIAM_GX_CC_REQUEST_TYPE_TERMINATION_REQUEST:
+                /*
+                 * The failure branch of test_can_proceed() below tears the
+                 * Gx session down but does not transition - it only sends
+                 * the GTP error - so its CCA-T is dispatched here rather
+                 * than to smf_gsm_state_wait_epc_auth_release. Without this
+                 * case it fell through and sess->gx_sid survived a Gx
+                 * session the PCRF had already terminated, so a later CCR
+                 * would reuse it and be answered UNKNOWN_SESSION_ID.
+                 *
+                 * break, not goto test_can_proceed: this state's gate looks
+                 * only at the *_init_in_flight flags, so completing a
+                 * termination gives it nothing new to evaluate.
+                 */
+                smf_gx_handle_cca_termination_request(sess,
+                        gx_message, gtp_xact);
+                sess->sm_data.gx_ccr_term_in_flight = false;
+                break;
             }
             break;
         }
@@ -438,13 +559,41 @@ test_can_proceed:
     if (!sess->sm_data.s6b_aar_in_flight &&
         !sess->sm_data.gx_ccr_init_in_flight &&
         !sess->sm_data.gy_ccr_init_in_flight) {
+        /* Phase 4 PR8 (Step 4-7): track whether the failure that ends
+         * up selected as diam_err originated from the S6b AAA path so
+         * the GTP-C v2 Cause mapping can apply TS 29.273 §9.1.2.1.4
+         * specific values (USER_AUTHENTICATION_FAILED / APN_ACCESS_
+         * DENIED_NO_SUBSCRIPTION / SERVICE_DENIED / REMOTE_PEER_NOT_
+         * RESPONDING / UE_NOT_AUTHORISED_BY_OCS). */
+        bool from_s6b = false;
+        uint32_t exp_err = 0;
+        uint32_t exp_vendor_id = 0; /* Phase 4.2b #3: RFC 6733 §7.6 tuple */
         diam_err = ER_DIAMETER_SUCCESS;
-        if (sess->sm_data.s6b_aaa_err != ER_DIAMETER_SUCCESS)
+        if (sess->sm_data.s6b_aaa_err != ER_DIAMETER_SUCCESS ||
+                sess->sm_data.s6b_aaa_exp_err != 0) {
             diam_err = sess->sm_data.s6b_aaa_err;
-        if (sess->sm_data.gx_cca_init_err != ER_DIAMETER_SUCCESS)
+            exp_err = sess->sm_data.s6b_aaa_exp_err;
+            exp_vendor_id = sess->sm_data.s6b_aaa_exp_vendor_id;
+            from_s6b = true;
+            /* IETF SUCCESS but Experimental-Result indicates a 3GPP
+             * failure (TS 29.230). Surface the Experimental code so
+             * the success-branch test below still triggers the
+             * failure path. */
+            if (diam_err == ER_DIAMETER_SUCCESS)
+                diam_err = exp_err;
+        }
+        if (sess->sm_data.gx_cca_init_err != ER_DIAMETER_SUCCESS) {
             diam_err = sess->sm_data.gx_cca_init_err;
-        if (sess->sm_data.gy_cca_init_err != ER_DIAMETER_SUCCESS)
+            exp_err = 0;
+            exp_vendor_id = 0;
+            from_s6b = false;
+        }
+        if (sess->sm_data.gy_cca_init_err != ER_DIAMETER_SUCCESS) {
             diam_err = sess->sm_data.gy_cca_init_err;
+            exp_err = 0;
+            exp_vendor_id = 0;
+            from_s6b = false;
+        }
 
         if (diam_err == ER_DIAMETER_SUCCESS) {
             OGS_FSM_TRAN(s, smf_gsm_state_wait_pfcp_establishment);
@@ -469,8 +618,20 @@ test_can_proceed:
                     OGS_DIAM_GY_CC_REQUEST_TYPE_TERMINATION_REQUEST);
             }
             uint8_t gtp_cause = gtp_cause_from_diameter(
-                                    gtp_xact->gtp_version, diam_err, NULL);
-            send_gtp_create_err_msg(sess, gtp_xact, gtp_cause);
+                                    gtp_xact->gtp_version, diam_err,
+                                    exp_err, exp_vendor_id, from_s6b);
+            /* Phase 4 PR8: prefer the proper Create Session Response
+             * (Cause IE) over a minimal GTP error message when the
+             * failure came from S6b on GTPv2, so the ePDG sees the
+             * full failure semantics. The local SMF session is not
+             * torn down here — the source EUTRAN session (if any)
+             * remains usable as fallback during VoLTE↔VoWiFi HO. */
+            if (from_s6b && gtp_xact->gtp_version == 2) {
+                smf_gtp2_send_create_session_response_with_cause(
+                        sess, gtp_xact, gtp_cause);
+            } else {
+                send_gtp_create_err_msg(sess, gtp_xact, gtp_cause);
+            }
         }
     }
 }
@@ -720,21 +881,71 @@ void smf_gsm_state_wait_pfcp_establishment(ogs_fsm_t *s, smf_event_t *e)
                     return;
                 }
 
-                if (sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_WLAN) {
+                if (sess->epc_handover.state ==
+                        SMF_HO_STATE_TARGET_ACTIVE &&
+                    sess->epc_handover.peer_sess_id !=
+                        OGS_INVALID_POOL_ID) {
                     /*
-                     * TS23.214
-                     * 6.3.1.7 Procedures with modification of bearer
-                     * p50
-                     * 2.  ...
-                     * For "PGW/MME initiated bearer deactivation procedure",
-                     * PGW-C shall indicate PGW-U to stop counting and stop
-                     * forwarding downlink packets for the affected bearer(s).
+                     * Handover: deactivate the peer (old) session.
+                     * VoLTE→VoWiFi: deactivate old EUTRAN
+                     * VoWiFi→VoLTE: deactivate old WLAN
                      */
-                    int rv = smf_epc_pfcp_send_deactivation(sess,
-                            OGS_GTP2_CAUSE_RAT_CHANGED_FROM_3GPP_TO_NON_3GPP);
+                    int gtp_cause;
+                    if (sess->gtp_rat_type ==
+                            OGS_GTP2_RAT_TYPE_WLAN) {
+                        gtp_cause =
+                            OGS_GTP2_CAUSE_RAT_CHANGED_FROM_3GPP_TO_NON_3GPP;
+                    } else {
+                        gtp_cause =
+                            OGS_GTP2_CAUSE_ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP;
+                    }
+                    int rv = smf_epc_pfcp_send_deactivation(
+                            sess, gtp_cause);
                     if (rv != OGS_OK) {
-                        ogs_error("Failed to send PFCP deactivation - proceeding with session setup");
-                        /* Continue despite the error - don't fail the handover */
+                        ogs_error("Failed to send PFCP deactivation "
+                                "- proceeding with session setup");
+                    }
+
+                    /*
+                     * Arm the source-release hold timer here, on the
+                     * success edge, rather than at HO detection.
+                     *
+                     * The Create Session Response has just been sent, so
+                     * the target is accepted and usable; releasing the
+                     * old access is now a legitimate post-success
+                     * cleanup. Arming it at detection instead made it a
+                     * speculative kill switch that destroyed the source
+                     * whenever the target failed to come up (e.g. a Gx
+                     * CCA-U that never arrives - there is no Gx timeout),
+                     * taking away the fallback the UE needed.
+                     *
+                     * Only for a non-3GPP target (VoLTE->VoWiFi);
+                     * VoWiFi->VoLTE is cleaned up via MBR(HI=1) on
+                     * S5/S8. The Delete Bearer Request the timer
+                     * ultimately sends is still behind the
+                     * `enable_sgw_cleanup` feature flag.
+                     */
+                    if (sess->gtp_rat_type == OGS_GTP2_RAT_TYPE_WLAN) {
+                        smf_sess_t *peer_sess = smf_sess_find_by_id(
+                                sess->epc_handover.peer_sess_id);
+                        if (peer_sess &&
+                                peer_sess->epc_handover.hold_timer) {
+                            ogs_time_t duration;
+                            int sec = smf_self()->
+                                    handover_config.hold_duration_sec;
+                            if (sec <= 0)
+                                sec = 30;
+                            duration = ogs_time_from_sec(sec);
+                            peer_sess->epc_handover.hold_generation++;
+                            ogs_timer_start(
+                                    peer_sess->epc_handover.hold_timer,
+                                    duration);
+                            ogs_info("HO: hold timer armed on peer "
+                                    "(VoLTE side) after CSResp, %ds, "
+                                    "gen=%u", sec,
+                                    peer_sess->epc_handover.
+                                        hold_generation);
+                        }
                     }
                 }
                 smf_bearer_binding(sess);
@@ -1447,9 +1658,36 @@ void smf_gsm_state_wait_pfcp_deletion(ogs_fsm_t *s, smf_event_t *e)
                     send_gtp_delete_err_msg(sess, gtp_xact, gtp_cause);
                     break;
                 }
-                if (send_ccr_termination_req_gx_gy_s6b(
-                            sess, gtp_xact) == true)
+                if (SMF_HO_IS_SOURCE_RELEASE_STATE(sess)) {
+                    /*
+                     * HO: Gx session transferred to new WLAN session.
+                     * Skip CCR-T regardless of how the source-side
+                     * release was triggered:
+                     *   - SOURCE_HOLD      : UE-initiated PDN Disconnect
+                     *   - SOURCE_DBREQ_TX  : Phase 4 PR3b active cleanup
+                     *                       (SMF-initiated Delete Bearer
+                     *                       Request to old SGW)
+                     * In both cases gx_sid is owned by the target side;
+                     * emitting CCR-T here would either tear down the
+                     * new side's Rx/IMS, or allocate a throwaway Gx
+                     * session and send a spurious CCR-T to PCRF.
+                     * Transition to release state for proper FSM cleanup.
+                     */
+                    ogs_info("SOURCE_HOLD/DBREQ_TX: skip Gx/Gy/S6b "
+                            "termination (state=%d, "
+                            "Gx transferred to peer session)",
+                            sess->epc_handover.state);
+                    if (gtp_xact) {
+                        ogs_assert(OGS_OK ==
+                            smf_gtp2_send_delete_session_response(
+                                sess, gtp_xact));
+                    }
+                    OGS_FSM_TRAN(s,
+                        smf_gsm_state_epc_session_will_release);
+                } else if (send_ccr_termination_req_gx_gy_s6b(
+                            sess, gtp_xact) == true) {
                     OGS_FSM_TRAN(s, smf_gsm_state_wait_epc_auth_release);
+                }
                 /* else: free session? */
             } else {
                 int trigger;
@@ -1619,6 +1857,8 @@ void smf_gsm_state_wait_epc_auth_release(ogs_fsm_t *s, smf_event_t *e)
         sess->sm_data.gx_cca_term_err = ER_DIAMETER_SUCCESS;
         sess->sm_data.gy_cca_term_err = ER_DIAMETER_SUCCESS;
         sess->sm_data.s6b_sta_err = ER_DIAMETER_SUCCESS;
+        sess->sm_data.s6b_sta_exp_err = 0;
+        sess->sm_data.s6b_sta_exp_vendor_id = 0;
         break;
 
     case SMF_EVT_GN_MESSAGE:
@@ -1637,6 +1877,9 @@ void smf_gsm_state_wait_epc_auth_release(ogs_fsm_t *s, smf_event_t *e)
             case OGS_DIAM_GX_CC_REQUEST_TYPE_TERMINATION_REQUEST:
                 diam_err = smf_gx_handle_cca_termination_request(sess,
                                 gx_message, gtp_xact);
+                /* sess->gx_sid is released inside
+                 * smf_gx_handle_cca_termination_request(), so every state
+                 * that handles a CCA-T gets it - not just this one. */
                 sess->sm_data.gx_ccr_term_in_flight = false;
                 sess->sm_data.gx_cca_term_err = diam_err;
                 goto test_can_proceed;
@@ -1667,12 +1910,17 @@ void smf_gsm_state_wait_epc_auth_release(ogs_fsm_t *s, smf_event_t *e)
     case SMF_EVT_S6B_MESSAGE:
         s6b_message = e->s6b_message;
         ogs_assert(s6b_message);
+        gtp_xact = ogs_gtp_xact_find_by_id(e->gtp_xact_id);
 
         switch(s6b_message->cmd_code) {
         case OGS_DIAM_S6B_CMD_SESSION_TERMINATION:
             sess->sm_data.s6b_str_in_flight = false;
             /* TODO: validate error code from message below: */
             sess->sm_data.s6b_sta_err = ER_DIAMETER_SUCCESS;
+            sess->sm_data.s6b_sta_exp_err =
+                    s6b_message->experimental_result_code;
+            sess->sm_data.s6b_sta_exp_vendor_id =
+                    s6b_message->experimental_vendor_id;
             goto test_can_proceed;
         }
         break;
@@ -1689,26 +1937,36 @@ test_can_proceed:
     if (!sess->sm_data.gx_ccr_term_in_flight &&
         !sess->sm_data.gy_ccr_term_in_flight &&
         !sess->sm_data.s6b_str_in_flight) {
-        /* Store GTP transaction for later use in case of race conditions */
-        if (gtp_xact) {
-            sess->gtp.stored_xact = gtp_xact;
-            ogs_debug("Stored GTP transaction for delayed DSResp");
-        }
-
+        /* Phase 4 PR8: track whether diam_err originates from S6b STA
+         * for the GTP-C v2 Cause mapping (see gtp_cause_from_diameter()
+         * S6b branch). */
+        bool from_s6b = false;
+        uint32_t exp_err = 0;
+        uint32_t exp_vendor_id = 0; /* Phase 4.2b #3: RFC 6733 §7.6 tuple */
         diam_err = ER_DIAMETER_SUCCESS;
-        if (sess->sm_data.gx_cca_term_err != ER_DIAMETER_SUCCESS)
+        if (sess->sm_data.gx_cca_term_err != ER_DIAMETER_SUCCESS) {
             diam_err = sess->sm_data.gx_cca_term_err;
-        if (sess->sm_data.gy_cca_term_err != ER_DIAMETER_SUCCESS)
+            from_s6b = false;
+        }
+        if (sess->sm_data.gy_cca_term_err != ER_DIAMETER_SUCCESS) {
             diam_err = sess->sm_data.gy_cca_term_err;
-        if (sess->sm_data.s6b_sta_err != ER_DIAMETER_SUCCESS)
+            from_s6b = false;
+        }
+        if (sess->sm_data.s6b_sta_err != ER_DIAMETER_SUCCESS ||
+                sess->sm_data.s6b_sta_exp_err != 0) {
             diam_err = sess->sm_data.s6b_sta_err;
+            exp_err = sess->sm_data.s6b_sta_exp_err;
+            exp_vendor_id = sess->sm_data.s6b_sta_exp_vendor_id;
+            from_s6b = true;
+            if (diam_err == ER_DIAMETER_SUCCESS)
+                diam_err = exp_err;
+        }
 
         ogs_debug("ktsubouc: smf_gsm_state_wait_epc_auth_release, if condition is met"); // ktsubouc / Eureka
 
-        /* Send response using stored or current transaction */
-        ogs_gtp_xact_t *xact_to_use = sess->gtp.stored_xact ? sess->gtp.stored_xact : gtp_xact;
+        /* Answer the Delete Session Request that started this release. */
+        ogs_gtp_xact_t *xact_to_use = gtp_xact;
         if (xact_to_use) {
-            sess->gtp.stored_xact = NULL;  /* Clear stored transaction */
             if (diam_err == ER_DIAMETER_SUCCESS) {
                 /*
                  * 1. MME sends Delete Session Request to SGW/SMF.
@@ -1726,7 +1984,8 @@ test_can_proceed:
                 }
             } else {
                 uint8_t gtp_cause = gtp_cause_from_diameter(
-                                    xact_to_use->gtp_version, diam_err, NULL);
+                                    xact_to_use->gtp_version, diam_err,
+                                    exp_err, exp_vendor_id, from_s6b);
                 send_gtp_delete_err_msg(sess, xact_to_use, gtp_cause);
             }
         }

@@ -145,6 +145,11 @@ void esm_state_inactive(ogs_fsm_t *s, mme_event_t *e)
                 ogs_assert(OGS_OK ==
                     mme_gtp_send_delete_session_request(enb_ue, sgw_ue, sess,
                         OGS_GTP_DELETE_SEND_DEACTIVATE_BEARER_CONTEXT_REQUEST));
+                /* Mark the core delete as issued (DSReq sent, DSResp not yet
+                 * received) so the pdn_will_disconnect stuck-recovery gate
+                 * can later confirm intent + core-delete completion. */
+                sess->deletion_in_progress = true;
+                sess->core_delete_done = false;
             } else {
                 r = nas_eps_send_deactivate_bearer_context_request(bearer);
                 ogs_expect(r == OGS_OK);
@@ -429,6 +434,11 @@ void esm_state_active(ogs_fsm_t *s, mme_event_t *e)
                 ogs_assert(OGS_OK ==
                     mme_gtp_send_delete_session_request(enb_ue, sgw_ue, sess,
                     OGS_GTP_DELETE_SEND_DEACTIVATE_BEARER_CONTEXT_REQUEST));
+                /* Mark the core delete as issued (DSReq sent, DSResp not yet
+                 * received) so the pdn_will_disconnect stuck-recovery gate
+                 * can later confirm intent + core-delete completion. */
+                sess->deletion_in_progress = true;
+                sess->core_delete_done = false;
             } else {
                 r = nas_eps_send_deactivate_bearer_context_request(bearer);
                 ogs_expect(r == OGS_OK);
@@ -577,6 +587,12 @@ void esm_state_pdn_will_disconnect(ogs_fsm_t *s, mme_event_t *e)
                     "context accept");
             ogs_debug("    IMSI[%s] PTI[%d] EBI[%d]",
                     mme_ue->imsi_bcd, sess->pti, bearer->ebi);
+            /* Stop T3495 retransmission timer on normal completion.
+             * Mirrors the explicit clear in esm_state_active (line above),
+             * preventing spurious retransmission between Accept and the
+             * eventual bearer free (CLEAR_BEARER_ALL_TIMERS via
+             * mme-context.c bearer remove path). */
+            CLEAR_BEARER_TIMER(bearer->t3495);
             OGS_FSM_TRAN(s, esm_state_pdn_did_disconnect);
             break;
         case OGS_NAS_EPS_PDN_CONNECTIVITY_REQUEST:
@@ -593,8 +609,55 @@ void esm_state_pdn_will_disconnect(ogs_fsm_t *s, mme_event_t *e)
 
             OGS_FSM_TRAN(s, esm_state_inactive);
             break;
+        case OGS_NAS_EPS_PDN_DISCONNECT_REQUEST:
+            /*
+             * Retransmitted PDN disconnect while still waiting for the UE's
+             * Deactivate EPS Bearer Context Accept. Normally the Accept
+             * drives us to esm_state_pdn_did_disconnect; but if the eNB
+             * idled the radio (E-RAB Release failed with user-inactivity)
+             * that Accept never arrives, and the UE keeps retransmitting the
+             * PDN disconnect. Previously these fell into the default branch
+             * ("Unknown message") and were dropped, leaving the bearer stuck
+             * here until a later TAU bearer-status mismatch (~tens of
+             * seconds), long enough to drop an in-progress call.
+             *
+             * Treat the retransmit as a recovery trigger, but ONLY under the
+             * shared safe condition (identical to the E-RAB Release failure
+             * cleanup path): the core (SGW/SMF) delete is genuinely complete.
+             *   - sess->deletion_in_progress  (we did issue the DSReq)
+             *   - sess->core_delete_done      (DSResp received, ownership-
+             *     guard-verified; not a timed-out xact)
+             *   - this bearer is the session default bearer
+             * When satisfied, stop T3495 and transition to
+             * esm_state_pdn_did_disconnect; the outer ESM dispatcher
+             * (mme-sm.c) then performs MME_SESS_CLEAR() safely -- we do NOT
+             * free in place here (the dispatcher still dereferences
+             * bearer/sess after this returns). If the condition does not
+             * hold (core delete not yet confirmed), fall through to the
+             * default "Unknown message" handling so a genuine in-flight
+             * Accept handshake is never broken.
+             */
+            {
+                mme_bearer_t *def = mme_default_bearer_in_sess(sess);
+                if (def && def == bearer &&
+                        sess->deletion_in_progress &&
+                        sess->core_delete_done) {
+                    ogs_warn("[%s] PDN disconnect retransmit; core delete "
+                            "complete, no Deactivate Accept expected - "
+                            "completing local PDN[%s] teardown (EBI:%d)",
+                            mme_ue->imsi_bcd,
+                            sess->session ? sess->session->name : "unknown",
+                            bearer->ebi);
+                    CLEAR_BEARER_TIMER(bearer->t3495);
+                    OGS_FSM_TRAN(s, esm_state_pdn_did_disconnect);
+                    break;
+                }
+            }
+            ogs_error("Unknown message(type:%d)",
+                    message->esm.h.message_type);
+            break;
         default:
-            ogs_error("Unknown message(type:%d)", 
+            ogs_error("Unknown message(type:%d)",
                     message->esm.h.message_type);
             break;
         }
