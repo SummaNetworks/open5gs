@@ -5181,12 +5181,23 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
             sess = mme_sess_add(mme_ue, pti);
             if (!sess) {
                 /*
-                 * Out of sessions, bearers or EPS Bearer Identities. The
-                 * caller in mme-sm.c already drops the NAS message on NULL,
-                 * which is how every other failure in this function ends.
+                 * Out of sessions, bearers or EPS Bearer Identities.
+                 *
+                 * The caller in mme-sm.c drops the NAS message on NULL, which
+                 * is how every other failure in this function ends. Here we
+                 * can do better: this is the attach path, so tell the UE why
+                 * instead of letting it retransmit into a wall until T3410
+                 * expires. Everything a session-less reject needs is already
+                 * in scope (enb_ue, mme_ue), so the "needs a session-less
+                 * reject builder" limitation does not apply at this site.
                  */
                 ogs_error("mme_sess_add() failed [IMSI:%s PTI:%d]",
                         mme_ue->imsi_bcd, pti);
+                r = nas_eps_send_attach_reject(enb_ue, mme_ue,
+                        OGS_NAS_EMM_CAUSE_CONGESTION,
+                        OGS_NAS_ESM_CAUSE_INSUFFICIENT_RESOURCES);
+                ogs_expect(r == OGS_OK);
+                ogs_assert(r != OGS_ERROR);
                 return NULL;
             }
 
