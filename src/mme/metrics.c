@@ -68,6 +68,22 @@ mme_metrics_spec_def_t mme_metrics_spec_def_global[_MME_METR_GLOB_MAX] = {
     .name = "enb",
     .description = "eNodeBs",
 },
+[MME_METR_GLOB_GAUGE_MME_BEARER] = {
+    .type = OGS_METRICS_METRIC_TYPE_GAUGE,
+    .name = "mme_bearer",
+    .description = "MME Bearers in use (mme_bearer_pool occupancy)",
+},
+[MME_METR_GLOB_GAUGE_MME_SESS_CAPACITY] = {
+    .type = OGS_METRICS_METRIC_TYPE_GAUGE,
+    .name = "mme_session_capacity",
+    .description = "Size of mme_sess_pool (max.ue * OGS_MAX_NUM_OF_SESS)",
+},
+[MME_METR_GLOB_GAUGE_MME_BEARER_CAPACITY] = {
+    .type = OGS_METRICS_METRIC_TYPE_GAUGE,
+    .name = "mme_bearer_capacity",
+    .description = "Size of mme_bearer_pool "
+                   "(mme_session_capacity * OGS_MAX_NUM_OF_BEARER)",
+},
 /* Open5GS implementation-specific counters (Phase 4 / Phase 4.1 hotfix). */
 [MME_METR_GLOB_CTR_HO_TYPE_RESCUE_FIRED] = {
     .type = OGS_METRICS_METRIC_TYPE_COUNTER,

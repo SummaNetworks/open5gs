@@ -62,11 +62,14 @@ static int context_initialized = 0;
 
 static int num_of_enb_ue = 0;
 static int num_of_mme_sess = 0;
+static int num_of_mme_bearer = 0;
 
 static void stats_add_enb_ue(void);
 static void stats_remove_enb_ue(void);
 static void stats_add_mme_session(void);
 static void stats_remove_mme_session(void);
+static void stats_add_mme_bearer(void);
+static void stats_remove_mme_bearer(void);
 
 static uint8_t *mme_ebi_pool_reserve(mme_ue_t *mme_ue, uint8_t ebi);
 
@@ -123,6 +126,16 @@ void mme_context_init(void)
     ogs_pool_init(&sgw_ue_pool, ogs_global_conf()->max.ue);
     ogs_pool_init(&mme_sess_pool, ogs_app()->pool.sess);
     ogs_pool_init(&mme_bearer_pool, ogs_app()->pool.bearer);
+
+    /*
+     * Publish the pool sizes once, so an alert can be expressed as
+     * mme_session / mme_session_capacity rather than against a literal that
+     * has to be kept in step with max.ue by hand.
+     */
+    mme_metrics_inst_global_set(MME_METR_GLOB_GAUGE_MME_SESS_CAPACITY,
+            ogs_app()->pool.sess);
+    mme_metrics_inst_global_set(MME_METR_GLOB_GAUGE_MME_BEARER_CAPACITY,
+            ogs_app()->pool.bearer);
     /* Increase size of TMSI pool (#1827) */
     ogs_pool_init(&m_tmsi_pool, ogs_global_conf()->max.ue*2);
     ogs_pool_random_id_generate(&m_tmsi_pool);
@@ -4653,6 +4666,50 @@ mme_bearer_t *mme_bearer_add(mme_sess_t *sess)
     bearer->sess_id = sess->id;
 
     ogs_list_add(&sess->bearer_list, bearer);
+    stats_add_mme_bearer();
+
+    /*
+     * Early warning for dedicated bearers that were never removed.
+     *
+     * The SMF matches a PCC rule to a bearer by RULE NAME only
+     * (smf_bearer_find_by_pcc_rule_name), so a rule arriving under a new name
+     * creates a new dedicated bearer even when the QCI and ARP are identical.
+     * Rule names change per call here, so every removal the PCRF fails to send
+     * leaves a bearer behind, and the UE's EBI pool - 8 identities since
+     * MAX_EPS_BEARER_ID was capped at 12 - fills up one missed removal at a
+     * time.
+     *
+     * Waiting for exhaustion is too late: at that point every further Create
+     * Bearer Request for this UE is answered NO_RESOURCES_AVAILABLE and the
+     * UE cannot place a call again until it re-attaches. Say so while the
+     * leak can still be traced back to the PCRF/IMS side.
+     *
+     * The threshold is an operational judgement, not something the code can
+     * derive: the EPC path in the SMF has no per-session bearer limit - only
+     * the 5G QoS-flow path enforces OGS_MAX_NUM_OF_BEARER - so nothing here
+     * says how many bearers are "normal". Six is what this network treats as
+     * within range; adjust it for a deployment that expects more.
+     *
+     * It fires late on purpose. The EBI pool is per UE, so seven on one
+     * session leaves a single identity for every other session that UE has.
+     * That buys quiet during normal operation at the cost of any lead time.
+     *
+     * The node-wide total is included because it is the difference between
+     * one leaking subscriber and a pool draining across the whole node, and
+     * there is no way to read a gauge back - it has to be carried here.
+     */
+#define MME_EXPECTED_BEARER_PER_SESS 6
+    if (ogs_list_count(&sess->bearer_list) > MME_EXPECTED_BEARER_PER_SESS)
+        ogs_error("[%s] APN[%s] now has %d bearers of the %d EPS Bearer IDs "
+                "[%d-%d] this UE has in total (node-wide %d/%" PRIu64 " bearers "
+                "in use) - stale dedicated bearers, a PCC rule removal was "
+                "missed",
+                mme_ue->imsi_bcd,
+                sess->session ? sess->session->name : "unknown",
+                ogs_list_count(&sess->bearer_list),
+                MAX_EPS_BEARER_ID - MIN_EPS_BEARER_ID + 1,
+                MIN_EPS_BEARER_ID, MAX_EPS_BEARER_ID,
+                num_of_mme_bearer, ogs_app()->pool.bearer);
 
     bearer->t3485.timer = ogs_timer_add(
             ogs_app()->timer_mgr, mme_timer_t3485_expire,
@@ -4708,6 +4765,8 @@ void mme_bearer_remove(mme_bearer_t *bearer)
 
     if (bearer->ebi_node)
         ogs_pool_free(&mme_ue->ebi_pool, bearer->ebi_node);
+
+    stats_remove_mme_bearer();
 
     ogs_list_for_each_entry_safe(&bearer->update.xact_list,
             next_xact, xact, to_update_node) {
@@ -5181,23 +5240,12 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
             sess = mme_sess_add(mme_ue, pti);
             if (!sess) {
                 /*
-                 * Out of sessions, bearers or EPS Bearer Identities.
-                 *
-                 * The caller in mme-sm.c drops the NAS message on NULL, which
-                 * is how every other failure in this function ends. Here we
-                 * can do better: this is the attach path, so tell the UE why
-                 * instead of letting it retransmit into a wall until T3410
-                 * expires. Everything a session-less reject needs is already
-                 * in scope (enb_ue, mme_ue), so the "needs a session-less
-                 * reject builder" limitation does not apply at this site.
+                 * Out of sessions, bearers or EPS Bearer Identities. The
+                 * caller in mme-sm.c already drops the NAS message on NULL,
+                 * which is how every other failure in this function ends.
                  */
                 ogs_error("mme_sess_add() failed [IMSI:%s PTI:%d]",
                         mme_ue->imsi_bcd, pti);
-                r = nas_eps_send_attach_reject(enb_ue, mme_ue,
-                        OGS_NAS_EMM_CAUSE_CONGESTION,
-                        OGS_NAS_ESM_CAUSE_INSUFFICIENT_RESOURCES);
-                ogs_expect(r == OGS_OK);
-                ogs_assert(r != OGS_ERROR);
                 return NULL;
             }
 
@@ -5631,6 +5679,27 @@ static void stats_remove_mme_session(void)
     mme_metrics_inst_global_dec(MME_METR_GLOB_GAUGE_MME_SESS);
     num_of_mme_sess = num_of_mme_sess - 1;
     ogs_info("[Removed] Number of MME-Sessions is now %d", num_of_mme_sess);
+}
+
+/*
+ * Bearer occupancy was not tracked at all. mme_bearer_pool is global, so
+ * exhausting it stops new bearers for every UE, and a dedicated-bearer leak
+ * moves this counter without moving mme_session - which is exactly the shape
+ * that would otherwise go unseen until an allocation failed.
+ *
+ * Deliberately not logged per bearer: unlike sessions these churn with every
+ * call, and an info line each way would drown the log.
+ */
+static void stats_add_mme_bearer(void)
+{
+    mme_metrics_inst_global_inc(MME_METR_GLOB_GAUGE_MME_BEARER);
+    num_of_mme_bearer = num_of_mme_bearer + 1;
+}
+
+static void stats_remove_mme_bearer(void)
+{
+    mme_metrics_inst_global_dec(MME_METR_GLOB_GAUGE_MME_BEARER);
+    num_of_mme_bearer = num_of_mme_bearer - 1;
 }
 
 

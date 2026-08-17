@@ -13,6 +13,21 @@ typedef enum mme_metric_type_global_s {
     MME_METR_GLOB_GAUGE_ENB_UE,
     MME_METR_GLOB_GAUGE_MME_SESS,
     MME_METR_GLOB_GAUGE_ENB,
+    /*
+     * Bearer occupancy, and the capacities the two are measured against.
+     *
+     * mme_sess_pool and mme_bearer_pool are shared by every UE, so running
+     * either dry stops new sessions node-wide and does not recover until the
+     * leaked ones are freed. mme_session already tracked the first; this adds
+     * the second, which nothing observed before - a dedicated-bearer leak
+     * moves mme_bearer without moving mme_session at all.
+     *
+     * The capacities are exported so an alert can be written as a ratio and
+     * survive a change to max.ue, which is where both pool sizes come from.
+     */
+    MME_METR_GLOB_GAUGE_MME_BEARER,
+    MME_METR_GLOB_GAUGE_MME_SESS_CAPACITY,
+    MME_METR_GLOB_GAUGE_MME_BEARER_CAPACITY,
     /* Phase 4 / Phase 4.1 hotfix instrumentation (Open5GS implementation-
      * specific counters; prefixed open5gs_mme_* in the exposition). */
     MME_METR_GLOB_CTR_HO_TYPE_RESCUE_FIRED,
